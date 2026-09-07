@@ -1,0 +1,6 @@
+#include <windows.h>
+
+3001 RCDATA "smaa\\SMAA.hlsl"
+3002 RCDATA "smaa\\AreaTexDX10.dds"
+3003 RCDATA "smaa\\SearchTex.dds"
+3004 RCDATA "smaa\\LICENSE.txt"

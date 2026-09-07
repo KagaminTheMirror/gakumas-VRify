@@ -1,0 +1,21 @@
+{
+    "version": "0.5",
+    "requires": [
+        "zlib/1.3.1#cac0f6daea041b0ccf42934163defb20%1765284699.337",
+        "websocketpp/0.8.2#01060cdb4f11652648794750bf3a5f44%1737630872.126",
+        "openssl/3.6.4#bc460bf37686ccae86a15bfdce71be11%1787920038.176",
+        "nlohmann_json/3.12.0#2d634ab0ec8d9f56353e5ccef6d6612c%1744735883.94",
+        "minizip/1.3.1#0fe428c3789670e2a03b3ad2a941d4b7%1741858542.122",
+        "fmt/11.2.0#15c2efeeecd75ba2fb9dafbec8dfa4cc%1785754557.243",
+        "cpprestsdk/2.10.19#b2689e8956d6ac0e2413c573b21d8aeb%1774594008.196",
+        "bzip2/1.0.8#c470882369c2d95c5c77e970c0c7e321%1762886692.465",
+        "boost/1.83.0#bc9060051b428f90c2df6065f03b34f8%1783338741.364"
+    ],
+    "build_requires": [
+        "strawberryperl/5.32.1.1#8d114504d172cfea8ea1662d09b6333e%1751971032.423",
+        "nasm/2.16.01#31e26f2ee3c4346ecd347911bd126904%1745483323.489",
+        "b2/5.5.3#043a75bcbb090e3f81f7ac849850d0ca%1784261134.143"
+    ],
+    "python_requires": [],
+    "config_requires": []
+}

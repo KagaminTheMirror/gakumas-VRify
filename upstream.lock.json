@@ -1,0 +1,33 @@
+{
+  "url": "https://git.chinosk6.cn/chinosk/gkms-localify-dmm.git",
+  "branch": "main",
+  "commit": "098a41459e17b130be02353f26d0ab0a2ccad914",
+  "tree": "622df9ccc55469741c301caa0ed5b30c64c369d3",
+  "ownedPrefixes": [
+    "src/host/",
+    "src/hooks/",
+    "src/vr/",
+    "scripts/",
+    "patches/",
+    "tests/"
+  ],
+  "substitutions": [
+    { "upstream": "src/imgui/imgui_draw.cpp", "local": "src/host/ImGuiDraw.cpp" },
+    { "upstream": "src/main.cpp", "local": "src/host/VrBootstrap.cpp" },
+    { "upstream": "src/windowsPlatform.cpp", "local": "src/host/VrWindowsPlatform.cpp" },
+    { "upstream": "src/windowsPlatform.hpp", "local": "src/host/VrWindowsPlatform.hpp" },
+    { "upstream": "src/platformDefine.hpp", "local": "src/host/localify/PlatformDefine.hpp" },
+    { "upstream": "src/dllproxy/proxy.cpp", "local": "src/host/dllproxy/proxy.cpp" },
+    { "upstream": "src/dllproxy/version.asm", "local": "src/host/dllproxy/version.asm" },
+    { "upstream": "src/dllproxy/version.def", "local": "src/host/dllproxy/version.def" },
+    { "upstream": "src/GakumasLocalify/Hook.cpp", "local": "src/vr/unity/VrLocalifyHook.cpp" },
+    { "upstream": "src/GakumasLocalify/config/Config.cpp", "local": "src/vr/config/VrifyConfig.cpp" },
+    { "upstream": "src/GakumasLocalify/config/Config.hpp", "local": "src/vr/config/VrifyConfig.hpp" },
+    { "upstream": "src/gkmsGUI/GUII18n.cpp", "local": "src/host/LocalifyI18n.cpp" },
+    { "upstream": "src/gkmsGUI/GUII18n.hpp", "local": "src/vr/i18n/VrI18n.hpp" },
+    { "upstream": "src/gkmsGUI/i18nData/strings_en.hpp", "local": "src/vr/i18n/i18nData/strings_en.hpp" },
+    { "upstream": "src/gkmsGUI/i18nData/strings_ja.hpp", "local": "src/vr/i18n/i18nData/strings_ja.hpp" },
+    { "upstream": "src/gkmsGUI/i18nData/strings_zh-rCN.hpp", "local": "src/vr/i18n/i18nData/strings_zh-rCN.hpp" },
+    { "upstream": "src/gkmsGUI/i18nData/strings_zh-rTW.hpp", "local": "src/vr/i18n/i18nData/strings_zh-rTW.hpp" }
+  ]
+}

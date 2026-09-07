@@ -1,0 +1,8 @@
+/.upstream/
+/.tools/
+/build/
+/.vs/
+/.vscode/
+*.user
+*.log
+__pycache__/

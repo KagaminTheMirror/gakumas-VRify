@@ -1,0 +1,4 @@
+#include <windows.h>
+
+3101 RCDATA "cmaa2\\CMAA2.hlsl"
+3102 RCDATA "cmaa2\\LICENSE.txt"
