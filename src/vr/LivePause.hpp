@@ -16,6 +16,14 @@ void ToggleLivePause() noexcept;
 // loading; presence-only is the correct scene signal. Cheap, no scene scans;
 // shared with the photo shutter's scene routing.
 [[nodiscard]] void* AliveLiveScenePresenter() noexcept;
+// Install the live-resolved AutoPhotoAsync state-machine lifecycle hook.
+void InstallLiveAutoPhotoProtection() noexcept;
+// Unity thread refreshes task-owner liveness. If the hook is unavailable,
+// retains the conservative whole-Produce-Live protection as a logged fallback.
+void RefreshLiveSourcePhotoProtection() noexcept;
+// Atomic capture-window snapshot: full source, authored view and no hand sticks.
+// Also safe for the OpenXR worker's Right-A routing; never changes saved options.
+[[nodiscard]] bool LiveSourcePhotoProtectionActive() noexcept;
 // Cached presenter + `_livePlayer` only. No FindObjects / scene scan.
 [[nodiscard]] bool IsOfficialLivePaused() noexcept;
 

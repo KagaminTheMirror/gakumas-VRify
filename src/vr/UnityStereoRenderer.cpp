@@ -3486,6 +3486,15 @@ void UnityStereoRenderer::SuppressSourceCamera(void* sourceCamera) noexcept {
 }
 
 void UnityStereoRenderer::SyncSourceCameraSuppression(void* sourceCamera) noexcept {
+    RefreshLiveSourcePhotoProtection();
+    if (LiveSourcePhotoProtectionActive()) {
+        // Preserve the official full-size capture surface during the Produce
+        // automatic-photo task. Reuse the established
+        // target/enabled/tag restore path so the tracked source stays alive.
+        RestoreSourceCamera("produce-auto-photo-protection");
+        PublishGripTransparency();
+        return;
+    }
     const bool healthy =
         stage_ == LadderStage::StereoFull &&
         (continuousStereo_ || publishedFrames_ != 0U || stageArmed_) &&

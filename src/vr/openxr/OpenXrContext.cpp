@@ -3,6 +3,7 @@
 #include "../d3d11/TextureFingerprint.hpp"
 #include "../SceneReadyGate.hpp"
 #include "../VrPhotoShutter.hpp"
+#include "../LivePause.hpp"
 #include "../pose/HandPoseMailbox.hpp"
 
 #include "../config/VrifyConfig.hpp"
@@ -1864,7 +1865,8 @@ void OpenXrContext::PollPanelAdjustButton(XrTime displayTime, VrLog& log) {
             // Pause-2D freezes the source view the official shutter captures.
             // Block the Right-A shortcut only; a Grip UI click still reaches
             // the game's own photo button.
-            if (GakumasLocal::Config::vrSourceCameraTiny) {
+            if (GakumasLocal::Config::vrSourceCameraTiny &&
+                !LiveSourcePhotoProtectionActive()) {
                 panelToastKind_ = 3;
                 panelToastUntil_ = displayTime + kPanelToastDuration;
                 photoResultPendingUntil_ = 0;

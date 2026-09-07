@@ -1725,7 +1725,18 @@ namespace GakumasLocal::HookMain {
             composed.center.orientation.y,
             composed.center.orientation.z,
             composed.center.orientation.w);
-        if (!TryWriteCinemachineRawPose(
+        // Automatic Memory photos must see the game's authored source shot.
+        // Still compose/publish the SAME free-rig + HMD pose below for the VR
+        // eyes; never switch modes or reset the rig just to take these photos.
+        const bool authoredPhotoSource = gakumas::vr::LiveSourcePhotoProtectionActive();
+        static bool photoSourceBypassLogged = false;
+        if (authoredPhotoSource != photoSourceBypassLogged) {
+            photoSourceBypassLogged = authoredPhotoSource;
+            static_cast<void>(gakumas::vr::WriteVrLog(authoredPhotoSource
+                ? "[VR][photo] AUTO_PHOTO_SOURCE_POSE bypass=1 hmd=unchanged"
+                : "[VR][photo] AUTO_PHOTO_SOURCE_POSE bypass=0 hmd=unchanged"));
+        }
+        if (!authoredPhotoSource && !TryWriteCinemachineRawPose(
                 state, outputPosition, outputRotation)) {
             vrHeadPoseWritesEnabled.store(false, std::memory_order_release);
             InvalidateVrStereoCameraFrame();
@@ -3199,6 +3210,12 @@ namespace GakumasLocal::HookMain {
 #ifdef GKMS_WINDOWS
         try {
             unityStereoRenderer.OnBeginCamera(camera);
+            if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
+                SetFpHeadColorSkip(
+                    unityStereoRenderer.IsEyeCamera(camera) &&
+                        gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
+                    "auto-photo-camera-begin");
+            }
             if (std::string_view(unityStereoRenderer.ClassifyCamera(camera)) ==
                 "left") {
                 ResetActorShadowLeftReuse();
@@ -3216,6 +3233,12 @@ namespace GakumasLocal::HookMain {
 #ifdef GKMS_WINDOWS
         try {
             unityStereoRenderer.OnBeginCamera(camera);
+            if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
+                SetFpHeadColorSkip(
+                    unityStereoRenderer.IsEyeCamera(camera) &&
+                        gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
+                    "auto-photo-camera-begin");
+            }
             if (std::string_view(unityStereoRenderer.ClassifyCamera(camera)) ==
                 "left") {
                 ResetActorShadowLeftReuse();
@@ -3238,6 +3261,10 @@ namespace GakumasLocal::HookMain {
             EndEyeRenderPassTrace(camera);
             gakumas::vr::GripTraceEndCamera(camera);
             ownedByVrQueue = unityStereoRenderer.OnEndCamera(camera);
+            if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
+                SetFpHeadColorSkip(gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
+                    "auto-photo-camera-end");
+            }
             if (!ownedByVrQueue) {
                 ObserveUnityCameraRender(camera);
             }
@@ -5304,6 +5331,22 @@ namespace GakumasLocal::HookMain {
         if (!Config::vrRuntimeStartupEnabled) {
             return;
         }
+        // The original crowd was already drawn. Omit only our extra hands
+        // from photo/source cameras; keep both HMD eyes and their colors intact.
+        const bool photoGuard = gakumas::vr::LiveSourcePhotoProtectionActive();
+        const bool eyeCamera = unityStereoRenderer.IsEyeCamera(unityStereoRenderer.CurrentCamera());
+        static unsigned photoHandLogMask = 0;
+        if (!photoGuard) photoHandLogMask = 0;
+        const unsigned photoHandBit = eyeCamera ? 2U : 1U;
+        if (photoGuard && (photoHandLogMask & photoHandBit) == 0U) {
+            photoHandLogMask |= photoHandBit;
+            static_cast<void>(gakumas::vr::WriteVrLog(eyeCamera
+                ? "[VR][photo] AUTO_PHOTO_HANDS camera=eye action=keep"
+                : "[VR][photo] AUTO_PHOTO_HANDS camera=non-eye action=skip"));
+        }
+        if (photoGuard && !eyeCamera) {
+            return;
+        }
         try {
             gakumas::vr::AfterOfficialCrowdRender(
                 self, commandBuffer, eventType);
@@ -7060,6 +7103,7 @@ namespace GakumasLocal::HookMain {
 
 #ifdef GKMS_WINDOWS
             if (vrRuntime) {
+                gakumas::vr::InstallLiveAutoPhotoProtection();
                 gakumas::vr::InstallGripBlurSource();
                 gakumas::vr::input::InstallUnityAnalogScrollHook();
                 gakumas::vr::input::InstallUnityPointerInput();

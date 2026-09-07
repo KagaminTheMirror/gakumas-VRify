@@ -1,12 +1,18 @@
 #include "LivePause.hpp"
 
 #include "VrRuntime.hpp"
+#include "config/VrifyConfig.hpp"
+#include "../hooks/HookManager.hpp"
 #include "../GakumasLocalify/Il2cppUtils.hpp"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 
 #include <Windows.h>
 
 #include <cstdint>
+#include <atomic>
+#include <sstream>
+#include <algorithm>
+#include <vector>
 #include <string>
 #include <string_view>
 
@@ -18,6 +24,17 @@ void* g_cachedModel = nullptr;
 bool g_resolvedLogged = false;
 void* g_pausedStoryAdv = nullptr;
 bool g_storyResolvedLogged = false;
+// Separate from the pause cache: a B press may clear that cache during loading.
+void* g_photoProtectionPresenter = nullptr;
+int g_photoLiveFromType = -1;
+std::atomic<bool> g_liveSourcePhotoProtection{false};
+struct AutoPhotoOwner { void* presenter; unsigned depth; };
+std::vector<AutoPhotoOwner> g_autoPhotoOwners;
+bool g_autoPhotoHookReady = false;
+using AutoPhotoMoveNextFn = void (*)(void*, void*);
+AutoPhotoMoveNextFn g_autoPhotoMoveNextOrig = nullptr;
+int g_autoPhotoStateOffset = -1;
+int g_autoPhotoOwnerOffset = -1;
 
 void Log(std::string_view message) noexcept {
     WriteVrLog(message);
@@ -248,6 +265,137 @@ bool RuntimeInvokeBool(
     }
 }
 
+// Exact, live-table-checked getters; never use the permissive ZeroArg fallback.
+UnityResolve::Method* PhotoGetter(
+    UnityResolve::Class* klass, const char* name, const char* resultType) noexcept {
+    if (klass == nullptr) return nullptr;
+    for (auto* method : klass->methods) {
+        if (method != nullptr && method->name == name && method->args.empty() &&
+            !method->static_function && method->address != nullptr &&
+            method->function != nullptr && method->return_type != nullptr &&
+            method->return_type->name == resultType) return method;
+    }
+    return nullptr;
+}
+
+bool UnboxLiveFromType(void* boxed, int* value) noexcept {
+    using Unbox = void* (*)(void*);
+    static const auto unbox = reinterpret_cast<Unbox>(GetProcAddress(
+        GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_object_unbox"));
+    if (boxed == nullptr || unbox == nullptr) return false;
+    __try {
+        void* raw = unbox(boxed);
+        if (raw == nullptr) return false;
+        *value = *static_cast<int*>(raw);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool TryReadPhotoLiveFromType(void* scene, int* fromType) noexcept {
+    // dump + current metadata: evidence/produce-live-photo/. Only the scene
+    // presenter is a Unity object. LiveModel/LiveFixedData are managed data;
+    // no m_CachedPtr test on either, and neither is cached across scene exits.
+    static auto* sceneClass = LiveClass("LiveScenePresenter");
+    static auto* modelClass = LiveClass("LiveModel");
+    static auto* fixedClass = LiveDataClass("LiveFixedData");
+    static auto* modelField = sceneClass != nullptr
+        ? sceneClass->Get<UnityResolve::Field>("_liveModel") : nullptr;
+    static auto* fixedGetter = PhotoGetter(
+        modelClass, "get_FixedData", "Campus.Live.Data.LiveFixedData");
+    static auto* fromGetter = PhotoGetter(
+        fixedClass, "get_LiveFromType", "Campus.Live.LiveFromType");
+    static const bool fieldReady = modelField != nullptr &&
+        !modelField->static_field && modelField->offset >= 0 &&
+        modelField->type != nullptr &&
+        modelField->type->name == "Campus.Live.LiveModel";
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::ostringstream line;
+        line << "[VR][photo] LIVE_SOURCE_PHOTO_API modelOffset="
+             << (fieldReady ? modelField->offset : -1)
+             << " fixedMethod=" << (fixedGetter ? fixedGetter->address : nullptr)
+             << " fixedFunction=" << (fixedGetter ? fixedGetter->function : nullptr)
+             << " fromMethod=" << (fromGetter ? fromGetter->address : nullptr)
+             << " fromFunction=" << (fromGetter ? fromGetter->function : nullptr);
+        Log(line.str());
+    }
+    if (!fieldReady || !IsUnityManagedObjectAlive(scene)) return false;
+    void* model = ReadPointerAt(scene, modelField->offset);
+    void* fixedData = nullptr;
+    void* boxed = nullptr;
+    return LooksAlive(model) &&
+        RuntimeInvokeRaw(fixedGetter, model, nullptr, &fixedData) &&
+        LooksAlive(fixedData) &&
+        RuntimeInvokeRaw(fromGetter, fixedData, nullptr, &boxed) &&
+        UnboxLiveFromType(boxed, fromType);
+}
+
+void BeginAutoPhoto(void* presenter, bool firstEntry) noexcept {
+    if (!GakumasLocal::Config::vrRuntimeStartupEnabled ||
+        !IsUnityManagedObjectAlive(presenter)) return;
+    const auto found = std::find_if(g_autoPhotoOwners.begin(), g_autoPhotoOwners.end(),
+        [presenter](const auto& entry) { return entry.presenter == presenter; });
+    if (found != g_autoPhotoOwners.end()) {
+        if (firstEntry) ++found->depth;
+        return;
+    }
+    int fromType = -1;
+    if (TryReadPhotoLiveFromType(presenter, &fromType) && fromType > 0 && fromType != 1) {
+        if (firstEntry) Log("[VR][photo] AUTO_PHOTO_SKIP reason=non-produce");
+        return;
+    }
+    // Unknown origin is conservative only inside the actual capture task.
+    // Owner identity survives the state machine's stack -> runner migration.
+    g_autoPhotoOwners.push_back({presenter, 1});
+    g_liveSourcePhotoProtection.store(true, std::memory_order_release);
+    Log(std::string("[VR][photo] AUTO_PHOTO_BEGIN fromType=") +
+        std::to_string(fromType) + " source=full camera=authored hands=source-hidden hmd=unchanged");
+}
+
+void EndAutoPhoto(void* presenter) noexcept {
+    const auto found = std::find_if(g_autoPhotoOwners.begin(), g_autoPhotoOwners.end(),
+        [presenter](const auto& entry) { return entry.presenter == presenter; });
+    if (found == g_autoPhotoOwners.end()) return;
+    if (--found->depth != 0) return;
+    g_autoPhotoOwners.erase(found);
+    g_liveSourcePhotoProtection.store(!g_autoPhotoOwners.empty(), std::memory_order_release);
+    Log("[VR][photo] AUTO_PHOTO_END reason=task-terminal restore=user-settings");
+}
+
+bool ReadAutoPhotoState(void* self, int* state, void** presenter) noexcept {
+    if (self == nullptr || g_autoPhotoStateOffset < 0 || g_autoPhotoOwnerOffset < 0) return false;
+    __try {
+        *state = *reinterpret_cast<int*>(static_cast<char*>(self) + g_autoPhotoStateOffset);
+        *presenter = *reinterpret_cast<void**>(static_cast<char*>(self) + g_autoPhotoOwnerOffset);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void AutoPhotoMoveNextDetour(void* self, void* methodInfo) {
+    int before = -2;
+    void* presenter = nullptr;
+    const bool readable = ReadAutoPhotoState(self, &before, &presenter);
+    if (readable && before >= -1) BeginAutoPhoto(presenter, before == -1);
+    if (g_autoPhotoMoveNextOrig != nullptr) g_autoPhotoMoveNextOrig(self, methodInfo);
+    int after = 0;
+    void* ignored = nullptr;
+    // -1 also means running, NOT finished. Only -2 is terminal (success,
+    // cancellation or the compiler-generated exception path); await states
+    // stay protected while the PlayerLoop renders between MoveNext calls.
+    const bool afterReadable = readable && ReadAutoPhotoState(self, &after, &ignored);
+    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+        std::ostringstream log;
+        log << "[VR][photo] AUTO_PHOTO_STEP self=" << self << " owner=" << presenter
+            << " before=" << before << " after=" << after
+            << " readable=" << readable << '/' << afterReadable;
+        Log(log.str());
+    }
+    if (afterReadable && after == -2) {
+        EndAutoPhoto(presenter);
+    }
+}
+
 void* InvokePtr(UnityResolve::Method* method, void* instance) noexcept {
     if (method == nullptr) {
         return nullptr;
@@ -431,6 +579,15 @@ bool TryToggleStoryPause() noexcept {
 void NoteLiveScenePresenter(void* instance) noexcept {
     if (IsUnityManagedObjectAlive(instance)) {
         g_cachedPresenter = instance;
+        if (GakumasLocal::Config::vrRuntimeStartupEnabled &&
+            instance != g_photoProtectionPresenter) {
+            g_photoProtectionPresenter = instance;
+            g_photoLiveFromType = -1;
+            if (!g_autoPhotoHookReady) {
+                g_liveSourcePhotoProtection.store(true, std::memory_order_release);
+                Log("[VR][photo] LIVE_SOURCE_PHOTO_HOLD reason=auto-photo-hook-unavailable");
+            }
+        }
     }
 }
 
@@ -441,9 +598,137 @@ void NoteLiveSceneModel(void* instance) noexcept {
 }
 
 void ForgetLiveScenePresenter(void* instance) noexcept {
+    const auto previousSize = g_autoPhotoOwners.size();
+    std::erase_if(g_autoPhotoOwners, [instance](const auto& entry) {
+        return instance == nullptr || entry.presenter == instance;
+    });
+    if (previousSize != g_autoPhotoOwners.size()) {
+        Log("[VR][photo] AUTO_PHOTO_END reason=scene-finalized restore=user-settings");
+    }
+    if (g_autoPhotoHookReady) {
+        g_liveSourcePhotoProtection.store(!g_autoPhotoOwners.empty(), std::memory_order_release);
+    }
     if (instance == nullptr || instance == g_cachedPresenter) {
         g_cachedPresenter = nullptr;
     }
+    if (instance == nullptr || instance == g_photoProtectionPresenter) {
+        if (g_photoProtectionPresenter != nullptr) {
+            Log("[VR][photo] LIVE_SOURCE_PHOTO_RELEASE reason=scene-finalized");
+        }
+        g_photoProtectionPresenter = nullptr;
+        g_photoLiveFromType = -1;
+        if (!g_autoPhotoHookReady) {
+            g_liveSourcePhotoProtection.store(false, std::memory_order_release);
+        }
+    }
+}
+
+void RefreshLiveSourcePhotoProtection() noexcept {
+    if (g_autoPhotoHookReady) {
+        const auto previousSize = g_autoPhotoOwners.size();
+        std::erase_if(g_autoPhotoOwners, [](const auto& entry) {
+            return !GakumasLocal::Config::vrRuntimeStartupEnabled ||
+                !IsUnityManagedObjectAlive(entry.presenter);
+        });
+        if (previousSize != g_autoPhotoOwners.size()) {
+            Log("[VR][photo] AUTO_PHOTO_END reason=scene-dead restore=user-settings");
+        }
+        g_liveSourcePhotoProtection.store(!g_autoPhotoOwners.empty(), std::memory_order_release);
+        return;
+    }
+    if (!GakumasLocal::Config::vrRuntimeStartupEnabled ||
+        !IsUnityManagedObjectAlive(g_photoProtectionPresenter)) {
+        if (g_photoProtectionPresenter != nullptr) {
+            Log("[VR][photo] LIVE_SOURCE_PHOTO_RELEASE reason=scene-dead");
+        }
+        g_photoProtectionPresenter = nullptr;
+        g_photoLiveFromType = -1;
+        g_liveSourcePhotoProtection.store(false, std::memory_order_release);
+        return;
+    }
+    if (g_photoLiveFromType >= 0) return;
+    int fromType = -1;
+    // Unknown (0) is not proof of an ordinary Live. Keep the source intact
+    // on missing methods, an uninitialized model, or an invoke exception.
+    if (!TryReadPhotoLiveFromType(g_photoProtectionPresenter, &fromType) ||
+        fromType <= 0) return;
+    g_photoLiveFromType = fromType;
+    const bool protect = fromType == 1; // LiveFromType.Produce, persisted dump.
+    g_liveSourcePhotoProtection.store(protect, std::memory_order_release);
+    Log(std::string("[VR][photo] LIVE_SOURCE_PHOTO_CLASSIFIED fromType=") +
+        std::to_string(fromType) + " protect=" + (protect ? "1" : "0"));
+}
+
+bool LiveSourcePhotoProtectionActive() noexcept {
+    return g_liveSourcePhotoProtection.load(std::memory_order_acquire);
+}
+
+void InstallLiveAutoPhotoProtection() noexcept {
+    if (!GakumasLocal::Config::vrRuntimeStartupEnabled) return;
+    static bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+    auto* assembly = UnityResolve::Get("Assembly-CSharp.dll");
+    auto* scene = LiveClass("LiveScenePresenter");
+    UnityResolve::Method* entry = nullptr;
+    if (scene != nullptr) {
+        for (auto* method : scene->methods) {
+            if (method && method->name == "AutoPhotoAsync" && !method->static_function &&
+                method->function && method->address && method->args.size() == 1 &&
+                method->args[0] && method->args[0]->pType &&
+                method->args[0]->pType->name == "System.Threading.CancellationToken" &&
+                method->return_type && method->return_type->name == "Cysharp.Threading.Tasks.UniTask") {
+                entry = method;
+                break;
+            }
+        }
+    }
+    UnityResolve::Class* machine = nullptr;
+    // Enumerate only this presenter's nested classes: similarly named state
+    // machines on movie recording/other presenters are not this lifecycle.
+    if (assembly != nullptr && scene != nullptr) {
+        void* iterator = nullptr;
+        while (void* nested = UnityResolve::Invoke<void*>(
+            "il2cpp_class_get_nested_types", scene->address, &iterator)) {
+            const char* name = UnityResolve::Invoke<const char*>("il2cpp_class_get_name", nested);
+            if (name == nullptr || std::string_view(name).find("<AutoPhotoAsync>d__") != 0) continue;
+            const char* ns = UnityResolve::Invoke<const char*>("il2cpp_class_get_namespace", nested);
+            auto* candidate = assembly->Get(name, ns != nullptr ? ns : "");
+            if (candidate != nullptr && candidate->address == nested) machine = candidate;
+            break;
+        }
+    }
+    auto* moveNext = PhotoGetter(machine, "MoveNext", "System.Void");
+    auto* state = machine ? machine->Get<UnityResolve::Field>("<>1__state") : nullptr;
+    auto* owner = machine ? machine->Get<UnityResolve::Field>("<>4__this") : nullptr;
+    const bool valueType = machine && UnityResolve::Invoke<bool>(
+        "il2cpp_class_is_valuetype", machine->address);
+    // IL2CPP field offsets include the boxed object header; MoveNext's
+    // methodPointer receives an unboxed struct (same ABI as Cinemachine).
+    const int headerSize = static_cast<int>(2 * sizeof(void*));
+    const bool layout = valueType && state && owner && !state->static_field &&
+        !owner->static_field && state->type && owner->type &&
+        state->type->name == "System.Int32" &&
+        owner->type->name == "Campus.Live.LiveScenePresenter" &&
+        state->offset == headerSize && owner->offset >= headerSize + 8 &&
+        owner->offset < headerSize + 256 && owner->offset % sizeof(void*) == 0;
+    if (entry && layout && moveNext) {
+        g_autoPhotoStateOffset = state->offset - headerSize;
+        g_autoPhotoOwnerOffset = owner->offset - headerSize;
+        g_autoPhotoHookReady = GakumasVR::Hooks::CreateAndEnable(
+            moveNext->function, reinterpret_cast<void*>(&AutoPhotoMoveNextDetour),
+            reinterpret_cast<void**>(&g_autoPhotoMoveNextOrig), "LiveScenePresenter.AutoPhotoAsync.MoveNext");
+    }
+    std::ostringstream log;
+    log << "[VR][photo] AUTO_PHOTO_API ready=" << g_autoPhotoHookReady
+        << " entry=" << (entry ? entry->function : nullptr)
+        << " class=" << (machine ? machine->name : "missing")
+        << " method=" << (moveNext ? moveNext->address : nullptr)
+        << " function=" << (moveNext ? moveNext->function : nullptr)
+        << " valueType=" << valueType << " stateOffset=" << g_autoPhotoStateOffset
+        << " ownerOffset=" << g_autoPhotoOwnerOffset
+        << " fallback=" << (g_autoPhotoHookReady ? "none" : "whole-live-protection");
+    Log(log.str());
 }
 
 void* AliveLiveScenePresenter() noexcept {

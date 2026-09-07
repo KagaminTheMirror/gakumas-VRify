@@ -88,5 +88,3 @@ Restart the game after installation. Logs are written under the game's `gakumas-
 - **VS2022 was not found:** install the required C++ workload and v143 toolset; the script discovers the installation through `vswhere.exe`.
 - **Conan/Python downloads failed:** check the failing host and retry. `.tools/` is local to this repository; deleting it recreates the Python environment and Conan cache on the next build.
 - **Stale build files:** remove `build/` and rerun `build.ps1`. Both `build/` and `.tools/` contain generated files only. Never use the game installation as a build directory.
-
-See [VALIDATION.md](VALIDATION.md) for the recorded clean-directory Release build results.

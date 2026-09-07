@@ -198,7 +198,8 @@ void* FindFirstInstance(UnityResolve::Class* klass) noexcept {
 void TriggerPhotoShutter(void* photography, void* live) noexcept {
     // Right-A shortcut only. The in-Grip official photo button never enters
     // this function; leaving it unblocked is intentional.
-    if (GakumasLocal::Config::vrSourceCameraTiny) {
+    if (GakumasLocal::Config::vrSourceCameraTiny &&
+        !LiveSourcePhotoProtectionActive()) {
         Log("[VR][photo] SHUTTER_BLOCKED reason=paused-2d");
         PublishPhotoResult(kPhotoShutterPaused2D);
         return;
@@ -350,6 +351,7 @@ void NotePhotoCaptured() noexcept {
 }
 
 void UpdatePhotoSceneAndConsumeShutterRequests() noexcept {
+    RefreshLiveSourcePhotoProtection();
     void* photography = AlivePhotographyPresenter();
     void* live = AliveLiveScenePresenter();
     const bool active = photography != nullptr || live != nullptr;

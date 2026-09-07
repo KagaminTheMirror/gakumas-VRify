@@ -286,6 +286,8 @@ struct GlowState {
     std::vector<UnityColor> colorTable{};
     std::vector<UniqueColor> uniqueColors{};
     UnityResolve::Class* colorTableClass = nullptr;
+    bool colorSourceManagedOnly = false;
+    ULONGLONG lastColorReadMs = 0;
     void* colorTableInstance = nullptr;
     UnityColor stickyColor{0.0F, 0.0F, 0.0F, 0.0F};
     int stickySlot = -1;
@@ -320,6 +322,7 @@ struct GlowState {
     bool crowdDrawActive = false;
     std::uint32_t lastCrowdDrawTick = 0;
     std::uint32_t crowdDrawFailureTick = 0;
+    ULONGLONG lastCrowdColorProbeMs = 0;
 };
 
 GlowState g_state;
@@ -334,7 +337,7 @@ std::ostringstream ClassicLine() noexcept {
     return line;
 }
 
-bool RefreshAudienceColors(bool log) noexcept;
+void ClearAudienceColors(const char* reason) noexcept;
 void* WriteObjectArray(
     void* elementClass, const std::vector<void*>& items) noexcept;
 bool AssignHandMaterials(
@@ -3100,7 +3103,14 @@ bool CopyOfficialInfoOntoHands(void* controller) noexcept {
 bool ReadColorTable(
     UnityResolve::Class* klass, void* instance, std::vector<UnityColor>* colors,
     std::ostringstream* line) noexcept {
-    void* table = InvokeInstanceObject(instance, klass, "get_ColorTable");
+    auto* getter = FindNamedInstance(klass, "get_ColorTable", 0U);
+    if (!HasExactSignature(getter, false, "UnityEngine.Vector4[]", {})) {
+        return false;
+    }
+    void* table = nullptr;
+    if (!RuntimeInvoke(MethodReference(getter), instance, nullptr, &table)) {
+        return false;
+    }
     if (table == nullptr) {
         return false;
     }
@@ -3249,7 +3259,12 @@ void RequestCycleHandGlowColor() noexcept {
     if (!EnsureApi()) {
         return;
     }
-    static_cast<void>(RefreshAudienceColors(false));
+    // Consume only the most recent official draw's palette; never rediscover
+    // a global or cached object from the menu.
+    if (!SceneReadyAllowsStereoRender()) {
+        ClearAudienceColors("cycle-scene-not-ready");
+        return;
+    }
     if (g_state.uniqueColors.size() < 2U) {
         ChooseSticky(true, g_state.uniqueColors.empty() ? "none" : "only");
         return;
@@ -3272,84 +3287,129 @@ void* MaterialForColorIndex(int colorIndex) noexcept {
     return g_state.officialMaterial;
 }
 
-bool TryReadAudienceColorTable(bool logTable) noexcept {
-    struct TableSource {
-        const char* namespaze;
-        const char* name;
-        const char* tag;
-    };
-    const TableSource sources[] = {
-        {"Campus.AudiencePenlight", "AudiencePenlightComponent", "audience"},
-        {"Campus.Crowd", "CrowdAnimationComponent", "crowd-anim"},
-        {"Campus.AudiencePenlight", "AudiencePenlightTimeline", "timeline"},
-    };
-    bool found = false;
-    for (const auto& source : sources) {
-        auto* klass = FindCampusClass(source.namespaze, source.name);
-        if (klass == nullptr) {
-            continue;
-        }
-        const auto instances = FindAllOfClass(klass);
-        for (void* instance : instances) {
-            if (instance == nullptr || !IsUnityManagedObjectAlive(instance)) {
-                continue;
-            }
-            std::ostringstream line;
-            std::vector<UnityColor> colors;
-            if (!ReadColorTable(
-                    klass, instance, &colors, logTable ? &line : nullptr)) {
-                continue;
-            }
-            bool projection = false;
-            const bool readProjection = InvokeInstanceBool(
-                instance, klass, "get_UseColorProjection", &projection);
-            if (logTable) {
-                auto header = ClassicLine();
-                header << "[VR][stereo] HAND_GLOW list kind=table src="
-                       << source.tag;
-                if (readProjection) {
-                    header << " proj=" << (projection ? 1 : 0);
-                }
-                header << line.str();
-                LogHandGlow(header.str());
-            }
-            if (!found || colors.size() > g_state.colorTable.size()) {
-                g_state.colorTable = colors;
-                g_state.colorTableClass = klass;
-                g_state.colorTableInstance = instance;
-                if (readProjection) {
-                    g_state.useColorProjection = projection;
-                }
-                found = true;
-            }
+// Cache metadata, never scene objects. Field offsets come from the actual
+// runtime class table; steady draws need only class/offset reads.
+void* ReadCrowdColorRef(void* object, const char* name) noexcept {
+    if (object == nullptr) {
+        return nullptr;
+    }
+    struct FieldSlot { void* klass; const char* name; std::int32_t offset; };
+    static std::array<FieldSlot, 12> slots{};
+    void* klass = UnityResolve::Invoke<void*>("il2cpp_object_get_class", object);
+    if (klass == nullptr) {
+        return nullptr;
+    }
+    for (auto& slot : slots) {
+        if (slot.klass == klass && std::strcmp(slot.name, name) == 0) {
+            return ReadRefAtOffsetSeh(object, slot.offset);
         }
     }
-    if (found) {
-        ComputePalette();
-        ChooseSticky(logTable, nullptr);
+    void* field = UnityResolve::Invoke<void*>(
+        "il2cpp_class_get_field_from_name", klass, name);
+    const auto offset = field != nullptr
+        ? UnityResolve::Invoke<std::int32_t>("il2cpp_field_get_offset", field) : -1;
+    for (auto& slot : slots) {
+        if (slot.klass == nullptr) {
+            slot = {klass, name, offset};
+            break;
+        }
     }
-    return found;
+    return ReadRefAtOffsetSeh(object, offset);
 }
 
-bool RefreshAudienceColors(bool log) noexcept {
-    if (g_state.colorTableInstance != nullptr &&
-        g_state.colorTableClass != nullptr &&
-        IsUnityManagedObjectAlive(g_state.colorTableInstance)) {
-        std::vector<UnityColor> colors;
-        if (ReadColorTable(
-                g_state.colorTableClass,
-                g_state.colorTableInstance,
-                &colors,
-                nullptr)) {
-            g_state.colorTable = std::move(colors);
-            ComputePalette();
-            ChooseSticky(log, nullptr);
-            return true;
-        }
+void ClearAudienceColors(const char* reason) noexcept {
+    if (g_state.colorTableInstance != nullptr || !g_state.colorTable.empty()) {
+        LogHandGlow(std::string("[VR][stereo] HAND_GLOW color-source clear reason=") + reason);
     }
+    g_state.colorTable.clear();
+    g_state.uniqueColors.clear();
     g_state.colorTableInstance = nullptr;
     g_state.colorTableClass = nullptr;
-    return TryReadAudienceColorTable(log);
+    g_state.colorSourceManagedOnly = false;
+    g_state.lastColorReadMs = 0;
+    g_state.stickySlot = -1;
+    g_state.stickyColor = UnityColor(0.0F, 0.0F, 0.0F, 0.0F);
+    g_state.paletteReady = false;
+}
+
+// Only resolve the current official draw's object. The default implementation
+// is managed-only; reading Unity's m_CachedPtr on it would be invalid.
+UnityResolve::Class* CurrentAudienceClass(void* audience) noexcept {
+    if (audience == nullptr) {
+        return nullptr;
+    }
+    void* actualClass = UnityResolve::Invoke<void*>(
+        "il2cpp_object_get_class", audience);
+    if (g_state.colorTableClass != nullptr &&
+        g_state.colorTableClass->address == actualClass) {
+        return g_state.colorSourceManagedOnly || IsUnityManagedObjectAlive(audience)
+            ? g_state.colorTableClass : nullptr;
+    }
+    const char* names[] = {
+        "AudiencePenlightTimeline", "AudiencePenlightComponent",
+        "DefaultAudiencePenlight"};
+    for (const char* name : names) {
+        auto* klass = FindCampusClass("Campus.AudiencePenlight", name);
+        if (klass != nullptr && klass->address == actualClass) {
+            if (std::strcmp(name, "DefaultAudiencePenlight") != 0 &&
+                !IsUnityManagedObjectAlive(audience)) {
+                return nullptr;
+            }
+            return klass;
+        }
+    }
+    return nullptr;
+}
+
+bool RefreshCurrentCrowdColors(void* crowdSystem) noexcept {
+    void* volume = ReadCrowdColorRef(crowdSystem, "_audiencePenlightVolume");
+    void* audience = volume != nullptr && IsUnityManagedObjectAlive(volume)
+        ? ReadCrowdColorRef(volume, "_audiencePenlight") : nullptr;
+    if (audience == nullptr) {
+        audience = ReadCrowdColorRef(crowdSystem, "_defaultAudiencePenlight");
+    }
+    auto* klass = CurrentAudienceClass(audience);
+    const bool changed = audience != g_state.colorTableInstance ||
+        klass != g_state.colorTableClass;
+    const ULONGLONG now = GetTickCount64();
+    // The official source identity/liveness is checked every draw. Only the
+    // managed getter and palette work are throttled, independently of Tick.
+    if (klass != nullptr && !changed && !g_state.colorTable.empty() &&
+        now - g_state.lastColorReadMs < 16U) {
+        return true;
+    }
+    std::vector<UnityColor> colors;
+    if (klass == nullptr || !ReadColorTable(klass, audience, &colors, nullptr)) {
+        ClearAudienceColors("current-crowd-unreadable");
+        return false;
+    }
+    g_state.lastColorReadMs = now;
+    const bool identical = colors.size() == g_state.colorTable.size() &&
+        std::equal(colors.begin(), colors.end(), g_state.colorTable.begin(),
+            [](const UnityColor& a, const UnityColor& b) {
+                return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+            });
+    if (!changed && identical) {
+        return true;
+    }
+    g_state.colorTable = std::move(colors);
+    g_state.colorTableInstance = audience;
+    g_state.colorTableClass = klass;
+    g_state.colorSourceManagedOnly =
+        klass == FindCampusClass("Campus.AudiencePenlight", "DefaultAudiencePenlight");
+    ComputePalette();
+    ChooseSticky(changed, nullptr);
+    if (changed) {
+        auto line = ClassicLine();
+        line << "[VR][stereo] HAND_GLOW color-source bind current-crowd="
+             << crowdSystem << " audience=" << audience
+             << " type=" << ManagedClassName(audience);
+        auto* getter = FindNamedInstance(klass, "get_ColorTable", 0U);
+        line << " getter=" << getter->function
+             << " methodInfo=" << getter->address;
+        LogHandGlow(line.str());
+    }
+    return true;
 }
 
 UnityColor ColorForIndex(int colorIndex) noexcept {
@@ -4106,12 +4166,7 @@ void DrawControllerSticksThroughCrowd(
         LogCrowdDrawFailure("api-or-private-resource");
         return;
     }
-    // The menu/Tick path refreshes the live table. Only perform discovery in
-    // this hot per-camera/per-event hook when no table has been found yet.
-    if (g_state.colorTable.empty()) {
-        static_cast<void>(RefreshAudienceColors(false));
-    }
-    if (g_state.colorTable.empty()) {
+    if (!RefreshCurrentCrowdColors(crowdSystem)) {
         LogCrowdDrawFailure("color-table");
         return;
     }
@@ -4289,7 +4344,45 @@ void DrawControllerSticksThroughCrowd(
         g_state.crowdDrawActive = true;
         g_state.lastCrowdDrawTick = g_state.ticks;
     }
-    if (!CrowdDrawAlreadySeen(crowdSystem, renderMesh, eventType)) {
+    const bool firstDraw =
+        !CrowdDrawAlreadySeen(crowdSystem, renderMesh, eventType);
+    const ULONGLONG probeNow = GetTickCount64();
+    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled &&
+        eventType == 1 &&
+        (firstDraw || probeNow - g_state.lastCrowdColorProbeMs >= 2000U)) {
+        g_state.lastCrowdColorProbeMs = probeNow;
+        void* volume = ReadNamedRef(crowdSystem, "_audiencePenlightVolume");
+        void* audience = ReadNamedRef(volume, "_audiencePenlight");
+        if (audience == nullptr) {
+            audience = ReadNamedRef(crowdSystem, "_defaultAudiencePenlight");
+        }
+        auto probe = ClassicLine();
+        probe << "[VR][stereo] HAND_GLOW color-probe system=" << crowdSystem
+              << " audience=" << audience
+              << " audienceType=" << ManagedClassName(audience)
+              << " selected=" << g_state.colorTableInstance
+              << " selectedType=" << ManagedClassName(g_state.colorTableInstance)
+              << " sameSource=" << (audience == g_state.colorTableInstance)
+              << " slot=" << colorSlot
+              << " unique=" << g_state.uniqueColors.size()
+              << " intensity=" << intensity;
+        // Persist the resolved live entry alongside the values. This is a
+        // diagnostic observation of the existing getter, not a new callable.
+        auto* getter = FindNamedInstance(
+            g_state.colorTableClass, "get_ColorTable", 0U);
+        if (getter != nullptr) {
+            probe << " getter=" << getter->name
+                  << " function=" << getter->function
+                  << " methodInfo=" << getter->address;
+        }
+        for (unsigned int i = 0; i < 8U; ++i) {
+            const auto& value = colors->At(i);
+            probe << " uploaded" << i << "=" << value.x << ","
+                  << value.y << "," << value.z << "," << value.w;
+        }
+        LogHandGlow(probe.str());
+    }
+    if (firstDraw) {
         auto line = ClassicLine();
         line << "[VR][stereo] HAND_GLOW crowd draw ownership=mod"
              << " event=" << (eventType == 0 ? "PreDepth" : "GBuffer")
@@ -4820,7 +4913,6 @@ void DiscoverAssets() noexcept {
     if (logList) {
         LogCrowdFamily();
     }
-    static_cast<void>(TryReadAudienceColorTable(logList));
     if (TryDiscoverMobPenlight(logList)) {
         g_state.listed = true;
         return;
@@ -5081,10 +5173,12 @@ void TickHandGlowSticks(
     ++g_state.ticks;
     g_state.crowdHandPoseValid.fill(false);
     if (!GakumasLocal::Config::vrHandGlowSticks) {
+        ClearAudienceColors("config-off");
         HideHands("config-off");
         return;
     }
     if (!SceneReadyAllowsStereoRender()) {
+        ClearAudienceColors("scene-not-ready");
         g_state.listed = false;
         g_state.crowdPoseBridgeValid = false;
         g_state.crowdIntensitySources.clear();
@@ -5113,7 +5207,6 @@ void TickHandGlowSticks(
     if (!EnsureApi()) {
         return;
     }
-    static_cast<void>(RefreshAudienceColors(false));
 
     g_state.crowdGameHeadsetPose = headsetPose;
     g_state.crowdOpenXrHeadCenter = hmdOpenXrCenter;
