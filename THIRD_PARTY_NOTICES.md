@@ -6,7 +6,7 @@ gakumas-VRify builds on Localify and includes adapted integration code under [GP
 | --- | --- |
 | Localify | Pinned by `upstream.lock.json`; fetched license: `.upstream/localify/LICENSE` |
 | OpenXR header subset | [Provenance](deps/openxr/README.md), [Apache-2.0](deps/openxr/LICENSE-APACHE-2.0.txt) or [MIT](deps/openxr/LICENSE-MIT.txt) |
-| OpenXR loader | Official Khronos 1.1.61 binary fetched by `package-vr.ps1`; its supplied license is included in the package |
+| OpenXR loader | Official Khronos 1.1.61 binary fetched by `package-vr.ps1`; its supplied license is available in `.tools/openxr-loader-1.1.61/share/doc/openxr/LICENSE` after packaging |
 | SMAA | [License and copyright notices](src/vr/d3d11/smaa/LICENSE.txt) |
 | CMAA2 | [License and copyright notices](src/vr/d3d11/cmaa2/LICENSE.txt) |
 | Dear ImGui | Fetched upstream `src/imgui/LICENSE.txt` |

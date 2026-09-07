@@ -36,3 +36,17 @@ installers completed. Final game installation is the public Release package,
 with diagnostic file logging disabled. Installed and public build DLL SHA-256:
 `878B0EDE24CAF89CA969EBCA771253DF39518087713E5556A85B8BB0DB37AA60`.
 Existing compiler/dependency warnings remain. No new headset/visual test run.
+
+## 2026-09-07 — v1.0.0 minimal release archive
+
+Release packaging now emits exactly seven files: two DLLs, three JSON configs,
+and one plain UTF-8 version.txt per component. gakumas-local uses the pinned
+upstream PLUGIN_VERSION (v3.4.1); gakumas-vr uses GAKUMAS_VR_VERSION (v1.0.0).
+Markers have no BOM or newline. Licenses, BUILD_INFO and SHA256SUMS are excluded.
+
+PASS: upstream boundary, package generation, exact ZIP entry whitelist, all
+archived file bytes compared with package inputs, and exact version marker bytes.
+Existing Release DLL is unchanged; no runtime rebuild or new headset test needed.
+Five-file development install completed; release markers are archive-only under
+the existing installation whitelist. Updated local release ZIP; remote draft
+assets and release tag were not changed.
