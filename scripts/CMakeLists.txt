@@ -17,6 +17,7 @@ endforeach()
 file(WRITE "${CMAKE_BINARY_DIR}/nlohmann-json-include.txt" "${nlohmann_json_INCLUDE_DIRS}")
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "${ROOT}/src/*.cpp" "${ROOT}/src/*.rc")
+list(FILTER SOURCES EXCLUDE REGEX "\\.inc\\.cpp$")
 file(READ "${PROJECT_ROOT}/upstream.lock.json" UPSTREAM_LOCK)
 string(JSON SUBSTITUTION_COUNT LENGTH "${UPSTREAM_LOCK}" substitutions)
 math(EXPR LAST_SUBSTITUTION "${SUBSTITUTION_COUNT} - 1")

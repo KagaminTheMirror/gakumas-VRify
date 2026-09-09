@@ -371,11 +371,74 @@ void TestOffsetPoseOnLocalX() {
         "NaN local-X fails closed");
 }
 
+void TestTicketAdmissionIgnoresWallClock() {
+    using gakumas::vr::pose::PoseAdmission;
+    StereoPoseMailbox mailbox;
+    auto sample = MakeStereoSample(7, 11, 0, {});
+    sample.frameId = 4;
+    sample.inputEpoch = 2;
+    sample.viewStateFlags = 0xF;
+    mailbox.Publish(sample);
+    StereoPoseSample stored{};
+    Expect(mailbox.ReadByFrameId(4, stored), "ticket slot stores N");
+    sample.frameId = 5;
+    mailbox.Publish(sample);
+    StereoPoseSample first{};
+    Expect(mailbox.ReadByFrameId(4, first), "N stays readable after N+1 publish");
+    Expect(first.frameId == 4, "ReadByFrameId does not return latest-wins");
+
+    PoseAdmission admission{};
+    admission.frameId = 4;
+    admission.sessionGeneration = 7;
+    admission.inputEpoch = 2;
+    admission.referenceSpaceType = 3;
+    StereoPoseSample accepted{};
+    Expect(mailbox.ReadAccepted(admission, accepted), "matching ticket is accepted");
+
+    PoseAdmission wrongTicket = admission;
+    wrongTicket.frameId = 99;
+    Expect(!mailbox.ReadAccepted(wrongTicket, accepted), "wrong frameId is rejected");
+    PoseAdmission wrongEpoch = admission;
+    wrongEpoch.inputEpoch = 8;
+    Expect(!mailbox.ReadAccepted(wrongEpoch, accepted), "wrong input epoch is rejected");
+
+    gakumas::vr::pose::RelativePoseBridge bridge;
+    Pose output{};
+    const Pose game{{1.0F, 2.0F, 3.0F}, {}};
+    constexpr std::int64_t now = 10'000'000'000LL;
+    first.hostPublishTimeNanoseconds = now - 500'000'000LL;
+    Expect(
+        bridge.Update(game, first, now, 250'000'000LL, 1.0F, output, &admission) ==
+            BridgeUpdateResult::BaselineLatched,
+        "same ticket 500 ms later is still valid");
+    first.hostPublishTimeNanoseconds = now - 300'000'000LL;
+    Expect(
+        bridge.Update(game, first, now, 250'000'000LL, 1.0F, output, &admission) ==
+            BridgeUpdateResult::Applied,
+        "same ticket 300 ms later stays live");
+
+    StereoPoseSample freshWrong = first;
+    freshWrong.frameId = 6;
+    freshWrong.hostPublishTimeNanoseconds = now;
+    PoseAdmission current = admission;
+    Expect(
+        bridge.Update(game, freshWrong, now, 250'000'000LL, 1.0F, output, &current) ==
+            BridgeUpdateResult::Unavailable,
+        "fresh sample with the wrong ticket is rejected");
+    freshWrong.cancelled = true;
+    freshWrong.frameId = 4;
+    Expect(
+        bridge.Update(game, freshWrong, now, 250'000'000LL, 1.0F, output, &admission) ==
+            BridgeUpdateResult::Unavailable,
+        "cancelled ticket is rejected");
+}
+
 int main() {
     TestCoordinateConversionAndComposition();
     TestOffsetPoseOnLocalX();
     TestStereoCenterAndMailboxEpochs();
     TestRelativeBridgeLifecycleAndCuts();
+    TestTicketAdmissionIgnoresWallClock();
     TestProjectionScalarIntrinsics();
     std::cout << "Head-pose core tests passed.\n";
     return 0;

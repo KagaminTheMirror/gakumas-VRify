@@ -7,6 +7,8 @@
 #include "VrLog.hpp"
 #include "d3d11/D3D11Capture.hpp"
 #include "d3d11/StereoRenderMailbox.hpp"
+#include "frame/FrameCoordinator.hpp"
+#include "frame/FrameEndDispatch.hpp"
 #include "input/ThumbstickScroll.hpp"
 #include "openxr/OpenXrContext.hpp"
 #include "pose/StereoPoseMailbox.hpp"
@@ -100,7 +102,18 @@ public:
     [[nodiscard]] bool ReadVrCameraInput(
         camera::VrCameraInputSample& sample) const noexcept;
 
+    void OnUnityWaitPhase() noexcept;
+    [[nodiscard]] int OnUnitySubmitPhase() noexcept;
+    void OnGraphicsEndEvent(int eventId) noexcept;
+    void EnsureGraphicsBegun() noexcept;
+    [[nodiscard]] bool CurrentPoseAdmission(pose::PoseAdmission& admission) const noexcept;
+    [[nodiscard]] bool ReadStereoPoseForAdmission(
+        const pose::PoseAdmission& admission,
+        pose::StereoPoseSample& sample) const noexcept;
+    void PumpStandaloneFrame() noexcept;
+
 private:
+    [[nodiscard]] bool ShouldDeferStereoSubmit() const noexcept;
     VrRuntime() = default;
     ~VrRuntime();
 
@@ -163,6 +176,32 @@ private:
     bool inputLayoutReady_ = false;
     bool inputLayoutMismatchLogged_ = false;
     bool inputLayoutPendingLogged_ = false;
+
+    d3d11::D3D11Capture::Snapshot sessionGraphics_{};
+    d3d11::D3D11Capture::FrameSnapshot activeSourceFrame_{};
+    frame::FrameIdentity prepareTicket_{};
+    openxr::OpenXrContext::StereoFrame prepareFrame_{};
+    std::atomic<bool> unityDriving_{false};
+    std::atomic<bool> restartGraphicsRequested_{false};
+    std::uint64_t observedRunGeneration_{0};
+    bool ticketPrepared_ = false;
+    bool ticketBegun_ = false;
+    bool ticketSubmitted_ = false;
+    std::uint32_t endEventSerial_ = 0;
+    bool currentRunPoseReady_ = false;
+    bool currentRunDisplayReady_ = false;
+    bool currentRunInputReady_ = false;
+    bool everPoseReady_ = false;
+    bool runtimeReadyLogged_ = false;
+    bool displayPaused_ = false;
+
+    void PublishPreparedOutputs(std::uint64_t runGeneration);
+    void NoteSubmittedOutputs(
+        const openxr::OpenXrContext::StereoFrame& frame, std::uint64_t runGeneration);
+    bool RefreshMirrorSource();
+    bool ProcessUnityEvents() noexcept;
+    frame::FrameEndDispatch endDispatch_;
+    d3d11::D3D11Capture::FrameSnapshot queuedSourceFrame_;
 };
 
 [[nodiscard]] const char* VrRuntimeStateName(VrRuntimeState state) noexcept;

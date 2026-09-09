@@ -18,7 +18,8 @@ BridgeUpdateResult RelativePoseBridge::Update(
     std::int64_t nowNanoseconds,
     std::int64_t maximumAgeNanoseconds,
     float worldScale,
-    Pose& composed) noexcept {
+    Pose& composed,
+    const PoseAdmission* admission) noexcept {
     StereoComposedPose stereo{};
     const BridgeUpdateResult result = UpdateStereo(
         gameRequested,
@@ -26,7 +27,8 @@ BridgeUpdateResult RelativePoseBridge::Update(
         nowNanoseconds,
         maximumAgeNanoseconds,
         worldScale,
-        stereo);
+        stereo,
+        admission);
     composed = stereo.center;
     return result;
 }
@@ -37,13 +39,18 @@ BridgeUpdateResult RelativePoseBridge::UpdateStereo(
     std::int64_t nowNanoseconds,
     std::int64_t maximumAgeNanoseconds,
     float worldScale,
-    StereoComposedPose& composed) noexcept {
-    const bool timestampValid = sample.hostPublishTimeNanoseconds > 0 &&
+    StereoComposedPose& composed,
+    const PoseAdmission* admission) noexcept {
+    const bool ticketValid = admission != nullptr &&
+        SampleMatchesAdmission(sample, *admission);
+    const bool timestampValid = admission == nullptr &&
+        sample.hostPublishTimeNanoseconds > 0 &&
         nowNanoseconds >= sample.hostPublishTimeNanoseconds &&
         nowNanoseconds - sample.hostPublishTimeNanoseconds <= maximumAgeNanoseconds;
-    if (!sample.valid || sample.viewCount != 2 || !timestampValid ||
-        maximumAgeNanoseconds < 0 || !std::isfinite(worldScale) ||
-        worldScale < 0.0F) {
+    if (!sample.valid || sample.viewCount != 2 ||
+        (admission != nullptr ? !ticketValid : !timestampValid) ||
+        (admission == nullptr && maximumAgeNanoseconds < 0) ||
+        !std::isfinite(worldScale) || worldScale < 0.0F) {
         Reset();
         return BridgeUpdateResult::Unavailable;
     }

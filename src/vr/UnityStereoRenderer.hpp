@@ -71,8 +71,16 @@ struct UnitySourceCameraStateDiagnostic {
 class UnityStereoRenderer final {
 public:
     UnityStereoRenderer() = default;
+    ~UnityStereoRenderer() {
+        DropPendingStereoGpuPublish();
+        ResetAllNativeTextureLeases();
+    }
     UnityStereoRenderer(const UnityStereoRenderer&) = delete;
     UnityStereoRenderer& operator=(const UnityStereoRenderer&) = delete;
+
+    friend bool HasPendingStereoGpuPublish() noexcept;
+    friend bool ConsumePendingStereoGpuPublish() noexcept;
+    friend void DropPendingStereoGpuPublish() noexcept;
 
     void Tick(
         void* sourceCamera,
@@ -572,11 +580,13 @@ private:
     [[nodiscard]] bool CaptureSmaaT2xMotionVectorTexture(
         std::size_t eye,
         ID3D11Texture2D* texture,
+        std::uint64_t pairToken,
         int renderPassEvent,
         const char* boundary) noexcept;
     [[nodiscard]] bool CaptureTscmaaMotionVectorTexture(
         std::size_t eye,
         ID3D11Texture2D* texture,
+        std::uint64_t pairToken,
         int renderPassEvent,
         const char* boundary) noexcept;
     void BindEyeDepthOfField(std::size_t eye, void* sourceVolumeStack) noexcept;
@@ -713,13 +723,75 @@ private:
     void MaybeLogPortraitArmed(void* sourceCamera) noexcept;
     void ConsumeStageDecisionAtSafePoint() noexcept;
     void TryPublishStereoAtSafePoint() noexcept;
+    struct NativeTextureLease final {
+        void* managed = nullptr;
+        void* nativePointer = nullptr;
+        ID3D11Texture2D* texture = nullptr;
+        std::uint64_t generation = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        std::uintptr_t device = 0;
+        std::uint64_t hitCount = 0;
+        bool srgbKnown = false;
+        bool srgb = false;
+
+        void Reset() noexcept;
+        [[nodiscard]] bool Matches(
+            void* managedObject, std::uint64_t resourceGeneration) const noexcept;
+    };
+    void ResetNativeTextureLease(NativeTextureLease& lease) noexcept;
+    void ResetAllNativeTextureLeases() noexcept;
+    [[nodiscard]] bool BindNativeTextureLease(
+        void* managed,
+        std::uint64_t generation,
+        NativeTextureLease& lease,
+        const char* role,
+        std::size_t eye,
+        void** nativePointer,
+        ID3D11Texture2D** texture) noexcept;
+    [[nodiscard]] bool ReadLeaseSrgb(
+        void* managed, NativeTextureLease& lease, bool* srgb) noexcept;
+    enum class StereoGpuPublishMode : std::uint8_t {
+        MailboxOnly,
+        SmaaT2x,
+        Tscmaa,
+    };
+    struct PendingStereoGpuPublish final {
+        std::array<ID3D11Texture2D*, 2> colors{};
+        std::array<ID3D11Texture2D*, 2> motionSources{};
+        std::array<int, 2> motionEvents{};
+        std::array<void*, 2> nativePointers{};
+        pose::StereoPoseSample tracking{};
+        StereoGpuPublishMode mode = StereoGpuPublishMode::MailboxOnly;
+        bool srgb = false;
+        bool resolveTemporal = false;
+        bool comprehensiveProbe = false;
+        int quality = 0;
+        std::uint32_t phase = 0;
+        std::uint64_t token = 0;
+        bool valid = false;
+
+        void Reset() noexcept;
+        [[nodiscard]] bool HasWork() const noexcept;
+    };
+    [[nodiscard]] bool QueueStereoGpuPublish(
+        const std::array<ID3D11Texture2D*, 2>& colors,
+        const std::array<void*, 2>& nativePointers,
+        StereoGpuPublishMode mode,
+        bool srgb,
+        bool resolveTemporal) noexcept;
+    [[nodiscard]] bool HasPendingStereoGpuPublish() const noexcept;
+    [[nodiscard]] bool ConsumePendingStereoGpuPublish() noexcept;
+    void DropPendingStereoGpuPublish() noexcept;
+    void ApplyPendingGpuFailure() noexcept;
     // Legacy method/field names are retained because the GPU-ordered copy
     // bridge was proven by SMAA T2x; both native temporal modes share it while
     // feeding distinct pass-owned immutable snapshots and histories.
     [[nodiscard]] bool EnsureSmaaT2xMotionCopyTarget(
         std::size_t eye, void* source) noexcept;
     [[nodiscard]] bool EnsureSmaaT2xMotionCopyCommandBuffer() noexcept;
-    [[nodiscard]] bool CaptureQueuedSmaaT2xMotionVectors() noexcept;
+    [[nodiscard]] bool BindQueuedSmaaT2xMotionVectors() noexcept;
     void RetireSmaaT2xMotionCopyTargets(const char* reason) noexcept;
     void ResetTemporalHistories(const char* reason) noexcept;
     void FallBackSmaaT2x(const char* reason) noexcept;
@@ -815,7 +887,7 @@ private:
     std::uint32_t smaaT2xMotionCopyWidth_ = 0;
     std::uint32_t smaaT2xMotionCopyHeight_ = 0;
     bool smaaT2xMotionCopyBufferLogged_ = false;
-    bool smaaT2xOrderedMotionReadyForPair_ = false;
+    bool smaaT2xMotionSourcesReadyForPair_ = false;
     std::uint64_t smaaT2xMotionBoundaryCount_ = 0;
     std::array<bool, 2> smaaT2xMotionHistoryCorrectedForPair_{};
     std::array<std::uint64_t, 2> smaaT2xMotionHistoryCorrectionCount_{};
@@ -843,6 +915,9 @@ private:
     std::array<Il2CppGCHandle, 2> admissionTargetHandles_{};
     std::array<void*, 2> fullTargets_{};
     std::array<Il2CppGCHandle, 2> fullTargetHandles_{};
+    std::array<NativeTextureLease, 2> colorNativeLeases_{};
+    std::array<NativeTextureLease, 2> motionNativeLeases_{};
+    std::uint64_t smaaT2xMotionCopyEpoch_ = 0;
     // Retired eye textures stay rooted after RenderTexture.Release() freed
     // their GPU surfaces: Unity may still hold managed references, and a
     // collected shell would turn those into a dangling native pointer.
@@ -862,6 +937,9 @@ private:
     std::uint8_t observedMask_ = 0;
     std::uint64_t armedPoseRevision_ = 0;
     std::uint64_t publishedFrames_ = 0;
+    mutable std::mutex pendingGpuMutex_;
+    PendingStereoGpuPublish pendingGpuPublish_{};
+    std::atomic<const char*> pendingGpuFailure_{nullptr};
     std::uint32_t ownerThreadId_ = 0;
     UnityStereoCameraFrame armedFrame_{};
     void* latestSourceCamera_ = nullptr;

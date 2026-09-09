@@ -17,6 +17,7 @@
 #include <cstring>
 #include "GakumasLocalify/camera/camera.hpp"
 #include "vr/config/VrifyConfig.hpp"
+#include "vr/PerformanceTiming.hpp"
 // #include <jni.h>
 #include <thread>
 #include <map>
@@ -42,6 +43,7 @@
     #include "vr/VrPhotoShutter.hpp"
     #include "vr/SkyRenderHooks.hpp"
     #include "vr/UnityStereoRenderer.hpp"
+    #include "vr/frame/FrameLoopDriver.hpp"
     #include "vr/GripTransparencyTrace.hpp"
     #include "vr/GripBlurSource.hpp"
     #include "vr/VrHandGlowSticks.hpp"
@@ -1451,6 +1453,10 @@ namespace GakumasLocal::HookMain {
                 static_cast<double>(now - lastUpdateNanoseconds) * 1.0e-9);
         }
         lastUpdateNanoseconds = now;
+        constexpr float kMaxFreeCameraDeltaSeconds = 0.10F;
+        if (dtSeconds > kMaxFreeCameraDeltaSeconds) {
+            dtSeconds = kMaxFreeCameraDeltaSeconds;
+        }
 
         vrcam::VrFreeCameraCommands commands;
         commands.dtSeconds = dtSeconds;
@@ -1480,10 +1486,12 @@ namespace GakumasLocal::HookMain {
             consumedCharaPresses = input.charaPressCount;
             consumedResetPresses = input.resetPressCount;
 
-            constexpr std::int64_t kInputStaleNanoseconds = 250'000'000LL;
-            const bool inputFresh =
-                now - input.publishTimeNanoseconds < kInputStaleNanoseconds;
-            if (inputFresh && !input.menuVisible) {
+            gakumas::vr::pose::PoseAdmission admission{};
+            const bool ticketOk =
+                gakumas::vr::VrRuntime::Instance().CurrentPoseAdmission(admission) &&
+                !input.cancelled && input.frameId == admission.frameId &&
+                input.sessionGeneration == admission.sessionGeneration;
+            if (ticketOk && !input.menuVisible) {
                 commands.leftStickX = input.leftStickX;
                 commands.leftStickY = input.leftStickY;
                 commands.rightStickX = input.rightStickX;
@@ -1671,7 +1679,13 @@ namespace GakumasLocal::HookMain {
         }
 
         gakumas::vr::pose::StereoPoseSample trackedPose;
-        gakumas::vr::ReadLatestStereoPose(trackedPose);
+        gakumas::vr::pose::PoseAdmission admission{};
+        if (!gakumas::vr::VrRuntime::Instance().CurrentPoseAdmission(admission) ||
+            !gakumas::vr::VrRuntime::Instance().ReadStereoPoseForAdmission(
+                admission, trackedPose)) {
+            InvalidateVrStereoCameraFrame();
+            return;
+        }
         const gakumas::vr::pose::Pose gameRequested{
             {gamePosition.x, gamePosition.y, gamePosition.z},
             {gameRotation.x, gameRotation.y, gameRotation.z, gameRotation.w},
@@ -1686,7 +1700,6 @@ namespace GakumasLocal::HookMain {
             bridgeBase = gameRequested;
         }
         gakumas::vr::pose::StereoComposedPose composed{};
-        constexpr std::int64_t kMaximumPoseAgeNanoseconds = 250'000'000LL;
         const float worldScale = Config::vrWorldScale;
         gakumas::vr::pose::BridgeUpdateResult result;
         {
@@ -1695,9 +1708,10 @@ namespace GakumasLocal::HookMain {
                 bridgeBase,
                 trackedPose,
                 gakumas::vr::pose::MonotonicNowNanoseconds(),
-                kMaximumPoseAgeNanoseconds,
+                -1,
                 worldScale,
-                composed);
+                composed,
+                &admission);
             if (result == gakumas::vr::pose::BridgeUpdateResult::BaselineLatched) {
                 std::ostringstream stream;
                 stream << "[VR][camera] HEAD_POSE_BASELINE_LATCHED session="
@@ -3458,6 +3472,7 @@ namespace GakumasLocal::HookMain {
         // frame boundary so owned EndCamera callbacks can be attributed.
         if (outerNormalLoop &&
             unityRenderPipelineGuardReady.load(std::memory_order_acquire)) {
+            gakumas::vr::VrRuntime::Instance().EnsureGraphicsBegun();
             if (!unityRenderLoopHookHitLogged.exchange(
                     true, std::memory_order_acq_rel)) {
                 std::ostringstream boundary;
@@ -3474,7 +3489,13 @@ namespace GakumasLocal::HookMain {
             }
         }
 #endif
+        static thread_local gakumas::vr::perf::Accumulator renderTiming;
+        gakumas::vr::perf::Scope renderScope(renderTiming,
+            Config::vrDiagnosticsStartupEnabled && outerNormalLoop,
+            "unity.render-loop-original",
+            [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
         DoRenderLoopInternal_Orig(pipelineAsset, loopPtr, renderRequest, method);
+        renderScope.Stop();
         if (unityRenderLoopDepth != 0U) {
             --unityRenderLoopDepth;
         }
@@ -3487,6 +3508,7 @@ namespace GakumasLocal::HookMain {
             try {
                 unityStereoRenderer.OnEndContext(true);
                 unityStereoRenderer.OnRenderLoopCompleted();
+                gakumas::vr::FrameLoopDriverAfterSrp();
             } catch (...) {
                 ReportVrUnityHookException();
             }

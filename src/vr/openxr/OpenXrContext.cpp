@@ -8,6 +8,8 @@
 
 #include "../config/VrifyConfig.hpp"
 #include "../VrLog.hpp"
+#include "../PerformanceTiming.hpp"
+#include "../frame/FrameCoordinator.hpp"
 
 #include <d3d11_4.h>
 
@@ -693,24 +695,41 @@ bool OpenXrContext::ValidateStereoViewConfiguration(VrLog& log) {
     }
 
     lastResult_ = XR_SUCCESS;
+    const auto queriedWidth = views[0].recommendedImageRectWidth;
+    const auto queriedHeight = views[0].recommendedImageRectHeight;
     log.Write(
         "[VR][pose] PRIMARY_STEREO views=2 recommended=" +
-        std::to_string(views[0].recommendedImageRectWidth) + "x" +
-        std::to_string(views[0].recommendedImageRectHeight) + "," +
+        std::to_string(queriedWidth) + "x" +
+        std::to_string(queriedHeight) + "," +
         std::to_string(views[1].recommendedImageRectWidth) + "x" +
         std::to_string(views[1].recommendedImageRectHeight));
+    if (queriedWidth == 0 || queriedHeight == 0) {
+        if (recommendedEyeWidth_ == 0 || recommendedEyeHeight_ == 0) {
+            lastResult_ = XR_ERROR_RUNTIME_FAILURE;
+            log.Write(
+                "[VR][pose] PRIMARY_STEREO recommended 0x0 with no cached "
+                "eye size; refusing to publish a 2x2 target spec");
+            return false;
+        }
+        log.Write(
+            "[VR][pose] PRIMARY_STEREO recommended 0x0 after session teardown; "
+            "keeping cached " +
+            std::to_string(recommendedEyeWidth_) + "x" +
+            std::to_string(recommendedEyeHeight_));
+    } else {
+        recommendedEyeWidth_ = queriedWidth;
+        recommendedEyeHeight_ = queriedHeight;
+    }
     if (!consoleSummaryLogged_ && !runtimeName_.empty() && !systemName_.empty()) {
         ::gakumas::vr::WriteVrConsole(
             "OpenXR runtime=" + runtimeName_ +
             " version=" + runtimeVersionText_ +
             " HMD=" + systemName_ +
             " views=2 recommended=" +
-            std::to_string(views[0].recommendedImageRectWidth) + "x" +
-            std::to_string(views[0].recommendedImageRectHeight));
+            std::to_string(recommendedEyeWidth_) + "x" +
+            std::to_string(recommendedEyeHeight_));
         consoleSummaryLogged_ = true;
     }
-    recommendedEyeWidth_ = views[0].recommendedImageRectWidth;
-    recommendedEyeHeight_ = views[0].recommendedImageRectHeight;
     stereoEyeWidth_ = ScaledEyeExtent(
         recommendedEyeWidth_, stereoRenderScale_, mirrorMaximumWidth_);
     stereoEyeHeight_ = ScaledEyeExtent(
@@ -1614,7 +1633,7 @@ void OpenXrContext::SyncPointerInput(
             dtSeconds = static_cast<float>(
                 static_cast<double>(displayTime - pointerFilterTime_[hand]) *
                 1.0e-9);
-            dtSeconds = std::min(dtSeconds, 0.10F);
+            dtSeconds = std::min(dtSeconds, 0.10F); // M2: 1€ dt matches 100 ms cap
         }
         pointerFilterTime_[hand] = displayTime;
 
@@ -2747,6 +2766,16 @@ void OpenXrContext::UpdateStereoUiPanelState(
     if (!stereoSceneEligible) {
         stereoUiPanelVisible_ = false;
     }
+    RefreshStereoUiInputState(projectionReady, mirrorReady, frame);
+    if (frame.mirrorPresentationChanged) {
+        log.Write(std::string("[VR][input] UI_INPUT_STATE enabled=") +
+            (frame.mirrorInputEnabled ? "1" : "0") + " menu=" +
+            (aaMenuVisible_ ? "1" : "0"));
+    }
+}
+
+void OpenXrContext::RefreshStereoUiInputState(
+    bool projectionReady, bool mirrorReady, StereoFrame& frame) {
     // The menu lives on its own swapchain, so it no longer depends on the
     // mirror quad being ready. RunFrame narrows this to the painted result.
     frame.aaMenuVisible = aaMenuVisible_;
@@ -2756,10 +2785,12 @@ void OpenXrContext::UpdateStereoUiPanelState(
     frame.mirrorInputEnabled = mirrorReady && !aaMenuVisible_ &&
         !panelAdjustMode_ &&
         (!projectionReady || frame.stereoUiPanelVisible);
-    frame.mirrorPresentationChanged = mirrorInputStateInitialized_ &&
-        frame.mirrorInputEnabled != lastMirrorInputEnabled_;
-    mirrorInputStateInitialized_ = true;
-    lastMirrorInputEnabled_ = frame.mirrorInputEnabled;
+    frame.mirrorPresentationChanged = frame.mirrorPresentationChanged ||
+        (mirrorInputStateInitialized_.load(std::memory_order_acquire) &&
+         frame.mirrorInputEnabled !=
+             lastMirrorInputEnabled_.load(std::memory_order_acquire));
+    mirrorInputStateInitialized_.store(true, std::memory_order_release);
+    lastMirrorInputEnabled_.store(frame.mirrorInputEnabled, std::memory_order_release);
 }
 
 bool OpenXrContext::CreateMirrorSwapchain(VrLog& log) {
@@ -2957,6 +2988,7 @@ bool OpenXrContext::DestroyMirrorSwapchainForRebuild(VrLog& log) {
 bool OpenXrContext::EnsureMirrorLayout(
     ID3D11Texture2D* sourceFrame,
     std::uint64_t sourceLayoutGeneration,
+    bool allowRebuild,
     bool& layoutChanged,
     VrLog& log) {
     layoutChanged = false;
@@ -2990,6 +3022,13 @@ bool OpenXrContext::EnsureMirrorLayout(
         mirrorSwapchain_ != XR_NULL_HANDLE) {
         mirrorLayoutGeneration_ = sourceLayoutGeneration;
         return true;
+    }
+    if (!allowRebuild) {
+        if (mirrorSwapchain_ != XR_NULL_HANDLE) {
+            return true;
+        }
+        lastResult_ = XR_ERROR_VALIDATION_FAILURE;
+        return false;
     }
 
     if (sourceDescription.Width > mirrorMaximumWidth_ ||
@@ -3381,7 +3420,8 @@ bool OpenXrContext::RenderMenuFrame(
     }
 
     if (output.requestRenderScale) {
-        ApplyStereoRenderScale(output.renderScale, log);
+        pendingStereoRenderScale_.store(output.renderScale, std::memory_order_release);
+        pendingStereoRenderScaleValid_.store(true, std::memory_order_release);
     }
     if (output.requestClose) {
         aaMenuVisible_ = false;
@@ -3592,7 +3632,12 @@ bool OpenXrContext::RenderProjectionFrame(
     }
     XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
+    static thread_local perf::Accumulator imageWaitTiming, flipTiming;
+    const auto timingSink = [&log](std::string_view line) noexcept { log.Write(line); };
+    const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
+    perf::Scope imageWaitScope(imageWaitTiming, timing, "xr.projection-image-wait", timingSink);
     lastResult_ = dispatch_.WaitSwapchainImage()(projectionSwapchain_, &waitInfo);
+    imageWaitScope.Stop();
     if (XR_FAILED(lastResult_)) {
         XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         dispatch_.ReleaseSwapchainImage()(projectionSwapchain_, &releaseInfo);
@@ -3600,6 +3645,7 @@ bool OpenXrContext::RenderProjectionFrame(
     }
 
     ID3D11Texture2D* destination = projectionImages_[imageIndex].texture;
+    perf::Scope flipScope(flipTiming, timing, "xr.projection-flip", timingSink);
     if (!projectionVerticalFlip_.FlipStereo(
             sessionContext_, stereoFrame.textures, destination)) {
         log.Write(
@@ -3628,6 +3674,7 @@ bool OpenXrContext::RenderProjectionFrame(
             std::to_string(static_cast<unsigned int>(
                 projectionVerticalFlip_.ViewFormat())));
     }
+    flipScope.Stop();
     if (stereoFrame.generation != lastProjectionFingerprintGeneration_ &&
         stereoFrame.generation <= 2U) {
         lastProjectionFingerprintGeneration_ = stereoFrame.generation;
@@ -3856,6 +3903,7 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                     exitRequested_ = false;
                     triggerHeld_.fill(false);
                     ++sessionRunGeneration_;
+                    ResetFrameProtocol();
                     log.Write("[VR][runtime] xrBeginSession succeeded");
                 }
 
@@ -3875,6 +3923,14 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                         log.Write(
                             "[VR][runtime] xrEndSession failed: " +
                             dispatch_.ResultText(instance_, lastResult_));
+                        // Unity may still have a begun frame when STOPPING
+                        // arrives for a graphics rebuild. Treat call-order
+                        // failure as an orderly exit so the worker can rebuild
+                        // instead of faulting the whole runtime.
+                        if (lastResult_ == XR_ERROR_CALL_ORDER_INVALID) {
+                            lastResult_ = XR_SUCCESS;
+                            return EventResult::SessionExiting;
+                        }
                         return ClassifyEventResult(lastResult_);
                     }
                     log.Write("[VR][runtime] xrEndSession succeeded");
@@ -3904,501 +3960,7 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
     return EventResult::Healthy;
 }
 
-OpenXrContext::FrameResult OpenXrContext::RunFrame(
-    StereoFrame& frame,
-    ID3D11Texture2D* sourceFrame,
-    std::uint64_t sourceFrameGeneration,
-    std::uint64_t sourceLayoutGeneration,
-    const d3d11::StereoRenderMailbox* stereoMailbox,
-    VrLog& log) {
-    // gripPanelTransparent is the only caller-input field on the otherwise
-    // output-only frame; latch it across the reset.
-    const bool gripPanelTransparent = frame.gripPanelTransparent;
-    frame = StereoFrame{};
-    frame.gripPanelTransparent = gripPanelTransparent;
-
-    if (session_ == XR_NULL_HANDLE || localSpace_ == XR_NULL_HANDLE) {
-        lastResult_ = XR_ERROR_HANDLE_INVALID;
-        log.Write("[VR][runtime] frame skipped: session or LOCAL space is unavailable");
-        return FrameResult::Failed;
-    }
-    if (!sessionRunning_) {
-        lastResult_ = XR_ERROR_SESSION_NOT_RUNNING;
-        return FrameResult::SessionNotRunning;
-    }
-    if (dispatch_.WaitFrame() == nullptr || dispatch_.BeginFrame() == nullptr ||
-        dispatch_.LocateViews() == nullptr || dispatch_.EndFrame() == nullptr) {
-        lastResult_ = XR_ERROR_FUNCTION_UNSUPPORTED;
-        log.Write("[VR][runtime] frame entry points are unavailable");
-        return FrameResult::Failed;
-    }
-
-    bool mirrorLayoutChanged = false;
-    if (!EnsureMirrorLayout(
-            sourceFrame,
-            sourceLayoutGeneration,
-            mirrorLayoutChanged,
-            log)) {
-        return ClassifyFrameResult(lastResult_);
-    }
-    frame.mirrorLayoutChanged = mirrorLayoutChanged;
-    frame.mirrorLayoutGeneration = mirrorLayoutGeneration_;
-    frame.mirrorWidth = mirrorWidth_;
-    frame.mirrorHeight = mirrorHeight_;
-
-    bool sessionLossPending = false;
-    XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
-    XrFrameState frameState{XR_TYPE_FRAME_STATE};
-    lastResult_ = dispatch_.WaitFrame()(session_, &waitInfo, &frameState);
-    if (XR_FAILED(lastResult_)) {
-        log.Write(
-            "[VR][runtime] xrWaitFrame failed: " +
-            dispatch_.ResultText(instance_, lastResult_));
-        return ClassifyFrameResult(lastResult_);
-    }
-    sessionLossPending = lastResult_ == XR_SESSION_LOSS_PENDING;
-    frame.predictedDisplayTime = frameState.predictedDisplayTime;
-    frame.predictedDisplayPeriod = frameState.predictedDisplayPeriod;
-    frame.shouldRender = frameState.shouldRender == XR_TRUE;
-
-    XrTime appliedReferenceSpaceChangeTime = 0;
-    std::size_t appliedReferenceSpaceChangeCount = 0;
-    for (const XrTime changeTime : pendingReferenceSpaceChangeTimes_) {
-        if (frameState.predictedDisplayTime < changeTime) {
-            break;
-        }
-        appliedReferenceSpaceChangeTime =
-            std::max(appliedReferenceSpaceChangeTime, changeTime);
-        ++appliedReferenceSpaceChangeCount;
-    }
-    frame.referenceSpaceChanged = appliedReferenceSpaceChangeCount != 0;
-    const XrTime effectiveProjectionTrackingTimeFloor = std::max(
-        projectionTrackingTimeFloor_, appliedReferenceSpaceChangeTime);
-
-    XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-    lastResult_ = dispatch_.BeginFrame()(session_, &beginInfo);
-    if (XR_FAILED(lastResult_)) {
-        log.Write(
-            "[VR][runtime] xrBeginFrame failed: " +
-            dispatch_.ResultText(instance_, lastResult_));
-        return ClassifyFrameResult(lastResult_);
-    }
-    sessionLossPending =
-        sessionLossPending || lastResult_ == XR_SESSION_LOSS_PENDING;
-    frame.frameDiscarded = lastResult_ == XR_FRAME_DISCARDED;
-
-    XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
-    locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    locateInfo.displayTime = frameState.predictedDisplayTime;
-    locateInfo.space = stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_;
-    XrViewState viewState{XR_TYPE_VIEW_STATE};
-    std::array<XrView, 2> views{
-        XrView{XR_TYPE_VIEW},
-        XrView{XR_TYPE_VIEW},
-    };
-    uint32_t viewCount = 0;
-    const XrResult locateResult = dispatch_.LocateViews()(
-        session_,
-        &locateInfo,
-        &viewState,
-        static_cast<uint32_t>(views.size()),
-        &viewCount,
-        views.data());
-
-    if (XR_SUCCEEDED(locateResult)) {
-        sessionLossPending =
-            sessionLossPending || locateResult == XR_SESSION_LOSS_PENDING;
-        frame.viewStateFlags = viewState.viewStateFlags;
-        frame.viewCount = std::min(viewCount, static_cast<uint32_t>(views.size()));
-        for (uint32_t index = 0; index < frame.viewCount; ++index) {
-            frame.views[index].pose = views[index].pose;
-            frame.views[index].fov = views[index].fov;
-        }
-    } else {
-        log.Write(
-            "[VR][runtime] xrLocateViews failed: " +
-            dispatch_.ResultText(instance_, locateResult));
-    }
-
-    // Panel placement first: SyncPointerInput hit-tests against the poses
-    // this computes for the current predicted display time.
-    UpdatePanelPlacementFrame(frameState.predictedDisplayTime, log);
-    SyncPointerInput(frame.pointers, frameState.predictedDisplayTime, log);
-
-    // xrWaitFrame is the longest blocking section in this worker. Read the
-    // mailbox only after it returns so the copy uses the newest immutable
-    // generation instead of a pre-wait pose paired with pixels Unity may have
-    // already replaced.
-    d3d11::StereoRenderMailbox::Snapshot latestStereoFrame;
-    const bool stereoFrameAvailable = stereoMailbox != nullptr &&
-        stereoMailbox->ReadLatest(latestStereoFrame);
-    const d3d11::StereoRenderMailbox::Snapshot* stereoFrame =
-        stereoFrameAvailable ? &latestStereoFrame : nullptr;
-
-    bool mirrorReady = false;
-    bool menuReady = false;
-    bool overlayReady = false;
-    bool projectionReady = false;
-    const pose::StereoPoseSample* projectionTrackingSample = nullptr;
-    XrResult mirrorResult = XR_SUCCESS;
-    if (frame.shouldRender) {
-        constexpr std::int64_t kMaximumStereoFrameAgeNanoseconds = 250'000'000LL;
-        const std::int64_t stereoCheckTimeNanoseconds =
-            pose::MonotonicNowNanoseconds();
-        const std::int64_t stereoFrameAgeNanoseconds =
-            stereoFrame != nullptr && stereoFrame->hostPublishTimeNanoseconds > 0 &&
-                stereoCheckTimeNanoseconds >= stereoFrame->hostPublishTimeNanoseconds
-            ? stereoCheckTimeNanoseconds - stereoFrame->hostPublishTimeNanoseconds
-            : -1;
-        const bool stereoFrameFresh = stereoFrame != nullptr &&
-            !frame.referenceSpaceChanged &&
-            stereoFrame->IsComplete() &&
-            stereoFrame->trackingSample.sessionGeneration == sessionRunGeneration_ &&
-            stereoFrame->trackingSample.referenceSpaceType ==
-                static_cast<std::int32_t>(ActiveReferenceSpaceType()) &&
-            stereoFrame->trackingSample.predictedDisplayTime >=
-                effectiveProjectionTrackingTimeFloor &&
-            stereoFrame->hostPublishTimeNanoseconds > 0 &&
-            stereoFrameAgeNanoseconds >= 0 &&
-            stereoFrameAgeNanoseconds <= kMaximumStereoFrameAgeNanoseconds;
-        const bool stereoSceneEligible = stereoProjectionEnabled_ &&
-            !projectionDisabledForSession_ &&
-            (!stereoLandscapeOnly_ || mirrorWidth_ >= mirrorHeight_);
-        if (stereoSceneEligible &&
-            stereoFrameFresh) {
-            const bool newStereoFrame =
-                stereoFrame->generation != lastSubmittedStereoGeneration_;
-            projectionReady = newStereoFrame
-                ? RenderProjectionFrame(*stereoFrame, log)
-                : projectionSwapchain_ != XR_NULL_HANDLE &&
-                    lastSubmittedStereoTrackingSample_.valid;
-            if (!projectionReady) {
-                log.Write(
-                    "[VR][stereo] PROJECTION_DISABLED_FOR_SESSION result=" +
-                    dispatch_.ResultText(instance_, lastResult_));
-                projectionDisabledForSession_ = true;
-                ResetProjectionSwapchain();
-            } else {
-                if (newStereoFrame) {
-                    lastSubmittedStereoGeneration_ = stereoFrame->generation;
-                    lastSubmittedStereoTrackingSample_ =
-                        stereoFrame->trackingSample;
-                    lastSubmittedStereoHostPublishTimeNanoseconds_ =
-                        stereoFrame->hostPublishTimeNanoseconds;
-                }
-                projectionTrackingSample =
-                    &lastSubmittedStereoTrackingSample_;
-                frame.stereoFrameGeneration = lastSubmittedStereoGeneration_;
-                ++stereoSubmissionCount_;
-                if (newStereoFrame) {
-                    ++freshStereoSubmissionCount_;
-                } else {
-                    ++repeatedStereoSubmissionCount_;
-                    if (!repeatedStereoReuseLogged_) {
-                        repeatedStereoReuseLogged_ = true;
-                        log.Write(
-                            "[VR][stereo] PROJECTION_REUSED generation=" +
-                            std::to_string(lastSubmittedStereoGeneration_) +
-                            " copy=skipped poseRevision=" +
-                            std::to_string(
-                                lastSubmittedStereoTrackingSample_.revision));
-                    }
-                }
-                if (stereoSubmissionCount_ <= 4U ||
-                    stereoSubmissionCount_ % 300U == 0U) {
-                    std::ostringstream timing;
-                    timing << "[VR][stereo] PROJECTION_TIMING samples="
-                           << stereoSubmissionCount_
-                           << " generation=" << stereoFrame->generation
-                           << " new=" << newStereoFrame
-                           << " copied=" << newStereoFrame
-                           << " stagingSlot=" << stereoFrame->StagingSlot()
-                           << " fresh=" << freshStereoSubmissionCount_
-                           << " repeated=" << repeatedStereoSubmissionCount_
-                           << " ageMs="
-                           << static_cast<double>(stereoFrameAgeNanoseconds) /
-                                  1'000'000.0
-                           << " poseRevision="
-                           << stereoFrame->trackingSample.revision
-                           << " predictedDisplayTime="
-                           << stereoFrame->trackingSample.predictedDisplayTime
-                           << " submitDisplayTime="
-                           << frameState.predictedDisplayTime
-                           << " displayDeltaMs="
-                           << static_cast<double>(
-                                  frameState.predictedDisplayTime -
-                                  stereoFrame->trackingSample.predictedDisplayTime) /
-                                  1'000'000.0;
-                    log.Write(timing.str());
-                }
-            }
-        }
-        const bool mirrorSwapchainReady = mirrorSwapchain_ != XR_NULL_HANDLE;
-        UpdateStereoUiPanelState(
-            frame.pointers,
-            stereoSceneEligible,
-            projectionReady,
-            mirrorSwapchainReady,
-            frameState.predictedDisplayTime,
-            frame,
-            log);
-        bool gripNeedsMirrorRefresh = false;
-        for (std::size_t hand = 0; hand < frame.pointers.size(); ++hand) {
-            const auto& pointer = frame.pointers[hand];
-            gripNeedsMirrorRefresh = gripNeedsMirrorRefresh || gripHeld_[hand] ||
-                (pointer.gripActive &&
-                 pointer.gripValue >= kGripPressThreshold);
-        }
-        const bool mirrorRefreshRequired =
-            !projectionReady || stereoUiPanelVisible_ ||
-            gripNeedsMirrorRefresh || panelAdjustMode_;
-        if (mirrorRefreshRequired) {
-            if (mirrorCopySuspended_) {
-                mirrorCopySuspended_ = false;
-                log.Write("[VR][display] MIRROR_COPY_RESUMED reason=grip-or-panel-or-fallback");
-            }
-            mirrorReady = RenderMirrorFrame(
-                sourceFrame, sourceFrameGeneration, frame.pointers, log);
-            mirrorResult = lastResult_;
-            if (mirrorReady) {
-                frame.sourceFrameGeneration = sourceFrameGeneration;
-            }
-        } else if (!mirrorCopySuspended_) {
-            mirrorCopySuspended_ = true;
-            log.Write("[VR][display] MIRROR_COPY_SUSPENDED reason=stereo-panel-hidden");
-        }
-        if (!mirrorReady) {
-            frame.stereoUiPanelVisible = false;
-            frame.mirrorInputEnabled = false;
-        } else {
-            frame.stereoUiPanelVisible =
-                projectionReady && stereoUiPanelVisible_ && !aaMenuVisible_;
-            frame.mirrorInputEnabled = !aaMenuVisible_ && !panelAdjustMode_ &&
-                (!projectionReady || frame.stereoUiPanelVisible);
-        }
-        if (aaMenuVisible_) {
-            menuReady = RenderMenuFrame(frame.pointers, log);
-        }
-        if (panelAdjustMode_ || panelToastKind_ != 0) {
-            overlayReady = RenderPanelOverlayFrame(frame.pointers, log);
-        }
-    } else {
-        UpdateStereoUiPanelState(
-            frame.pointers,
-            false,
-            false,
-            false,
-            frameState.predictedDisplayTime,
-            frame,
-            log);
-    }
-    frame.aaMenuVisible = menuReady;
-
-    // xrEndFrame is required for every successful xrBeginFrame, including
-    // shouldRender == false and all xrLocateViews failure paths.
-    // The game panel rides the adjustable placement: head-locked VIEW pose by
-    // default, or the base-space pinned pose (direction frozen, position
-    // following the head) computed by UpdatePanelPlacementFrame.
-    XrSpace panelSpace = panelPoseUsesBase_
-        ? (stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_)
-        : viewSpace_;
-    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    quad.space = panelSpace;
-    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    quad.subImage.swapchain = mirrorSwapchain_;
-    quad.subImage.imageRect.extent.width = static_cast<int32_t>(mirrorWidth_);
-    quad.subImage.imageRect.extent.height = static_cast<int32_t>(mirrorHeight_);
-    quad.pose = ToXrPose(panelPoseUsesBase_ ? panelPoseBase_ : panelPoseView_);
-    quad.size.width = panelQuadWidth_;
-    quad.size.height = mirrorWidth_ == 0
-        ? 0.0F
-        : quad.size.width *
-            static_cast<float>(mirrorHeight_) /
-            static_cast<float>(mirrorWidth_);
-    // Grip transparency: with the backbuffer cleared to alpha-0 black, UI
-    // drawn via SrcAlpha blending is already premultiplied, matching the
-    // OpenXR source-alpha convention. Only over a live projection layer —
-    // the title / loading / missing-stereo fallback stays opaque.
-    if (frame.gripPanelTransparent && projectionReady) {
-        quad.layerFlags |= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    }
-    // Adjust bar: panel-attached strip from the shared overlay texture.
-    XrCompositionLayerQuad barQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    barQuad.space = panelSpace;
-    barQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    barQuad.subImage.swapchain = panelOverlaySwapchain_;
-    barQuad.subImage.imageRect.offset = {0, 0};
-    barQuad.subImage.imageRect.extent.width =
-        static_cast<int32_t>(kPanelOverlayTextureWidth);
-    barQuad.subImage.imageRect.extent.height =
-        static_cast<int32_t>(kPanelOverlayBarHeight);
-    barQuad.pose = ToXrPose(panelPoseUsesBase_ ? barPoseBase_ : barPoseView_);
-    barQuad.size.width = barQuadWidth_;
-    barQuad.size.height = barQuadHeight_;
-    // Hint / toast: head-locked quad cropped to the fitted text box the
-    // painter reported (centered horizontally in the strip).
-    constexpr float kHintMetresPerPixel =
-        kHintQuadWidthMetres / static_cast<float>(kPanelOverlayTextureWidth);
-    const std::uint32_t hintWidthPx =
-        std::min(panelHintWidthPx_, kPanelOverlayTextureWidth);
-    const std::uint32_t hintHeightPx =
-        std::min(panelHintHeightPx_, kPanelOverlayHintHeight);
-    XrCompositionLayerQuad hintQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    hintQuad.space = viewSpace_;
-    hintQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    hintQuad.subImage.swapchain = panelOverlaySwapchain_;
-    hintQuad.subImage.imageRect.offset = {
-        static_cast<int32_t>((kPanelOverlayTextureWidth - hintWidthPx) / 2U),
-        static_cast<int32_t>(kPanelOverlayHintTop)};
-    hintQuad.subImage.imageRect.extent.width =
-        static_cast<int32_t>(hintWidthPx);
-    hintQuad.subImage.imageRect.extent.height =
-        static_cast<int32_t>(hintHeightPx);
-    hintQuad.pose = ToXrPose(hintPoseView_);
-    hintQuad.size.width = static_cast<float>(hintWidthPx) * kHintMetresPerPixel;
-    hintQuad.size.height =
-        static_cast<float>(hintHeightPx) * kHintMetresPerPixel;
-    XrCompositionLayerQuad menuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    menuQuad.space = viewSpace_;
-    menuQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    menuQuad.subImage.swapchain = menuSwapchain_;
-    menuQuad.subImage.imageRect.extent.width = static_cast<int32_t>(menuWidth_);
-    menuQuad.subImage.imageRect.extent.height = static_cast<int32_t>(menuHeight_);
-    menuQuad.pose.orientation.w = 1.0F;
-    menuQuad.pose.position.z = kMenuPlaneZ;
-    menuQuad.size.width = kMenuWidthMetres;
-    menuQuad.size.height = kMenuHeightMetres;
-    std::array<XrCompositionLayerProjectionView, 2> projectionViews{
-        XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
-        XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
-    };
-    XrCompositionLayerProjection projection{
-        XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projection.space = stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_;
-    projection.viewCount = static_cast<uint32_t>(projectionViews.size());
-    projection.views = projectionViews.data();
-    if (projectionReady) {
-        for (std::size_t eyeIndex = 0; eyeIndex < projectionViews.size(); ++eyeIndex) {
-            const auto& trackedEye =
-                projectionTrackingSample->eyes[eyeIndex];
-            projectionViews[eyeIndex].pose.position = {
-                trackedEye.pose.position.x,
-                trackedEye.pose.position.y,
-                trackedEye.pose.position.z,
-            };
-            projectionViews[eyeIndex].pose.orientation = {
-                trackedEye.pose.orientation.x,
-                trackedEye.pose.orientation.y,
-                trackedEye.pose.orientation.z,
-                trackedEye.pose.orientation.w,
-            };
-            projectionViews[eyeIndex].fov = {
-                trackedEye.fov.angleLeft,
-                trackedEye.fov.angleRight,
-                trackedEye.fov.angleUp,
-                trackedEye.fov.angleDown,
-            };
-            projectionViews[eyeIndex].subImage.swapchain = projectionSwapchain_;
-            projectionViews[eyeIndex].subImage.imageRect.extent.width =
-                static_cast<int32_t>(projectionSourceDescription_.Width);
-            projectionViews[eyeIndex].subImage.imageRect.extent.height =
-                static_cast<int32_t>(projectionSourceDescription_.Height);
-            projectionViews[eyeIndex].subImage.imageArrayIndex =
-                static_cast<uint32_t>(eyeIndex);
-        }
-    }
-    std::array<const XrCompositionLayerBaseHeader*, 5> layers{};
-    uint32_t layerCount = 0;
-    if (projectionReady) {
-        layers[layerCount++] =
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
-    }
-    // A projection frame is the immersive view. The opaque desktop Quad is
-    // the Grip-summoned UI panel over stereo, and the fallback for title /
-    // loading / any missing stereo frame; if it were layered after
-    // projection while hidden it would completely cover the 3D scene.
-    // The settings quad replaces the ordinary 2D fallback while it is open.
-    // Closing (or a paint failure) makes the continuously refreshed 2D quad
-    // return on the following frame without changing any Unity camera state.
-    const bool mirrorLayerVisible = mirrorReady && !frame.aaMenuVisible &&
-        (!projectionReady || frame.stereoUiPanelVisible);
-    if (mirrorLayerVisible) {
-        layers[layerCount++] =
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
-    }
-    // Adjust-mode overlays: the bar rides the panel, the hint/toast strip is
-    // head-locked. The toast also shows without adjust mode (photo scenes).
-    if (overlayReady && panelAdjustMode_ && mirrorLayerVisible) {
-        layers[layerCount++] =
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&barQuad);
-    }
-    if (overlayReady && hintWidthPx != 0 && hintHeightPx != 0 &&
-        (panelAdjustMode_ || panelToastKind_ != 0)) {
-        layers[layerCount++] =
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hintQuad);
-    }
-    // The settings menu is the topmost layer and never replaces the scene.
-    if (menuReady) {
-        layers[layerCount++] =
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menuQuad);
-    }
-
-    XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
-    endInfo.displayTime = frameState.predictedDisplayTime;
-    endInfo.environmentBlendMode = environmentBlendMode_;
-    endInfo.layerCount = layerCount;
-    endInfo.layers = layerCount != 0 ? layers.data() : nullptr;
-    frame.layerSubmitted = layerCount != 0;
-    frame.stereoLayerSubmitted = projectionReady;
-    const XrResult endResult = dispatch_.EndFrame()(session_, &endInfo);
-    if (XR_FAILED(endResult)) {
-        lastResult_ = endResult;
-        log.Write(
-            "[VR][runtime] xrEndFrame failed: " +
-            dispatch_.ResultText(instance_, lastResult_));
-        return ClassifyFrameResult(lastResult_);
-    }
-    sessionLossPending =
-        sessionLossPending || endResult == XR_SESSION_LOSS_PENDING;
-
-    if (frame.referenceSpaceChanged) {
-        projectionTrackingTimeFloor_ = effectiveProjectionTrackingTimeFloor;
-        pendingReferenceSpaceChangeTimes_.erase(
-            pendingReferenceSpaceChangeTimes_.begin(),
-            pendingReferenceSpaceChangeTimes_.begin() +
-                static_cast<std::ptrdiff_t>(appliedReferenceSpaceChangeCount));
-        log.Write(
-            std::string("[VR][pose] REFERENCE_SPACE_CHANGE_APPLIED active=") +
-            ReferenceSpaceText(ActiveReferenceSpaceType()) +
-            " changeTime=" + std::to_string(appliedReferenceSpaceChangeTime) +
-            " predictedDisplayTime=" + std::to_string(frame.predictedDisplayTime) +
-            " coalesced=" + std::to_string(appliedReferenceSpaceChangeCount));
-    }
-
-    if (!mirrorReady && !projectionReady && frame.shouldRender) {
-        lastResult_ = mirrorResult;
-        return ClassifyFrameResult(lastResult_);
-    }
-
-    if (XR_FAILED(locateResult)) {
-        lastResult_ = locateResult;
-        return ClassifyFrameResult(lastResult_);
-    }
-    if (viewCount != views.size()) {
-        lastResult_ = XR_ERROR_RUNTIME_FAILURE;
-        log.Write(
-            "[VR][runtime] xrLocateViews returned " + std::to_string(viewCount) +
-            " view(s); PRIMARY_STEREO requires exactly 2");
-        return FrameResult::Failed;
-    }
-    if (sessionLossPending) {
-        lastResult_ = XR_SESSION_LOSS_PENDING;
-        return FrameResult::SessionLossPending;
-    }
-
-    lastResult_ = XR_SUCCESS;
-    return FrameResult::Completed;
-}
+#include "OpenXrFrameProtocol.inc.cpp"
 
 bool OpenXrContext::RequestExit(VrLog& log) {
     if (exitRequested_) {
@@ -4678,6 +4240,7 @@ void OpenXrContext::ResetSessionChildren() noexcept {
 }
 
 void OpenXrContext::ClearSessionState() noexcept {
+    ResetFrameProtocol();
     session_ = XR_NULL_HANDLE;
     sessionState_ = XR_SESSION_STATE_UNKNOWN;
     sessionRunning_ = false;
@@ -4797,6 +4360,25 @@ std::uint32_t OpenXrContext::StereoEyeWidth() const noexcept {
 
 std::uint32_t OpenXrContext::StereoEyeHeight() const noexcept {
     return stereoProjectionEnabled_ ? stereoEyeHeight_ : 0U;
+}
+
+bool OpenXrContext::MirrorSwapchainMatches(ID3D11Texture2D* sourceFrame) const noexcept {
+    if (mirrorSwapchain_ == XR_NULL_HANDLE) {
+        return true;
+    }
+    if (sourceFrame == nullptr || mirrorWidth_ == 0 || mirrorHeight_ == 0) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC sourceDescription{};
+    sourceFrame->GetDesc(&sourceDescription);
+    return sourceDescription.Width == mirrorWidth_ &&
+        sourceDescription.Height == mirrorHeight_ &&
+        sourceDescription.MipLevels == 1 &&
+        sourceDescription.ArraySize == 1 &&
+        sourceDescription.SampleDesc.Count == 1 &&
+        AreCopyCompatibleFormats(
+            sourceDescription.Format,
+            static_cast<DXGI_FORMAT>(mirrorSwapchainFormat_));
 }
 
 XrResult OpenXrContext::LastResult() const noexcept {

@@ -1,6 +1,7 @@
 #include "ScrollInputDiagnostics.hpp"
 #include "ScrollAxisRouter.hpp"
 #include "ThumbstickScroll.hpp"
+#include "../frame/SingleFrameLoopContracts.hpp"
 
 #include "../../GakumasLocalify/Il2cppUtils.hpp"
 #include "../config/VrifyConfig.hpp"
@@ -64,7 +65,7 @@ std::int32_t g_flickTotalDeltaOffset = -1;
 bool g_inputInstallAttempted = false;
 bool g_diagnosticInstallAttempted = false;
 
-constexpr float kMaximumQueuedAnalogDelta = 1.0F;
+constexpr float kMaximumQueuedAnalogDelta = frame::kScrollMaxUnityUnitsPerTicket;
 
 thread_local ScrollVector g_threadInjectedDelta{};
 

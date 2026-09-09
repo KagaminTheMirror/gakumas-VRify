@@ -4,6 +4,7 @@
 #include "../PanelPlacement.hpp"
 #include "../d3d11/StereoRenderMailbox.hpp"
 #include "../d3d11/VerticalFlipPass.hpp"
+#include "../frame/FrameCoordinator.hpp"
 #include "../input/PointerSmoother.hpp"
 
 #include <array>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gakumas::vr {
@@ -59,6 +61,8 @@ public:
         SessionLossPending,
         SessionLost,
         InstanceLost,
+        GraphicsGateClosed,
+        ProtocolRejected,
         Failed,
     };
 
@@ -198,7 +202,7 @@ public:
         bool stereoLayerSubmitted = false;
         bool stereoUiPanelVisible = false;
         bool aaMenuVisible = false;
-        bool mirrorInputEnabled = true;
+        bool mirrorInputEnabled = false;
         bool mirrorPresentationChanged = false;
         std::uint64_t stereoFrameGeneration = 0;
         bool mirrorLayoutChanged = false;
@@ -247,6 +251,37 @@ public:
         std::uint64_t sourceLayoutGeneration,
         const d3d11::StereoRenderMailbox* stereoMailbox,
         VrLog& log);
+    [[nodiscard]] FrameResult WaitAndPrepare(
+        StereoFrame& frame,
+        ID3D11Texture2D* sourceFrame,
+        std::uint64_t sourceFrameGeneration,
+        std::uint64_t sourceLayoutGeneration,
+        frame::FrameIdentity& ticket,
+        VrLog& log);
+    [[nodiscard]] FrameResult BeginPrepared(
+        const frame::FrameIdentity& ticket,
+        StereoFrame& frame,
+        VrLog& log);
+    [[nodiscard]] FrameResult SubmitPrepared(
+        const frame::FrameIdentity& ticket,
+        StereoFrame& frame,
+        ID3D11Texture2D* sourceFrame,
+        std::uint64_t sourceFrameGeneration,
+        const d3d11::StereoRenderMailbox* stereoMailbox,
+        VrLog& log);
+    [[nodiscard]] FrameResult BeginAndSubmit(
+        const frame::FrameIdentity& ticket,
+        StereoFrame& frame,
+        ID3D11Texture2D* sourceFrame,
+        std::uint64_t sourceFrameGeneration,
+        const d3d11::StereoRenderMailbox* stereoMailbox,
+        VrLog& log);
+    [[nodiscard]] FrameResult EndPrepared(
+        const frame::FrameIdentity& ticket,
+        StereoFrame& frame,
+        VrLog& log);
+    [[nodiscard]] frame::FrameCoordinator& Coordinator() noexcept;
+    [[nodiscard]] const frame::FrameCoordinator& Coordinator() const noexcept;
     [[nodiscard]] bool RequestExit(VrLog& log);
 
     // Rebuild only graphics-bound session resources after Unity replaces its
@@ -266,6 +301,10 @@ public:
     [[nodiscard]] bool HasStageSpace() const noexcept;
     [[nodiscard]] std::uint32_t StereoEyeWidth() const noexcept;
     [[nodiscard]] std::uint32_t StereoEyeHeight() const noexcept;
+    // True when there is no mirror swapchain yet, or the Unity source can
+    // CopyResource onto the current swapchain. False means Wait must drain
+    // the graphics callback before EnsureMirrorLayout can rebuild.
+    [[nodiscard]] bool MirrorSwapchainMatches(ID3D11Texture2D* sourceFrame) const noexcept;
     [[nodiscard]] XrResult LastResult() const noexcept;
     // OpenXR worker writes; Unity thread consumes. Rising-edge B only.
     [[nodiscard]] bool ConsumeLivePauseToggle() noexcept;
@@ -320,6 +359,8 @@ private:
         XrTime displayTime,
         StereoFrame& frame,
         VrLog& log);
+    void RefreshStereoUiInputState(
+        bool projectionReady, bool mirrorReady, StereoFrame& frame);
     bool CreateMirrorSwapchain(VrLog& log);
     bool EnsureProjectionSwapchain(
         const d3d11::StereoRenderMailbox::Snapshot& stereoFrame,
@@ -333,6 +374,7 @@ private:
     bool EnsureMirrorLayout(
         ID3D11Texture2D* sourceFrame,
         std::uint64_t sourceLayoutGeneration,
+        bool allowRebuild,
         bool& layoutChanged,
         VrLog& log);
     bool DestroyMirrorSwapchainForRebuild(VrLog& log);
@@ -364,12 +406,92 @@ private:
     void ResetSessionChildren() noexcept;
     void ClearSessionState() noexcept;
     void ResetSession() noexcept;
+    struct SubmitLayers {
+        XrTime displayTime = 0;
+        XrEnvironmentBlendMode blendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        std::array<XrCompositionLayerProjectionView, 2> projectionViews{
+            XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+            XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+        };
+        XrCompositionLayerQuad mirror{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerQuad bar{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerQuad hint{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        XrCompositionLayerQuad menu{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        std::array<const XrCompositionLayerBaseHeader*, 5> layerPtrs{};
+        std::uint32_t layerCount = 0;
+        bool projectionReady = false;
+        bool mirrorReady = false;
+        bool valid = false;
+    };
+
+    // Immutable GPU submit parameters frozen at Wait return. Submit/End of
+    // ticket N must read this copy so Wait(N+1) can mutate live UI/pose/layout.
+    struct GpuSubmitSnapshot {
+        bool aaMenuVisible = false;
+        bool stereoUiPanelVisible = false;
+        bool panelAdjustMode = false;
+        int panelToastKind = 0;
+        std::array<bool, 2> gripHeld{};
+        bool panelPoseUsesBase = false;
+        pose::Pose panelPoseView{};
+        pose::Pose panelPoseBase{};
+        pose::Pose barPoseView{};
+        pose::Pose barPoseBase{};
+        pose::Pose hintPoseView{};
+        float panelQuadWidth = 0.0F;
+        float barQuadWidth = 0.0F;
+        float barQuadHeight = 0.0F;
+        std::uint32_t panelHintWidthPx = 0;
+        std::uint32_t panelHintHeightPx = 0;
+        std::uint32_t mirrorWidth = 0;
+        std::uint32_t mirrorHeight = 0;
+        std::uint64_t mirrorLayoutGeneration = 0;
+    };
+
+    struct FrameWork {
+        frame::FrameIdentity identity{};
+        StereoFrame frame{};
+        GpuSubmitSnapshot gpuSnapshot{};
+        bool sessionLossPending = false;
+        bool began = false;
+        XrResult locateResult = XR_SUCCESS;
+        XrResult mirrorResult = XR_SUCCESS;
+        std::uint32_t locateViewCount = 0;
+        XrTime appliedReferenceSpaceChangeTime = 0;
+        std::size_t appliedReferenceSpaceChangeCount = 0;
+        XrTime effectiveProjectionTrackingTimeFloor = 0;
+        d3d11::StereoRenderMailbox::Snapshot stereo;
+        bool stereoBound = false;
+        bool projectionReady = false;
+        bool mirrorReady = false;
+        bool menuReady = false;
+        bool overlayReady = false;
+        pose::StereoPoseSample projectionTracking{};
+        ID3D11Texture2D* sourceFrame = nullptr;
+        std::uint64_t sourceFrameGeneration = 0;
+        std::uint64_t sourceLayoutGeneration = 0;
+        int endEventId = 0;
+        SubmitLayers layers{};
+    };
+
+    [[nodiscard]] FrameWork* WorkFor(std::uint64_t frameId) noexcept;
+    void FreezeGpuSubmitSnapshot(FrameWork& work) noexcept;
+    void ResetFrameProtocol() noexcept;
+    void LogFrame(
+        VrLog& log,
+        std::string_view token,
+        const frame::FrameIdentity& identity,
+        XrTime displayTime);
     [[nodiscard]] static EventResult ClassifyEventResult(XrResult result) noexcept;
     [[nodiscard]] static FrameResult ClassifyFrameResult(XrResult result) noexcept;
     static bool EqualLuid(const LUID& left, const LUID& right) noexcept;
     static bool IsSupportedMirrorFormat(DXGI_FORMAT format) noexcept;
     static bool AreCopyCompatibleFormats(DXGI_FORMAT left, DXGI_FORMAT right) noexcept;
 
+    frame::FrameCoordinator coordinator_;
+    std::array<FrameWork, 2> works_{};
+    std::uint64_t referenceSpaceEpoch_ = 0;
     OpenXrDispatch dispatch_;
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSystemId systemId_ = XR_NULL_SYSTEM_ID;
@@ -415,6 +537,9 @@ private:
     std::atomic<std::uint32_t> cameraResetPressCount_{0};
     bool stereoUiPanelVisible_ = false;
     bool aaMenuVisible_ = false;
+    // Last submitted scene role; CPU admission cannot depend on eyes that
+    // have not been rendered yet. Written by Submit, read by the next Wait.
+    std::atomic<bool> inputProjectionReady_{false};
     // --- Right-A: photo shutter routing + panel adjust mode. ---
     XrAction panelAdjustAction_ = XR_NULL_HANDLE;
     bool panelAdjustButtonHeld_ = false;
@@ -485,8 +610,8 @@ private:
     AaMenuPaintFn aaMenuPainter_ = nullptr;
     AaMenuShutdownFn aaMenuShutdown_ = nullptr;
     AaMenuFlushFn aaMenuFlush_ = nullptr;
-    bool mirrorInputStateInitialized_ = false;
-    bool lastMirrorInputEnabled_ = true;
+    std::atomic<bool> mirrorInputStateInitialized_{false};
+    std::atomic<bool> lastMirrorInputEnabled_{true};
     bool mirrorCopySuspended_ = false;
     bool inputActionsCreated_ = false;
     bool inputSessionReady_ = false;
@@ -526,8 +651,10 @@ private:
     std::uint32_t menuPaintFailures_ = 0;
     bool stereoProjectionEnabled_ = false;
     bool stereoLandscapeOnly_ = false;
-    bool projectionDisabledForSession_ = false;
+    std::atomic<bool> projectionDisabledForSession_{false};
     float stereoRenderScale_ = 1.0F;
+    std::atomic<bool> pendingStereoRenderScaleValid_{false};
+    std::atomic<float> pendingStereoRenderScale_{1.0F};
     // Runtime recommendation kept so the menu can rescale the eye targets
     // without tearing the session down and re-enumerating view configurations.
     std::uint32_t recommendedEyeWidth_ = 0;
@@ -559,7 +686,7 @@ private:
     d3d11::VerticalFlipPass projectionVerticalFlip_;
     ID3D11DeviceContext* sessionContext_ = nullptr;
     ID3D11Device* sessionDevice_ = nullptr;
-    XrResult lastResult_ = XR_SUCCESS;
+    std::atomic<XrResult> lastResult_{XR_SUCCESS};
 };
 
 // Both hands always publish independent menu cursors. ImGui still has one

@@ -24,6 +24,10 @@ struct VrCameraInputSample {
     // Right-A presses routed to the game's photo shutter (photo scenes only).
     std::uint32_t photoPressCount = 0;
     std::int64_t publishTimeNanoseconds = 0;
+    std::uint64_t frameId = 0;
+    std::uint64_t sessionGeneration = 0;
+    std::uint64_t inputEpoch = 0;
+    bool cancelled = false;
 };
 
 // Same rationale as StereoPoseMailbox: a mutex over a tiny struct, published

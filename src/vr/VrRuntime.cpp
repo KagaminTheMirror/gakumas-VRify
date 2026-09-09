@@ -1,9 +1,12 @@
 #include "VrRuntime.hpp"
 
+#include "StereoGpuPublish.hpp"
 #include "VrVersion.hpp"
 #include "GripTransparencyTrace.hpp"
 #include "VrAaMenu.hpp"
 #include "VrFreeCamera.hpp"
+#include "frame/FrameLoopDriver.hpp"
+#include "frame/SingleFrameLoopContracts.hpp"
 #include "input/ScrollInputDiagnostics.hpp"
 #include "input/UnityPointerInput.hpp"
 #include "config/VrifyConfig.hpp"
@@ -13,7 +16,6 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -229,6 +231,7 @@ bool VrRuntime::Start(VrRuntimeConfig config, HookRegistrar registrar) {
     if (worker_.joinable()) {
         return false;
     }
+    if (!endDispatch_.Reset()) return false;
     confirmedMirrorLayout_.store(0, std::memory_order_release);
     if (!config.enabled) {
         config_ = std::move(config);
@@ -274,6 +277,7 @@ bool VrRuntime::Start(VrRuntimeConfig config, HookRegistrar registrar) {
         return false;
     }
 
+    ConfigureFrameLoopDriver(registrar_);
     log_.Write(
         "[VR][runtime] RUN_BEGIN pid=" + std::to_string(GetCurrentProcessId()) +
         " version=" GAKUMAS_VR_VERSION);
@@ -297,6 +301,7 @@ bool VrRuntime::Start(VrRuntimeConfig config, HookRegistrar registrar) {
 void VrRuntime::Stop() noexcept {
     std::unique_lock lifecycleLock(lifecycleMutex_);
     stopRequested_.store(true, std::memory_order_release);
+    endDispatch_.Close();
     confirmedMirrorLayout_.store(0, std::memory_order_release);
     poseMailbox_.Invalidate();
     stereoRenderMailbox_.Invalidate();
@@ -310,6 +315,11 @@ void VrRuntime::Stop() noexcept {
         lifecycleLock.lock();
     }
 
+    if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+        Fault("OpenXR shutdown retains resources for an outstanding graphics callback");
+        return;
+    }
+    DropPendingStereoGpuPublish();
     d3d11Capture_.Detach();
     ReleasePointerDrag();
     ResetThumbstickScroll("runtime-stop");
@@ -604,11 +614,15 @@ void VrRuntime::DispatchPointerInput(
     const input::ThumbstickScrollStep horizontalStep =
         thumbstickScrollHorizontal_.Update(
             frame.predictedDisplayTime,
-            scrollPointer.thumbstick.x);
+            scrollPointer.thumbstick.x,
+            openXr_.SessionRunGeneration(),
+            prepareTicket_.referenceSpaceEpoch);
     const input::ThumbstickScrollStep verticalStep =
         thumbstickScrollVertical_.Update(
             frame.predictedDisplayTime,
-            scrollPointer.thumbstick.y);
+            scrollPointer.thumbstick.y,
+            openXr_.SessionRunGeneration(),
+            prepareTicket_.referenceSpaceEpoch);
     const bool scrollIsActive = thumbstickScrollHorizontal_.Active() ||
         thumbstickScrollVertical_.Active();
     if (!scrollWasActive && scrollIsActive) {
@@ -767,6 +781,11 @@ void VrRuntime::WorkerMain() noexcept {
         Fault("unknown unhandled worker exception");
     }
 
+    endDispatch_.Close();
+    if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+        Fault("OpenXR worker retains resources for an outstanding graphics callback");
+        return;
+    }
     // These operations are noexcept and intentionally run for every normal or
     // exceptional worker exit. Keeping the boundary here prevents a diagnostic
     // allocation failure from terminating the host game.
@@ -908,12 +927,17 @@ void VrRuntime::WorkerMainImpl() {
             break;
         }
 
+        // Bind the captured device before CreateD3D11Session. Unity PlayerLoop
+        // can DrainEvents and BeginSession while this call is still setting up
+        // spaces/swapchains; RefreshMirrorSource must not see a null device and
+        // treat that as a graphics-device change.
+        sessionGraphics_ = std::move(graphics);
         const auto sessionResult = openXr_.CreateD3D11Session(
-            graphics.device,
-            graphics.adapterLuid,
-            graphics.featureLevel,
-            graphics.frameDescription,
-            graphics.layoutGeneration,
+            sessionGraphics_.device,
+            sessionGraphics_.adapterLuid,
+            sessionGraphics_.featureLevel,
+            sessionGraphics_.frameDescription,
+            sessionGraphics_.layoutGeneration,
             requirements,
             config_.stereoProjectionEnabled,
             config_.stereoLandscapeOnly,
@@ -921,45 +945,52 @@ void VrRuntime::WorkerMainImpl() {
             log_);
         lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
         if (sessionResult == openxr::OpenXrContext::SessionResult::AdapterMismatch) {
+            sessionGraphics_.Reset();
             Fault("Unity D3D11 adapter LUID does not match the OpenXR runtime requirement");
             break;
         }
         if (sessionResult == openxr::OpenXrContext::SessionResult::FeatureLevelMismatch) {
+            sessionGraphics_.Reset();
             Fault("Unity D3D11 feature level is below the OpenXR runtime requirement");
             break;
         }
         if (sessionResult == openxr::OpenXrContext::SessionResult::RetryRuntime) {
+            sessionGraphics_.Reset();
             openXr_.ResetInstance();
             capturedGeneration = 0;
             WaitOrStop(config_.runtimeRetryInterval);
             continue;
         }
         if (sessionResult != openxr::OpenXrContext::SessionResult::Ready) {
+            sessionGraphics_.Reset();
             Fault("xrCreateSession failed after graphics validation");
             break;
         }
 
         SetState(VrRuntimeState::SessionReady);
+        unityDriving_.store(false, std::memory_order_release);
+        ticketPrepared_ = false;
+        ticketBegun_ = false;
+        ticketSubmitted_ = false;
+        prepareTicket_ = {};
+        prepareFrame_ = {};
         stereoEyeWidth_.store(openXr_.StereoEyeWidth(), std::memory_order_release);
         stereoEyeHeight_.store(openXr_.StereoEyeHeight(), std::memory_order_release);
         stereoTargetGeneration_.fetch_add(1, std::memory_order_acq_rel);
-        std::uint64_t frameIndex = 0;
         std::uint64_t observedRunGeneration = 0;
-        bool currentRunPoseReady = false;
-        bool currentRunDisplayReady = false;
-        bool currentRunInputReady = false;
-        bool everPoseReady = false;
-        bool runtimeReadyLogged = false;
+        everPoseReady_ = false;
         bool restartGraphicsSession = false;
         bool graphicsRestartExitRequested = false;
-        d3d11::D3D11Capture::FrameSnapshot activeSourceFrame;
-        std::optional<std::chrono::steady_clock::time_point> notRenderingSince;
-        auto nextDisplayPauseLog = std::chrono::steady_clock::time_point::min();
-        XrViewStateFlags previousViewFlags = std::numeric_limits<XrViewStateFlags>::max();
-        auto nextPoseSample = std::chrono::steady_clock::now();
 
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            const auto eventResult = openXr_.DrainEvents(log_);
+            if (restartGraphicsRequested_.exchange(false, std::memory_order_acq_rel)) {
+                restartGraphicsSession = true;
+            }
+            openxr::OpenXrContext::EventResult eventResult =
+                openxr::OpenXrContext::EventResult::Healthy;
+            if (!unityDriving_.load(std::memory_order_acquire)) {
+                eventResult = openXr_.DrainEvents(log_);
+            }
             PumpGripTraceOutput();
             if (eventResult == openxr::OpenXrContext::EventResult::SessionExiting) {
                 confirmedMirrorLayout_.store(0, std::memory_order_release);
@@ -974,7 +1005,7 @@ void VrRuntime::WorkerMainImpl() {
             }
             if (eventResult != openxr::OpenXrContext::EventResult::Healthy) {
                 lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
-                if (everPoseReady) {
+                if (everPoseReady_) {
                     log_.Write("[VR][pose] READY_INVALIDATED");
                 }
                 Fault("OpenXR session or instance became invalid during pose probing");
@@ -1016,19 +1047,20 @@ void VrRuntime::WorkerMainImpl() {
                 ReleasePointerDrag();
                 ResetThumbstickScroll("session-generation");
                 observedRunGeneration = runGeneration;
-                currentRunPoseReady = false;
-                currentRunDisplayReady = false;
-                currentRunInputReady = false;
+                observedRunGeneration_ = runGeneration;
+                currentRunPoseReady_ = false;
+                currentRunDisplayReady_ = false;
+                currentRunInputReady_ = false;
                 activePointerHand_ = 1;
                 inputMirrorLayoutGeneration_ = 0;
                 inputLayoutReady_ = false;
                 inputLayoutMismatchLogged_ = false;
                 inputLayoutPendingLogged_ = false;
-                notRenderingSince.reset();
-                nextDisplayPauseLog =
-                    std::chrono::steady_clock::time_point::min();
-                previousViewFlags = std::numeric_limits<XrViewStateFlags>::max();
-                nextPoseSample = std::chrono::steady_clock::now();
+                ticketPrepared_ = false;
+                ticketBegun_ = false;
+                ticketSubmitted_ = false;
+                prepareTicket_ = {};
+                input::ClearUnityPointerLease();
                 SetState(VrRuntimeState::SessionRunning);
                 log_.Write(
                     "[VR][pose] FRAME_LOOP_STARTED generation=" +
@@ -1046,18 +1078,17 @@ void VrRuntime::WorkerMainImpl() {
                 continue;
             }
 
-            openxr::OpenXrContext::StereoFrame frame;
             d3d11::D3D11Capture::FrameSnapshot latestSourceFrame;
             const bool latestSourceAvailable =
                 d3d11Capture_.GetLatestFrame(latestSourceFrame);
             if (latestSourceAvailable) {
                 ID3D11Device* sourceDevice = nullptr;
                 latestSourceFrame.texture->GetDevice(&sourceDevice);
-                const bool sourceDeviceMatches = sourceDevice == graphics.device;
+                const bool sourceDeviceMatches = sourceDevice == sessionGraphics_.device;
                 if (sourceDevice != nullptr) {
                     sourceDevice->Release();
                 }
-                if (!sourceDeviceMatches) {
+                if (sessionGraphics_.device != nullptr && !sourceDeviceMatches) {
                     confirmedMirrorLayout_.store(0, std::memory_order_release);
                     log_.Write(
                         "[VR][display] Unity D3D11 device changed; requesting "
@@ -1067,8 +1098,11 @@ void VrRuntime::WorkerMainImpl() {
                     restartGraphicsSession = true;
                     continue;
                 }
-                activeSourceFrame = std::move(latestSourceFrame);
-            } else if (!activeSourceFrame.IsComplete()) {
+                if (!unityDriving_.load(std::memory_order_acquire)) {
+                    activeSourceFrame_ = std::move(latestSourceFrame);
+                }
+            } else if (!unityDriving_.load(std::memory_order_acquire) &&
+                       !activeSourceFrame_.IsComplete()) {
                 confirmedMirrorLayout_.store(0, std::memory_order_release);
                 log_.Write(
                     "[VR][display] Unity mirror frame became unavailable before "
@@ -1081,303 +1115,56 @@ void VrRuntime::WorkerMainImpl() {
             confirmedMirrorLayout_.store(
                 ConfirmedMirrorLayoutState(
                     latestSourceAvailable,
-                    activeSourceFrame.layoutTransitionPending,
-                    activeSourceFrame.layoutGeneration,
-                    activeSourceFrame.description.Width,
-                    activeSourceFrame.description.Height),
+                    activeSourceFrame_.layoutTransitionPending,
+                    activeSourceFrame_.layoutGeneration,
+                    activeSourceFrame_.description.Width,
+                    activeSourceFrame_.description.Height),
                 std::memory_order_release);
-            // Input to RunFrame (latched across its entry reset): the game
-            // thread's Grip transparency request rides the frame so the quad
-            // submission can pick source-alpha blending.
-            frame.gripPanelTransparent =
-                gripPanelTransparent_.load(std::memory_order_acquire);
-            d3d11::D3D11Capture::TransparencyProbe transparencyProbe{};
-            if (d3d11Capture_.ConsumeTransparencyProbe(&transparencyProbe)) {
-                // One-shot forensic record per arming: proves whether the
-                // post-Present clear ran (clears/clearErr) and what the
-                // presented backbuffer actually contains (corner/centre
-                // texels) when the panel still looks frozen or opaque.
-                std::ostringstream probeLog;
-                probeLog << "[VR][display] GRIP_TRANSPARENCY_PROBE clears="
-                         << transparencyProbe.clearCount << " clearErr=0x"
-                         << std::hex << transparencyProbe.lastClearError
-                         << " sampleErr=0x" << transparencyProbe.sampleError
-                         << std::dec << " fmt=" << transparencyProbe.format
-                         << " size=" << transparencyProbe.width << 'x'
-                         << transparencyProbe.height << std::hex;
-                static constexpr const char* kProbePointNames[4] = {
-                    "topLeft", "topRight", "centre", "bottomLeft"};
-                for (std::size_t index = 0;
-                     index < transparencyProbe.pixels.size(); ++index) {
-                    probeLog << ' ' << kProbePointNames[index] << "=0x"
-                             << std::setw(8) << std::setfill('0')
-                             << transparencyProbe.pixels[index];
-                }
-                log_.Write(probeLog.str());
-            }
-            d3d11::D3D11Capture::ClearTargetReport clearTargetReport{};
-            if (d3d11Capture_.ConsumeClearTargetReport(&clearTargetReport)) {
-                // .226 adoption record: which big Unity RenderTextures were
-                // matched against the swapchain size and now get cleared to
-                // transparent black each Present while armed.
-                std::ostringstream reportLog;
-                reportLog << "[VR][display] GRIP_TRANSPARENCY_RT candidates="
-                          << clearTargetReport.candidates
-                          << " adopted=" << clearTargetReport.adopted;
-                log_.Write(reportLog.str());
-                for (std::uint32_t index = 0; index < clearTargetReport.count;
-                     ++index) {
-                    const auto& entry = clearTargetReport.entries[index];
-                    std::ostringstream entryLog;
-                    entryLog << "[VR][display] GRIP_TRANSPARENCY_RT tex=0x"
-                             << std::hex << entry.texture << std::dec
-                             << " size=" << entry.width << 'x' << entry.height
-                             << " fmt=" << entry.format
-                             << " adopted=" << entry.adopted << " hr=0x"
-                             << std::hex << entry.hresult;
-                    log_.Write(entryLog.str());
+            if (!unityDriving_.load(std::memory_order_acquire)) {
+                static auto nextDriveWaitLog =
+                    std::chrono::steady_clock::time_point::min();
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= nextDriveWaitLog) {
+                    log_.Write(
+                        "[VR][frame] FRAME_DRIVE_WAITING session running; "
+                        "Unity PlayerLoop owns Wait/Begin/End");
+                    nextDriveWaitLog = now + std::chrono::seconds(5);
                 }
             }
-            const auto frameResult = openXr_.RunFrame(
-                frame,
-                activeSourceFrame.texture,
-                activeSourceFrame.generation,
-                activeSourceFrame.layoutGeneration,
-                config_.stereoProjectionEnabled ? &stereoRenderMailbox_ : nullptr,
-                log_);
-            lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
-            if (frameResult == openxr::OpenXrContext::FrameResult::SessionNotRunning) {
-                confirmedMirrorLayout_.store(0, std::memory_order_release);
-                ResetThumbstickScroll("session-not-running");
-                continue;
-            }
-            if (frameResult != openxr::OpenXrContext::FrameResult::Completed) {
-                if (everPoseReady) {
-                    log_.Write("[VR][pose] READY_INVALIDATED");
-                }
-                Fault("OpenXR display/pose frame loop failed");
+            if (WaitOrStop(std::chrono::milliseconds(16))) {
                 break;
             }
-
-            // The VR menu can rescale the eye targets mid-session. Publishing a
-            // new generation is what makes Unity drop and rebuild its eye
-            // RenderTextures at the new size.
-            PublishStereoTargetSpecChange();
-
-            if (frame.referenceSpaceChanged) {
-                poseMailbox_.Invalidate(
-                    runGeneration,
-                    static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
-                stereoRenderMailbox_.Invalidate();
-                ReleasePointerDrag();
-                ResetThumbstickScroll("reference-space-changed");
-                log_.Write(
-                    "[VR][pose] REFERENCE_SPACE_BASELINE_INVALIDATED generation=" +
-                    std::to_string(runGeneration) + " space=" +
-                    std::to_string(static_cast<std::int32_t>(
-                        openXr_.ActiveReferenceSpaceType())) +
-                    " predictedDisplayTime=" +
-                    std::to_string(frame.predictedDisplayTime));
-            }
-
-            frame.mirrorLayoutTransitionPending =
-                activeSourceFrame.layoutTransitionPending ||
-                !latestSourceAvailable;
-            if (!frame.referenceSpaceChanged) {
-                DispatchPointerInput(
-                    frame,
-                    activeSourceFrame.outputWindow != nullptr
-                        ? activeSourceFrame.outputWindow
-                        : graphics.outputWindow);
-            }
-
-            {
-                camera::VrCameraInputSample cameraInput;
-                cameraInput.valid = true;
-                cameraInput.menuVisible = frame.aaMenuVisible;
-                if (frame.pointers[0].thumbstickActive) {
-                    cameraInput.leftStickX = frame.pointers[0].thumbstick.x;
-                    cameraInput.leftStickY = frame.pointers[0].thumbstick.y;
-                }
-                if (frame.pointers[1].thumbstickActive) {
-                    cameraInput.rightStickX = frame.pointers[1].thumbstick.x;
-                    cameraInput.rightStickY = frame.pointers[1].thumbstick.y;
-                }
-                const auto& leftPointer = frame.pointers[0];
-                cameraInput.sprintHeld = camera::FreeMoveSprintFromLeftTrigger(
-                    leftPointer.triggerHeld,
-                    leftPointer.hovering && frame.stereoUiPanelVisible,
-                    leftPointer.menuHovering && frame.aaMenuVisible,
-                    leftPointer.barHovering);
-                cameraInput.modePressCount = openXr_.CameraModePressCount();
-                cameraInput.charaPressCount = openXr_.CameraCharaPressCount();
-                cameraInput.resetPressCount = openXr_.CameraResetPressCount();
-                cameraInput.photoPressCount = openXr_.PhotoPressCount();
-                cameraInput.publishTimeNanoseconds =
-                    pose::MonotonicNowNanoseconds();
-                cameraInputMailbox_.Publish(cameraInput);
-            }
-
-            ++frameIndex;
-            if (frame.frameDiscarded) {
-                log_.Write(
-                    "[VR][pose] xrBeginFrame discarded an older frame at frame=" +
-                    std::to_string(frameIndex));
-            }
-            if (frame.viewStateFlags != previousViewFlags) {
-                previousViewFlags = frame.viewStateFlags;
-                log_.Write(ViewFlagsText(frame.viewStateFlags));
-            }
-
-            constexpr XrViewStateFlags kRequiredPoseFlags =
-                XR_VIEW_STATE_ORIENTATION_VALID_BIT |
-                XR_VIEW_STATE_POSITION_VALID_BIT;
-            const bool validStereoPose =
-                frame.viewCount == 2 &&
-                HasViewFlags(frame.viewStateFlags, kRequiredPoseFlags);
-            constexpr XrViewStateFlags kRequiredBridgePoseFlags =
-                kRequiredPoseFlags |
-                XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
-                XR_VIEW_STATE_POSITION_TRACKED_BIT;
-            const bool validTrackedStereoPose =
-                frame.shouldRender && frame.viewCount == 2 &&
-                HasViewFlags(frame.viewStateFlags, kRequiredBridgePoseFlags);
-            if (validTrackedStereoPose) {
-                pose::StereoPoseSample poseSample;
-                poseSample.valid = true;
-                poseSample.sessionGeneration = runGeneration;
-                poseSample.referenceSpaceType = static_cast<std::int32_t>(
-                    openXr_.ActiveReferenceSpaceType());
-                poseSample.predictedDisplayTime = frame.predictedDisplayTime;
-                poseSample.viewStateFlags = frame.viewStateFlags;
-                poseSample.viewCount = frame.viewCount;
-                for (std::size_t eyeIndex = 0; eyeIndex < poseSample.eyes.size(); ++eyeIndex) {
-                    const auto& sourceEye = frame.views[eyeIndex];
-                    auto& destinationEye = poseSample.eyes[eyeIndex];
-                    destinationEye.pose.position = {
-                        sourceEye.pose.position.x,
-                        sourceEye.pose.position.y,
-                        sourceEye.pose.position.z,
-                    };
-                    destinationEye.pose.orientation = {
-                        sourceEye.pose.orientation.x,
-                        sourceEye.pose.orientation.y,
-                        sourceEye.pose.orientation.z,
-                        sourceEye.pose.orientation.w,
-                    };
-                    destinationEye.fov = {
-                        sourceEye.fov.angleLeft,
-                        sourceEye.fov.angleRight,
-                        sourceEye.fov.angleUp,
-                        sourceEye.fov.angleDown,
-                    };
-                }
-                poseMailbox_.Publish(poseSample);
-            } else {
-                poseMailbox_.Invalidate(
-                    runGeneration,
-                    static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
-                stereoRenderMailbox_.Invalidate();
-            }
-            if (validStereoPose && !currentRunPoseReady) {
-                currentRunPoseReady = true;
-                SetState(VrRuntimeState::PoseReady);
-                log_.Write(
-                    "[VR][pose] POSE_STREAM_READY generation=" +
-                    std::to_string(runGeneration));
-                everPoseReady = true;
-            } else if (!validStereoPose && currentRunPoseReady) {
-                currentRunPoseReady = false;
-                SetState(VrRuntimeState::SessionRunning);
-                log_.Write(
-                    "[VR][pose] POSE_STREAM_LOST generation=" +
-                    std::to_string(runGeneration));
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            if (frame.layerSubmitted && !currentRunDisplayReady) {
-                currentRunDisplayReady = true;
-                log_.Write(
-                    "[VR][display] GAME_MIRROR_VISIBLE generation=" +
-                    std::to_string(runGeneration) +
-                    " sourceFrame=" + std::to_string(frame.sourceFrameGeneration));
-            }
-            if (frame.stereoLayerSubmitted && frame.stereoFrameGeneration != 0 &&
-                frame.stereoFrameGeneration !=
-                    lastLoggedProjectionFrameGeneration_ &&
-                (frame.stereoFrameGeneration == 1U ||
-                 frame.stereoFrameGeneration % 300U == 0U)) {
-                lastLoggedProjectionFrameGeneration_ =
-                    frame.stereoFrameGeneration;
-                log_.Write(
-                    "[VR][stereo] PROJECTION_FRAME_SUBMITTED generation=" +
-                    std::to_string(frame.stereoFrameGeneration));
-            }
-            const bool dualPointerPoseReady = std::all_of(
-                frame.pointers.begin(),
-                frame.pointers.end(),
-                [](const openxr::OpenXrContext::PointerState& pointer) {
-                    return pointer.poseActive && pointer.poseValid;
-                });
-            if (dualPointerPoseReady && !currentRunInputReady) {
-                currentRunInputReady = true;
-                log_.Write(
-                    "[VR][input] DUAL_POINTERS_READY generation=" +
-                    std::to_string(runGeneration));
-            }
-            if (!runtimeReadyLogged && currentRunPoseReady && currentRunDisplayReady &&
-                currentRunInputReady) {
-                runtimeReadyLogged = true;
-                log_.Write("[VR][runtime] RUNTIME_READY");
-            }
-
-            if (frame.shouldRender) {
-                if (notRenderingSince.has_value()) {
-                    log_.Write(
-                        "[VR][display] DISPLAY_RESUMED afterMs=" +
-                        std::to_string(std::chrono::duration_cast<
-                            std::chrono::milliseconds>(
-                            now - *notRenderingSince).count()));
-                    notRenderingSince.reset();
-                }
-            } else if (!notRenderingSince.has_value()) {
-                notRenderingSince = now;
-                log_.Write(
-                    "[VR][display] DISPLAY_PAUSED shouldRender=0; "
-                    "keeping OpenXR session for headset return");
-            } else if (now - *notRenderingSince >= std::chrono::seconds(5) &&
-                       now >= nextDisplayPauseLog) {
-                log_.Write(
-                    "[VR][display] DISPLAY_PAUSED_WAITING ms=" +
-                    std::to_string(std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                        now - *notRenderingSince).count()));
-                nextDisplayPauseLog = now + std::chrono::seconds(5);
-            }
-
-            if (validStereoPose && now >= nextPoseSample) {
-                log_.Write(PoseSampleText(frameIndex, frame));
-                nextPoseSample = now + std::chrono::seconds(1);
-            }
+            continue;
         }
         if (restartGraphicsSession &&
             !stopRequested_.load(std::memory_order_acquire) &&
             State() != VrRuntimeState::Faulted) {
+            if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+                Fault("OpenXR rebuild is waiting for an outstanding graphics callback");
+                break;
+            }
             if (openXr_.IsSessionRunning()) {
                 Fault(
                     "OpenXR session remained running after graphics rebuild "
                     "exit request");
                 break;
             }
-            if (everPoseReady) {
+            if (everPoseReady_) {
                 log_.Write("[VR][pose] READY_INVALIDATED graphicsSessionRebuild=1");
             }
             ReleasePointerDrag();
             ResetThumbstickScroll("graphics-session-rebuild");
             stereoRenderMailbox_.Invalidate();
+            sessionGraphics_.Reset();
+            activeSourceFrame_.Reset();
+            unityDriving_.store(false, std::memory_order_release);
+            ticketPrepared_ = false;
+            ticketBegun_ = false;
+            ticketSubmitted_ = false;
+            prepareTicket_ = {};
+            (void)endDispatch_.Reset();
+            input::ClearUnityPointerLease();
             confirmedMirrorLayout_.store(0, std::memory_order_release);
-            stereoEyeWidth_.store(0, std::memory_order_release);
-            stereoEyeHeight_.store(0, std::memory_order_release);
             if (!openXr_.ResetGraphicsSession(log_)) {
                 lastOpenXrResult_.store(
                     openXr_.LastResult(), std::memory_order_release);
@@ -1393,6 +1180,473 @@ void VrRuntime::WorkerMainImpl() {
 
 }
 
+bool VrRuntime::RefreshMirrorSource() {
+    d3d11::D3D11Capture::FrameSnapshot latest;
+    if (!d3d11Capture_.GetLatestFrame(latest) || latest.texture == nullptr) {
+        return activeSourceFrame_.IsComplete();
+    }
+    ID3D11Device* sourceDevice = nullptr;
+    latest.texture->GetDevice(&sourceDevice);
+    const bool matches = sessionGraphics_.device == nullptr ||
+        sourceDevice == sessionGraphics_.device;
+    if (sourceDevice != nullptr) {
+        sourceDevice->Release();
+    }
+    if (!matches) {
+        log_.Write(
+            "[VR][display] Unity D3D11 device changed during Unity wait; "
+            "requesting an orderly OpenXR graphics-session rebuild");
+        restartGraphicsRequested_.store(true, std::memory_order_release);
+        return false;
+    }
+    activeSourceFrame_ = std::move(latest);
+    confirmedMirrorLayout_.store(
+        ConfirmedMirrorLayoutState(
+            true,
+            activeSourceFrame_.layoutTransitionPending,
+            activeSourceFrame_.layoutGeneration,
+            activeSourceFrame_.description.Width,
+            activeSourceFrame_.description.Height),
+        std::memory_order_release);
+    return true;
+}
+
+void VrRuntime::PublishPreparedOutputs(std::uint64_t runGeneration) {
+    auto& frame = prepareFrame_;
+    frame.mirrorLayoutTransitionPending = activeSourceFrame_.layoutTransitionPending;
+    PublishStereoTargetSpecChange();
+    if (frame.referenceSpaceChanged) {
+        poseMailbox_.Invalidate(
+            runGeneration,
+            static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
+        stereoRenderMailbox_.Invalidate();
+        ReleasePointerDrag();
+        ResetThumbstickScroll("reference-space-changed");
+        input::ClearUnityPointerLease();
+    }
+    if (!frame.referenceSpaceChanged) {
+        DispatchPointerInput(
+            frame,
+            activeSourceFrame_.outputWindow != nullptr
+                ? activeSourceFrame_.outputWindow
+                : sessionGraphics_.outputWindow);
+    }
+    camera::VrCameraInputSample cameraInput;
+    cameraInput.valid = true;
+    cameraInput.menuVisible = frame.aaMenuVisible;
+    cameraInput.frameId = prepareTicket_.frameId;
+    cameraInput.sessionGeneration = runGeneration;
+    cameraInput.inputEpoch = prepareTicket_.referenceSpaceEpoch;
+    if (frame.pointers[0].thumbstickActive) {
+        cameraInput.leftStickX = frame.pointers[0].thumbstick.x;
+        cameraInput.leftStickY = frame.pointers[0].thumbstick.y;
+    }
+    if (frame.pointers[1].thumbstickActive) {
+        cameraInput.rightStickX = frame.pointers[1].thumbstick.x;
+        cameraInput.rightStickY = frame.pointers[1].thumbstick.y;
+    }
+    const auto& leftPointer = frame.pointers[0];
+    cameraInput.sprintHeld = camera::FreeMoveSprintFromLeftTrigger(
+        leftPointer.triggerHeld,
+        leftPointer.hovering && frame.stereoUiPanelVisible,
+        leftPointer.menuHovering && frame.aaMenuVisible,
+        leftPointer.barHovering);
+    cameraInput.modePressCount = openXr_.CameraModePressCount();
+    cameraInput.charaPressCount = openXr_.CameraCharaPressCount();
+    cameraInput.resetPressCount = openXr_.CameraResetPressCount();
+    cameraInput.photoPressCount = openXr_.PhotoPressCount();
+    cameraInput.publishTimeNanoseconds = pose::MonotonicNowNanoseconds();
+    cameraInputMailbox_.Publish(cameraInput);
+
+    constexpr XrViewStateFlags kRequiredPoseFlags =
+        XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+    constexpr XrViewStateFlags kRequiredBridgePoseFlags =
+        kRequiredPoseFlags | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT |
+        XR_VIEW_STATE_POSITION_TRACKED_BIT;
+    const bool validStereoPose =
+        frame.viewCount == 2 && HasViewFlags(frame.viewStateFlags, kRequiredPoseFlags);
+    const bool validTrackedStereoPose =
+        frame.shouldRender && frame.viewCount == 2 &&
+        HasViewFlags(frame.viewStateFlags, kRequiredBridgePoseFlags);
+    if (validTrackedStereoPose) {
+        pose::StereoPoseSample poseSample;
+        poseSample.valid = true;
+        poseSample.sessionGeneration = runGeneration;
+        poseSample.frameId = prepareTicket_.frameId;
+        poseSample.inputEpoch = prepareTicket_.referenceSpaceEpoch;
+        poseSample.referenceSpaceType = static_cast<std::int32_t>(
+            openXr_.ActiveReferenceSpaceType());
+        poseSample.predictedDisplayTime = frame.predictedDisplayTime;
+        poseSample.viewStateFlags = frame.viewStateFlags;
+        poseSample.viewCount = frame.viewCount;
+        for (std::size_t eyeIndex = 0; eyeIndex < poseSample.eyes.size(); ++eyeIndex) {
+            const auto& sourceEye = frame.views[eyeIndex];
+            auto& destinationEye = poseSample.eyes[eyeIndex];
+            destinationEye.pose.position = {
+                sourceEye.pose.position.x,
+                sourceEye.pose.position.y,
+                sourceEye.pose.position.z,
+            };
+            destinationEye.pose.orientation = {
+                sourceEye.pose.orientation.x,
+                sourceEye.pose.orientation.y,
+                sourceEye.pose.orientation.z,
+                sourceEye.pose.orientation.w,
+            };
+            destinationEye.fov = {
+                sourceEye.fov.angleLeft,
+                sourceEye.fov.angleRight,
+                sourceEye.fov.angleUp,
+                sourceEye.fov.angleDown,
+            };
+        }
+        poseMailbox_.Publish(poseSample);
+    } else {
+        poseMailbox_.Invalidate(
+            runGeneration,
+            static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
+        stereoRenderMailbox_.Invalidate();
+    }
+    static XrViewStateFlags previousViewFlags =
+        std::numeric_limits<XrViewStateFlags>::max();
+    if (frame.viewStateFlags != previousViewFlags) {
+        previousViewFlags = frame.viewStateFlags;
+        log_.Write(ViewFlagsText(frame.viewStateFlags));
+    }
+    static XrTime nextPoseSampleLog = 0;
+    if (validStereoPose &&
+        (nextPoseSampleLog == 0 ||
+         frame.predictedDisplayTime >= nextPoseSampleLog)) {
+        log_.Write(PoseSampleText(prepareTicket_.frameId, frame));
+        nextPoseSampleLog = frame.predictedDisplayTime + 1'000'000'000;
+    }
+    if (validStereoPose && !currentRunPoseReady_) {
+        currentRunPoseReady_ = true;
+        SetState(VrRuntimeState::PoseReady);
+        log_.Write(
+            "[VR][pose] POSE_STREAM_READY generation=" + std::to_string(runGeneration));
+        everPoseReady_ = true;
+    } else if (!validStereoPose && currentRunPoseReady_) {
+        currentRunPoseReady_ = false;
+        SetState(VrRuntimeState::SessionRunning);
+        log_.Write(
+            "[VR][pose] POSE_STREAM_LOST generation=" + std::to_string(runGeneration));
+    }
+    input::RegisterUnityPointerWait(prepareTicket_.frameId, runGeneration);
+    const bool dualPointerPoseReady = std::all_of(
+        frame.pointers.begin(),
+        frame.pointers.end(),
+        [](const openxr::OpenXrContext::PointerState& pointer) {
+            return pointer.poseActive && pointer.poseValid;
+        });
+    if (dualPointerPoseReady && !currentRunInputReady_) {
+        currentRunInputReady_ = true;
+        log_.Write(
+            "[VR][input] DUAL_POINTERS_READY generation=" +
+            std::to_string(runGeneration));
+    }
+    if (frame.shouldRender) {
+        if (displayPaused_) {
+            log_.Write("[VR][display] DISPLAY_RESUMED");
+            displayPaused_ = false;
+        }
+    } else if (!displayPaused_) {
+        displayPaused_ = true;
+        log_.Write(
+            "[VR][display] DISPLAY_PAUSED shouldRender=0; "
+            "keeping OpenXR session for headset return");
+    }
+}
+
+void VrRuntime::NoteSubmittedOutputs(
+    const openxr::OpenXrContext::StereoFrame& frame, std::uint64_t runGeneration) {
+    if (frame.layerSubmitted && !currentRunDisplayReady_) {
+        currentRunDisplayReady_ = true;
+        log_.Write(
+            "[VR][display] GAME_MIRROR_VISIBLE generation=" +
+            std::to_string(runGeneration) +
+            " sourceFrame=" + std::to_string(frame.sourceFrameGeneration));
+    }
+    if (frame.stereoLayerSubmitted && frame.stereoFrameGeneration != 0 &&
+        frame.stereoFrameGeneration != lastLoggedProjectionFrameGeneration_ &&
+        (frame.stereoFrameGeneration == 1U ||
+         frame.stereoFrameGeneration % 300U == 0U)) {
+        lastLoggedProjectionFrameGeneration_ = frame.stereoFrameGeneration;
+        log_.Write(
+            "[VR][stereo] PROJECTION_FRAME_SUBMITTED generation=" +
+            std::to_string(frame.stereoFrameGeneration));
+    }
+    if (!runtimeReadyLogged_ && currentRunPoseReady_ && currentRunDisplayReady_ &&
+        currentRunInputReady_) {
+        runtimeReadyLogged_ = true;
+        log_.Write("[VR][runtime] RUNTIME_READY");
+    }
+}
+
+bool VrRuntime::ProcessUnityEvents() noexcept {
+    if (openXr_.HasInstance()) {
+        const auto eventResult = openXr_.DrainEvents(log_);
+        lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+        if (eventResult == openxr::OpenXrContext::EventResult::SessionExiting) {
+            openXr_.Coordinator().FreezeNewWaits();
+            ticketPrepared_ = false;
+            ticketBegun_ = false;
+            ticketSubmitted_ = false;
+            unityDriving_.store(false, std::memory_order_release);
+            input::ClearUnityPointerLease();
+            log_.Write("[VR][pose] session exiting normally");
+            return false;
+        }
+        if (eventResult != openxr::OpenXrContext::EventResult::Healthy) {
+            Fault("OpenXR session or instance became invalid during Unity wait");
+            return false;
+        }
+    }
+    return true;
+}
+
+void VrRuntime::OnUnityWaitPhase() noexcept {
+    if (ticketPrepared_ && ticketSubmitted_ && prepareFrame_.referenceSpaceChanged) {
+        if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+            Fault("OpenXR graphics callback did not retire after a reference-space change");
+            return;
+        }
+    }
+    if (stopRequested_.load(std::memory_order_acquire) ||
+        State() == VrRuntimeState::Faulted ||
+        State() == VrRuntimeState::Disabled) {
+        return;
+    }
+    // Session events may destroy spaces/swapchains. Defer them during End;
+    // the graphics gate always pumps them once the callback is idle.
+    if (endDispatch_.WaitForIdle(std::chrono::milliseconds(0)) && !ProcessUnityEvents()) {
+        return;
+    }
+    if (!openXr_.IsSessionRunning()) {
+        return;
+    }
+    const auto state = State();
+    if (state != VrRuntimeState::SessionReady &&
+        state != VrRuntimeState::SessionRunning &&
+        state != VrRuntimeState::PoseReady) {
+        return;
+    }
+    if (!RefreshMirrorSource()) {
+        return;
+    }
+    if (!openXr_.MirrorSwapchainMatches(activeSourceFrame_.texture)) {
+        log_.Write("[VR][display] MIRROR_LAYOUT_GATE reason=source-mismatch");
+        if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+            Fault("OpenXR graphics callback did not retire after a mirror layout change");
+            return;
+        }
+    }
+    unityDriving_.store(true, std::memory_order_release);
+    if (ticketPrepared_ && !ticketSubmitted_ && prepareTicket_.frameId != 0) {
+        PublishPreparedOutputs(openXr_.SessionRunGeneration());
+        return;
+    }
+    prepareFrame_ = {};
+    prepareFrame_.gripPanelTransparent =
+        gripPanelTransparent_.load(std::memory_order_acquire);
+    frame::FrameIdentity ticket{};
+    const auto result = openXr_.WaitAndPrepare(
+        prepareFrame_,
+        activeSourceFrame_.texture,
+        activeSourceFrame_.generation,
+        activeSourceFrame_.layoutGeneration,
+        ticket,
+        log_);
+    lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+    if (result == openxr::OpenXrContext::FrameResult::SessionNotRunning) {
+        ticketPrepared_ = false;
+        return;
+    }
+    if (result == openxr::OpenXrContext::FrameResult::ProtocolRejected) {
+        return;
+    }
+    if (result != openxr::OpenXrContext::FrameResult::Completed) {
+        Fault("OpenXR wait/prepare failed");
+        return;
+    }
+    prepareTicket_ = ticket;
+    ticketPrepared_ = true;
+    ticketBegun_ = false;
+    ticketSubmitted_ = false;
+    PublishPreparedOutputs(openXr_.SessionRunGeneration());
+}
+
+bool VrRuntime::ShouldDeferStereoSubmit() const noexcept {
+    if (ticketBegun_) {
+        return false;
+    }
+    if (!config_.stereoProjectionEnabled || !prepareFrame_.shouldRender) {
+        return false;
+    }
+    if (HasPendingStereoGpuPublish() || stereoRenderMailbox_.HasUnconsumed()) {
+        return false;
+    }
+    return stereoRenderMailbox_.PublishedRecently(
+        frame::kStereoSubmitHoldNanoseconds);
+}
+
+void VrRuntime::EnsureGraphicsBegun() noexcept {
+    if (stopRequested_.load(std::memory_order_acquire) || State() == VrRuntimeState::Faulted) {
+        return;
+    }
+    if (!ticketPrepared_ || ticketBegun_ || prepareTicket_.frameId == 0) {
+        return;
+    }
+    if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+        Fault("OpenXR graphics callback did not retire within 2 seconds");
+        return;
+    }
+    if (!ProcessUnityEvents() || !openXr_.IsSessionRunning() ||
+        prepareTicket_.sessionGeneration != openXr_.SessionRunGeneration()) {
+        ticketPrepared_ = false;
+        return;
+    }
+    const auto gate = openXr_.Coordinator().WaitForGraphicsGate(prepareTicket_.frameId);
+    if (gate != frame::TicketError::None) {
+        log_.Write(
+            std::string("[VR][frame] GRAPHICS_GATE wait failed reason=") +
+            frame::TicketErrorName(gate));
+        return;
+    }
+    const auto begun = openXr_.BeginPrepared(prepareTicket_, prepareFrame_, log_);
+    lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+    if (begun == openxr::OpenXrContext::FrameResult::Completed) {
+        ticketBegun_ = true;
+        return;
+    }
+    if (begun != openxr::OpenXrContext::FrameResult::GraphicsGateClosed) {
+        Fault("OpenXR begin failed");
+    }
+}
+
+int VrRuntime::OnUnitySubmitPhase() noexcept {
+    if (stopRequested_.load(std::memory_order_acquire) || State() == VrRuntimeState::Faulted) {
+        return 0;
+    }
+    if (!ticketPrepared_ || prepareTicket_.frameId == 0 || ticketSubmitted_) {
+        return 0;
+    }
+    if (ShouldDeferStereoSubmit()) {
+        log_.Write(
+            "[VR][frame] SUBMIT_DEFERRED frameId=" +
+            std::to_string(prepareTicket_.frameId) + " reason=await-fresh-eyes");
+        return 0;
+    }
+    EnsureGraphicsBegun();
+    if (!ticketBegun_) {
+        return 0;
+    }
+    // Preserve the exact source identity until the ordered callback has copied
+    // it. The capture pixels are written on that same Present/render thread.
+    queuedSourceFrame_.Reset();
+    queuedSourceFrame_.texture = activeSourceFrame_.texture;
+    if (queuedSourceFrame_.texture != nullptr) queuedSourceFrame_.texture->AddRef();
+    queuedSourceFrame_.generation = activeSourceFrame_.generation;
+    ticketSubmitted_ = true;
+    const int slot = openXr_.Coordinator().SlotIndex(prepareTicket_.frameId);
+    endEventSerial_ = (endEventSerial_ + 1U) & 0x7fffu;
+    int eventId = static_cast<int>((endEventSerial_ << 1) | (slot & 1));
+    if (eventId <= 0) {
+        eventId = 2;
+    }
+    if (!endDispatch_.Publish(eventId, prepareTicket_)) {
+        Fault("OpenXR End dispatch slot is still occupied");
+        return 0;
+    }
+    if (openXr_.Coordinator().MarkEndDispatched(prepareTicket_.frameId) !=
+            frame::TicketError::None) {
+        Fault("OpenXR End dispatch could not release the next CPU wait");
+        return 0;
+    }
+    log_.Write("[VR][frame] GRAPHICS_DISPATCH frameId=" +
+        std::to_string(prepareTicket_.frameId) + " eventId=" + std::to_string(eventId) +
+        " tid=" + std::to_string(GetCurrentThreadId()));
+    return eventId;
+}
+
+void VrRuntime::OnGraphicsEndEvent(int eventId) noexcept {
+    frame::FrameIdentity endingTicket{};
+    if (!endDispatch_.Take(eventId, endingTicket)) {
+        return;
+    }
+    // Keep both completion signals valid even when an unexpected C++ exception
+    // escapes a painter. Resources retire before the next graphics owner runs.
+    struct CallbackCompletion {
+        frame::FrameEndDispatch& dispatch;
+        ~CallbackCompletion() { dispatch.CompleteCallback(); }
+    } completion{endDispatch_};
+    try {
+        auto source = std::move(queuedSourceFrame_);
+        // Color/AA/mailbox GPU work is part of this ordered callback. A
+        // failed consume withholds that pair; Submit still legally ends.
+        if (!ConsumePendingStereoGpuPublish()) {
+            log_.Write("[VR][stereo] STEREO_GPU_CONSUME_FAILED eventId=" +
+                std::to_string(eventId));
+        }
+        // EndPrepared fills this from the ticket's sealed FrameWork. Never read
+        // prepareFrame_: the Unity thread may already be preparing N+1.
+        openxr::OpenXrContext::StereoFrame ending{};
+        const auto submitted = openXr_.SubmitPrepared(
+            endingTicket, ending, source.texture, source.generation,
+            config_.stereoProjectionEnabled ? &stereoRenderMailbox_ : nullptr, log_);
+        lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+        if (submitted != openxr::OpenXrContext::FrameResult::Completed) {
+            Fault("OpenXR graphics callback submission failed");
+            return;
+        }
+        NoteSubmittedOutputs(ending, openXr_.SessionRunGeneration());
+        input::RegisterUnityPointerEndQueued(
+            endingTicket.frameId, openXr_.SessionRunGeneration());
+        log_.Write("[VR][frame] GRAPHICS_SUBMITTED frameId=" +
+            std::to_string(endingTicket.frameId) + " eventId=" + std::to_string(eventId) +
+            " tid=" + std::to_string(GetCurrentThreadId()));
+        // An epoch transition updates shared reference-space bookkeeping in End.
+        // Keep CPU preparation behind the full callback for these rare frames.
+        if (!ending.referenceSpaceChanged) endDispatch_.CompleteSubmission();
+        const auto ended = openXr_.EndPrepared(endingTicket, ending, log_);
+        lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+        if (ended != openxr::OpenXrContext::FrameResult::Completed &&
+            ended != openxr::OpenXrContext::FrameResult::SessionNotRunning) {
+            Fault("OpenXR end failed");
+        }
+    } catch (...) {
+        Fault("OpenXR graphics callback raised an exception");
+    }
+}
+
+bool VrRuntime::CurrentPoseAdmission(pose::PoseAdmission& admission) const noexcept {
+    if (!ticketPrepared_ || prepareTicket_.frameId == 0) {
+        return false;
+    }
+    admission.frameId = prepareTicket_.frameId;
+    admission.sessionGeneration = prepareTicket_.sessionGeneration;
+    admission.inputEpoch = prepareTicket_.referenceSpaceEpoch;
+    admission.referenceSpaceType =
+        static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType());
+    admission.requireTracked = true;
+    return true;
+}
+
+bool VrRuntime::ReadStereoPoseForAdmission(
+    const pose::PoseAdmission& admission,
+    pose::StereoPoseSample& sample) const noexcept {
+    return poseMailbox_.ReadAccepted(admission, sample);
+}
+
+void VrRuntime::PumpStandaloneFrame() noexcept {
+    OnUnityWaitPhase();
+    EnsureGraphicsBegun();
+    const int eventId = OnUnitySubmitPhase();
+    if (eventId > 0) {
+        OnGraphicsEndEvent(eventId);
+    }
+}
+
 void VrRuntime::PublishStereoTargetSpecChange() {
     const std::uint32_t width = openXr_.StereoEyeWidth();
     const std::uint32_t height = openXr_.StereoEyeHeight();
@@ -1402,6 +1656,7 @@ void VrRuntime::PublishStereoTargetSpecChange() {
         return;
     }
     stereoRenderMailbox_.Invalidate();
+    DropPendingStereoGpuPublish();
     stereoEyeWidth_.store(width, std::memory_order_release);
     stereoEyeHeight_.store(height, std::memory_order_release);
     const std::uint64_t generation =
@@ -1518,6 +1773,7 @@ bool VrRuntime::PublishUnityStereoFrame(
 
 void VrRuntime::InvalidateUnityStereoFrame() noexcept {
     stereoRenderMailbox_.Invalidate();
+    DropPendingStereoGpuPublish();
 }
 
 bool VrRuntime::WriteVrLog(std::string_view message) noexcept {

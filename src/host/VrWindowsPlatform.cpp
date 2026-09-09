@@ -5,6 +5,7 @@
 #include "GakumasLocalify/MasterLocal.h"
 #include "GakumasLocalify/camera/camera.hpp"
 #include "vr/config/VrifyConfig.hpp"
+#include "vr/VrRuntime.hpp"
 #include "GakumasLocalify/Il2cppUtils.hpp"
 #include "gkmsGUI/gkmsGUIMain.hpp"
 #include "gkmsGUI/GUII18n.hpp"
@@ -68,6 +69,11 @@ namespace
 
     using LoadLibraryWFunction = HMODULE(WINAPI*)(LPCWSTR);
     LoadLibraryWFunction g_loadLibraryWOriginal = nullptr;
+    using GetProcAddressFunction = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    using Il2CppInitFunction = int (*)(const char*);
+    GetProcAddressFunction g_getProcAddressOriginal = nullptr;
+    std::atomic<Il2CppInitFunction> g_il2cppInitOriginal{nullptr};
+    std::atomic_bool g_earlyRuntimeReady = false;
     std::atomic<HANDLE> g_patchRequestEvent = nullptr;
     std::atomic_bool g_gameAssemblyPatched = false;
 
@@ -108,6 +114,14 @@ namespace
         const auto requestEvent = static_cast<HANDLE>(parameter);
         if (WaitForSingleObject(requestEvent, INFINITE) == WAIT_OBJECT_0) {
             try {
+                if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+                    gakumas::vr::WriteVrLog(g_earlyRuntimeReady.load(std::memory_order_acquire)
+                        ? "UNITY_BOOTSTRAP_MILESTONE source=il2cpp_init_success"
+                        : "UNITY_BOOTSTRAP_MILESTONE source=vuplex_fallback");
+                }
+                GakumasLocal::Log::Info(g_earlyRuntimeReady.load(std::memory_order_acquire)
+                    ? "Unity bootstrap milestone: il2cpp_init returned successfully."
+                    : "Unity bootstrap milestone: Vuplex fallback.");
                 PatchGameAssembly();
             }
             catch (const std::exception& exception) {
@@ -162,6 +176,32 @@ namespace
         }
     }
 
+    int EarlyIl2CppInit(const char* domainName) {
+        const auto original = g_il2cppInitOriginal.load(std::memory_order_acquire);
+        const int result = original(domainName);
+        if (result != 0) {
+            g_earlyRuntimeReady.store(true, std::memory_order_release);
+            RequestGameAssemblyPatch();
+        }
+        return result;
+    }
+
+    FARPROC WINAPI GetProcAddressHook(HMODULE module, LPCSTR name) {
+        const auto resolved = g_getProcAddressOriginal(module, name);
+        // UnityPlayer's verified LoadIl2Cpp resolves this export into its init
+        // slot. Lookup does no Unity work; only successful init signals the
+        // existing worker. Ordinal lookups and every other export pass through.
+        if (resolved && reinterpret_cast<std::uintptr_t>(name) > 0xffff &&
+            std::strcmp(name, "il2cpp_init") == 0 &&
+            module == GetModuleHandleW(L"GameAssembly.dll") &&
+            GakumasLocal::Config::vrRuntimeStartupEnabled) {
+            g_il2cppInitOriginal.store(
+                reinterpret_cast<Il2CppInitFunction>(resolved), std::memory_order_release);
+            return reinterpret_cast<FARPROC>(&EarlyIl2CppInit);
+        }
+        return resolved;
+    }
+
     HMODULE WINAPI LoadLibraryWHook(const wchar_t* path)
     {
         if (!g_loadLibraryWOriginal) {
@@ -205,6 +245,12 @@ bool initHook() {
     }
 
     const auto kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (GakumasLocal::Config::vrRuntimeStartupEnabled && kernel32) {
+        const auto lookup = reinterpret_cast<void*>(GetProcAddress(kernel32, "GetProcAddress"));
+        GakumasVR::Hooks::CreateAndEnable(
+            lookup, reinterpret_cast<void*>(&GetProcAddressHook),
+            reinterpret_cast<void**>(&g_getProcAddressOriginal), "VR.EarlyIl2CppLookup");
+    }
     const auto loadLibraryW = kernel32
         ? reinterpret_cast<void*>(GetProcAddress(kernel32, "LoadLibraryW"))
         : nullptr;

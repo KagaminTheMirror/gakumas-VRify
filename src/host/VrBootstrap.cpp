@@ -212,9 +212,27 @@ namespace {
 // The deterministic host harness has a finite lifetime unlike the game. Give it
 // an explicit, non-loader-lock teardown seam so a live OpenXR runtime is never
 // abandoned while its host process is returning from wWinMain.
+extern "C" __declspec(dllexport) void GakumasVrPumpApplicationFrameForTest() noexcept
+{
+	gakumas::vr::VrRuntime::Instance().PumpStandaloneFrame();
+}
+
 extern "C" __declspec(dllexport) void GakumasVrStopRuntimeForTest() noexcept
 {
 	gakumas::vr::StopVrRuntime();
+}
+
+extern "C" __declspec(dllexport) int GakumasVrPrepareApplicationFrameForTest() noexcept
+{
+	auto& runtime = gakumas::vr::VrRuntime::Instance();
+	runtime.OnUnityWaitPhase();
+	runtime.EnsureGraphicsBegun();
+	return runtime.OnUnitySubmitPhase();
+}
+
+extern "C" __declspec(dllexport) void GakumasVrRenderApplicationFrameForTest(int eventId) noexcept
+{
+	gakumas::vr::VrRuntime::Instance().OnGraphicsEndEvent(eventId);
 }
 
 BOOL WINAPI DllMain(HINSTANCE dllModule, DWORD reason, LPVOID)

@@ -1,5 +1,9 @@
 #include "D3D11Capture.hpp"
 #include "../GripTransparencyTrace.hpp"
+#include "../PerformanceTiming.hpp"
+#include "../frame/FrameLoopDriver.hpp"
+#include "../VrRuntime.hpp"
+#include "../config/VrifyConfig.hpp"
 
 #include <d3d11_4.h>
 
@@ -387,6 +391,10 @@ HRESULT WINAPI D3D11Capture::CreateDeviceAndSwapChainDetour(
 }
 
 HRESULT STDMETHODCALLTYPE D3D11Capture::PresentDetour(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    static thread_local perf::Accumulator captureTiming, presentTiming;
+    const auto sink = [](std::string_view line) noexcept { static_cast<void>(WriteVrLog(line)); };
+    const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
+    perf::Scope captureScope(captureTiming, timing, "present.capture", sink);
     auto* active = active_.load(std::memory_order_acquire);
     if (active != nullptr) {
         active->CaptureUnitySwapChain(swapChain);
@@ -394,8 +402,12 @@ HRESULT STDMETHODCALLTYPE D3D11Capture::PresentDetour(IDXGISwapChain* swapChain,
     }
 
     const auto original = originalPresent_;
+    captureScope.Stop();
+    perf::Scope presentScope(presentTiming, timing, "present.original", sink, syncInterval, flags);
     const HRESULT result =
         original != nullptr ? original(swapChain, syncInterval, flags) : E_FAIL;
+    presentScope.Stop();
+    FrameLoopDriverOnPresent();
     if (active != nullptr &&
         active->transparentBackbufferClear_.load(std::memory_order_acquire)) {
         active->ClearBackbufferTransparent(swapChain);
@@ -408,6 +420,10 @@ HRESULT STDMETHODCALLTYPE D3D11Capture::Present1Detour(
     UINT syncInterval,
     UINT presentFlags,
     const DXGI_PRESENT_PARAMETERS* presentParameters) {
+    static thread_local perf::Accumulator captureTiming, presentTiming;
+    const auto sink = [](std::string_view line) noexcept { static_cast<void>(WriteVrLog(line)); };
+    const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
+    perf::Scope captureScope(captureTiming, timing, "present1.capture", sink);
     auto* active = active_.load(std::memory_order_acquire);
     if (active != nullptr) {
         active->CaptureUnitySwapChain(swapChain);
@@ -415,10 +431,14 @@ HRESULT STDMETHODCALLTYPE D3D11Capture::Present1Detour(
     }
 
     const auto original = originalPresent1_;
+    captureScope.Stop();
+    perf::Scope presentScope(presentTiming, timing, "present1.original", sink, syncInterval, presentFlags);
     const HRESULT result =
         original != nullptr
             ? original(swapChain, syncInterval, presentFlags, presentParameters)
             : E_FAIL;
+    presentScope.Stop();
+    FrameLoopDriverOnPresent();
     if (active != nullptr &&
         active->transparentBackbufferClear_.load(std::memory_order_acquire)) {
         active->ClearBackbufferTransparent(swapChain);

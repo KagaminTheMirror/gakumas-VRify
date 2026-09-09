@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../frame/SingleFrameLoopContracts.hpp"
+
 #include <cstdint>
 
 namespace gakumas::vr::input {
@@ -15,6 +17,7 @@ struct ThumbstickScrollStep {
     bool stopped = false;
     bool directionChanged = false;
     bool timingReset = false;
+    bool timingCapped = false;
 };
 
 // Converts a sampled OpenXR thumbstick axis into high-resolution Windows
@@ -27,12 +30,18 @@ public:
     // The live game multiplies CampusScrollRect event deltas by 80. 18.75 Unity
     // input units per second therefore targets 1500 UI units/s at full
     // deflection while retaining truly fractional frame steps.
-    static constexpr float kMaximumUnityUnitsPerSecond = 18.75F;
-    static constexpr std::int64_t kMaximumFrameGapNanoseconds = 50'000'000;
+    static constexpr float kMaximumUnityUnitsPerSecond =
+        frame::kScrollMaxUnityUnitsPerSecond;
+    static constexpr std::int64_t kMaximumFrameGapNanoseconds =
+        frame::kScrollMaxCompensationNanoseconds;
+    static constexpr float kMaximumUnityUnitsPerTicket =
+        frame::kScrollMaxUnityUnitsPerTicket;
 
     [[nodiscard]] ThumbstickScrollStep Update(
         std::int64_t predictedDisplayTime,
-        float verticalAxis) noexcept;
+        float verticalAxis,
+        std::uint64_t sessionGeneration = 0,
+        std::uint64_t inputEpoch = 0) noexcept;
     void Reset() noexcept;
     [[nodiscard]] bool Active() const noexcept;
 
@@ -41,6 +50,9 @@ private:
     int direction_ = 0;
     std::int64_t lastSampleTime_ = 0;
     double fractionalWheelUnits_ = 0.0;
+    std::uint64_t sessionGeneration_ = 0;
+    std::uint64_t inputEpoch_ = 0;
+    bool epochReady_ = false;
 };
 
 } // namespace gakumas::vr::input

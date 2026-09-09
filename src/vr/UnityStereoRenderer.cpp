@@ -1,5 +1,6 @@
 #include "UnityStereoRenderer.hpp"
 
+#include "StereoGpuPublish.hpp"
 #include "LivePause.hpp"
 #include "LivenessCrashProbe.hpp"
 #include "GripTransparencyTrace.hpp"
@@ -8,11 +9,13 @@
 #include "SkyRenderHooks.hpp"
 #include "VrFreeCamera.hpp"
 #include "VrRuntime.hpp"
+#include "frame/FrameLoopDriver.hpp"
 #include "camera/FovEquivalence.hpp"
 #include "camera/ProjectionIntrinsics.hpp"
 #include "d3d11/TextureFingerprint.hpp"
 #include "../GakumasLocalify/Il2cppUtils.hpp"
 #include "config/VrifyConfig.hpp"
+#include "PerformanceTiming.hpp"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 #include "../hooks/HookManager.hpp"
 
@@ -3122,9 +3125,8 @@ bool UnityStereoRenderer::RetireFullTargets(
         std::to_string(fullWidth_) + "x" + std::to_string(fullHeight_) +
         " new=" + std::to_string(width) + "x" + std::to_string(height) +
         " generation=" + std::to_string(generation));
-    // No stage is armed here and no publish is pending, so the eye cameras own
-    // nothing the pipeline is still reading. The mailbox holds its own staging
-    // copies, so the OpenXR worker never reads these textures again.
+    // No stage is armed here. Drop any queued GPU lease and mailbox copies
+    // before the Unity shells release their surfaces.
     InvalidateUnityStereoFrame();
     using SetTarget = void (*)(void*, void*, void*);
     for (std::size_t eye = 0; eye < fullTargets_.size(); ++eye) {
@@ -3164,6 +3166,9 @@ bool UnityStereoRenderer::RetireFullTargets(
     fullGeneration_ = 0;
     continuousStereo_ = false;
     sourceFingerprintValid_.fill(false);
+    ResetNativeTextureLease(colorNativeLeases_[0]);
+    ResetNativeTextureLease(colorNativeLeases_[1]);
+    Log("[VR][stereo] NATIVE_POINTER_CACHE_INVALIDATE role=color reason=full-target-retired");
     RetireSmaaT2xMotionCopyTargets("full-target-retired");
     ResetTemporalHistories("full-target-retired");
     Log("[VR][stereo] FULL_TARGET_RETIRED retiredHandles=" +
@@ -3195,6 +3200,9 @@ bool UnityStereoRenderer::EnsureFullTarget(
                 InvalidateUnityStereoFrame();
                 continuousStereo_ = false;
                 sourceFingerprintValid_.fill(false);
+                ResetNativeTextureLease(colorNativeLeases_[0]);
+                ResetNativeTextureLease(colorNativeLeases_[1]);
+                Log("[VR][stereo] NATIVE_POINTER_CACHE_INVALIDATE role=color reason=generation-rebound");
             }
         }
         return true;
@@ -14017,7 +14025,7 @@ bool UnityStereoRenderer::ArmCurrentStage(
         // A copy queued by an unpublished/parked prior pair must never cross
         // the next pair token or a target/scene rebuild.
         smaaT2xMotionCopyTokens_.fill(0);
-        smaaT2xOrderedMotionReadyForPair_ = false;
+        smaaT2xMotionSourcesReadyForPair_ = false;
     }
     smaaT2xRequestedForPair_ = smaaT2xRequested;
     smaaT2xActiveForPair_ = smaaT2xRequested && smaaT2xReady_;
@@ -14129,8 +14137,16 @@ void UnityStereoRenderer::Tick(
     void* sourceCamera,
     const UnityStereoCameraFrame& frame,
     bool pipelineIdle) noexcept {
+    BindStereoGpuPublishOwner(this);
+    ApplyPendingGpuFailure();
+    static thread_local perf::Accumulator tickTiming;
+    perf::Scope tickScope(tickTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        "unity.tick", [this](std::string_view line) noexcept { Log(line); });
     if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
         EnsureLivenessCrashProbe();
+    }
+    if (IsOwnerThread()) {
+        FrameLoopDriverEnsureOnUnityThread();
     }
     while (IsOwnerThread() && ConsumeLivePauseToggle()) {
         ToggleLivePause();
@@ -14195,7 +14211,7 @@ void UnityStereoRenderer::Tick(
     }
     if (releaseRequested_.load(std::memory_order_acquire)) {
         RetireSmaaT2xMotionCopyTargets("release-requested");
-        smaaT2xOrderedMotionReadyForPair_ = false;
+        smaaT2xMotionSourcesReadyForPair_ = false;
         if (smaaT2xPass_.IsPrepared()) {
             smaaT2xPass_.Reset();
             smaaT2xReady_ = false;
@@ -14839,10 +14855,11 @@ bool UnityStereoRenderer::EnsureSmaaT2xMotionCopyCommandBuffer() noexcept {
 bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
     std::size_t eye,
     ID3D11Texture2D* texture,
+    std::uint64_t pairToken,
     int renderPassEvent,
     const char* boundary) noexcept {
     if (eye >= eyeCameras_.size() || texture == nullptr ||
-        smaaT2xPairToken_ == 0U) {
+        pairToken == 0U) {
         return false;
     }
     const std::string boundaryName = boundary != nullptr ? boundary : "unknown";
@@ -14854,15 +14871,7 @@ bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
     }
     const bool captured = context != nullptr &&
         smaaT2xPass_.CaptureMotionVector(
-            context, eye, texture, smaaT2xPairToken_);
-    d3d11::SmaaT2xPass::MotionVectorValueDiagnostics values{};
-    const std::uint64_t nextCaptureCount = smaaT2xCaptureCount_[eye] + 1U;
-    const bool shouldReadValues =
-        GakumasLocal::Config::vrDiagnosticsStartupEnabled && captured &&
-        (smaaT2xComprehensiveProbeForPair_ || nextCaptureCount <= 2U ||
-         nextCaptureCount % 120U == 0U);
-    const bool valuesReady = shouldReadValues && context != nullptr &&
-        smaaT2xPass_.ReadMotionVectorValues(context, eye, values);
+            context, eye, texture, pairToken);
     if (context != nullptr) {
         context->Release();
     }
@@ -14874,7 +14883,7 @@ bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
         if (faultCount <= 2U || faultCount % 300U == 0U) {
             Log("[VR][smaa-t2x] SMAA_T2X_FAULT mv-capture eye=" +
                 std::string(eye == 0U ? "left" : "right") + " token=" +
-                std::to_string(smaaT2xPairToken_) + " count=" +
+                std::to_string(pairToken) + " count=" +
                 std::to_string(faultCount) + " boundary=" + boundaryName +
                 " status=" +
                 d3d11::SmaaT2xPass::StatusName(smaaT2xPass_.LastStatus()) +
@@ -14886,7 +14895,7 @@ bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
             std::ostringstream details;
             details << "[VR][smaa-t2x] SMAA_T2X_MV_DESC eye="
                     << (eye == 0U ? "left" : "right")
-                    << " token=" << smaaT2xPairToken_
+                    << " token=" << pairToken
                     << " count=" << faultCount
                     << " boundary=" << boundaryName
                     << " mismatch=0x" << std::hex << diagnostics.mismatchMask
@@ -14916,32 +14925,12 @@ bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
         return false;
     }
     ++smaaT2xCaptureCount_[eye];
-    if (shouldReadValues) {
-        std::ostringstream valueLine;
-        valueLine << std::fixed << std::setprecision(7)
-                  << "[VR][smaa-t2x] SMAA_T2X_MV_VALUES eye="
-                  << (eye == 0U ? "left" : "right")
-                  << " token=" << smaaT2xPairToken_
-                  << " count=" << smaaT2xCaptureCount_[eye]
-                  << " boundary=" << boundaryName
-                  << " ready=" << (valuesReady ? 1 : 0)
-                  << " samples=" << values.sampleCount
-                  << " finite=" << values.finiteSampleCount
-                  << " nonfinite=" << values.nonFiniteSampleCount
-                  << " x=" << values.minimumX << ',' << values.maximumX
-                  << " y=" << values.minimumY << ',' << values.maximumY
-                  << " magnitudeMean=" << values.meanMagnitude
-                  << " magnitudeMax=" << values.maximumMagnitude
-                  << " z=" << values.minimumZ << ',' << values.maximumZ
-                  << " w=" << values.minimumW << ',' << values.maximumW;
-        Log(valueLine.str());
-    }
     if (smaaT2xCaptureCount_[eye] <= 2U ||
         smaaT2xCaptureCount_[eye] % 300U == 0U) {
         const auto diagnostics = smaaT2xPass_.LastMotionVectorDiagnostics();
         Log("[VR][smaa-t2x] SMAA_T2X_MV_CAPTURE eye=" +
             std::string(eye == 0U ? "left" : "right") + " token=" +
-            std::to_string(smaaT2xPairToken_) + " count=" +
+            std::to_string(pairToken) + " count=" +
             std::to_string(smaaT2xCaptureCount_[eye]) + " boundary=" +
             boundaryName + " event=" +
             std::to_string(renderPassEvent) + " resourceFormat=" +
@@ -14956,10 +14945,11 @@ bool UnityStereoRenderer::CaptureSmaaT2xMotionVectorTexture(
 bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
     std::size_t eye,
     ID3D11Texture2D* texture,
+    std::uint64_t pairToken,
     int renderPassEvent,
     const char* boundary) noexcept {
     if (eye >= eyeCameras_.size() || texture == nullptr ||
-        smaaT2xPairToken_ == 0U) {
+        pairToken == 0U) {
         return false;
     }
     const std::string boundaryName = boundary != nullptr ? boundary : "unknown";
@@ -14969,17 +14959,14 @@ bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
     if (device != nullptr) {
         device->GetImmediateContext(&context);
     }
+    static thread_local perf::Accumulator copyTiming[2];
+    const auto timingSink = [this](std::string_view line) noexcept { Log(line); };
+    perf::Scope copyScope(copyTiming[eye], GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        eye == 0 ? "mv.left.d3d-copy" : "mv.right.d3d-copy", timingSink);
     const bool captured = context != nullptr &&
         tscmaaPass_.CaptureMotionVector(
-            context, eye, texture, smaaT2xPairToken_);
-    d3d11::TscmaaPass::MotionVectorValueDiagnostics values{};
-    const std::uint64_t nextCaptureCount = smaaT2xCaptureCount_[eye] + 1U;
-    const bool shouldReadValues =
-        GakumasLocal::Config::vrDiagnosticsStartupEnabled && captured &&
-        (tscmaaComprehensiveProbeForPair_ || nextCaptureCount <= 2U ||
-         nextCaptureCount % 120U == 0U);
-    const bool valuesReady = shouldReadValues && context != nullptr &&
-        tscmaaPass_.ReadMotionVectorValues(context, eye, values);
+            context, eye, texture, pairToken);
+    copyScope.Stop();
     if (context != nullptr) {
         context->Release();
     }
@@ -14991,7 +14978,7 @@ bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
         if (faultCount <= 2U || faultCount % 300U == 0U) {
             Log("[VR][tscmaa] TSCMAA_FAULT mv-capture eye=" +
                 std::string(eye == 0U ? "left" : "right") + " token=" +
-                std::to_string(smaaT2xPairToken_) + " count=" +
+                std::to_string(pairToken) + " count=" +
                 std::to_string(faultCount) + " boundary=" + boundaryName +
                 " status=" +
                 d3d11::TscmaaPass::StatusName(tscmaaPass_.LastStatus()) +
@@ -15003,7 +14990,7 @@ bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
             std::ostringstream details;
             details << "[VR][tscmaa] TSCMAA_MV_DESC eye="
                     << (eye == 0U ? "left" : "right")
-                    << " token=" << smaaT2xPairToken_
+                    << " token=" << pairToken
                     << " count=" << faultCount
                     << " boundary=" << boundaryName
                     << " mismatch=0x" << std::hex << diagnostics.mismatchMask
@@ -15033,32 +15020,12 @@ bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
         return false;
     }
     ++smaaT2xCaptureCount_[eye];
-    if (shouldReadValues) {
-        std::ostringstream valueLine;
-        valueLine << std::fixed << std::setprecision(7)
-                  << "[VR][tscmaa] TSCMAA_MV_VALUES eye="
-                  << (eye == 0U ? "left" : "right")
-                  << " token=" << smaaT2xPairToken_
-                  << " count=" << smaaT2xCaptureCount_[eye]
-                  << " boundary=" << boundaryName
-                  << " ready=" << (valuesReady ? 1 : 0)
-                  << " samples=" << values.sampleCount
-                  << " finite=" << values.finiteSampleCount
-                  << " nonfinite=" << values.nonFiniteSampleCount
-                  << " x=" << values.minimumX << ',' << values.maximumX
-                  << " y=" << values.minimumY << ',' << values.maximumY
-                  << " magnitudeMean=" << values.meanMagnitude
-                  << " magnitudeMax=" << values.maximumMagnitude
-                  << " z=" << values.minimumZ << ',' << values.maximumZ
-                  << " w=" << values.minimumW << ',' << values.maximumW;
-        Log(valueLine.str());
-    }
     if (smaaT2xCaptureCount_[eye] <= 2U ||
         smaaT2xCaptureCount_[eye] % 300U == 0U) {
         const auto diagnostics = tscmaaPass_.LastMotionVectorDiagnostics();
         Log("[VR][tscmaa] TSCMAA_MV_CAPTURE eye=" +
             std::string(eye == 0U ? "left" : "right") + " token=" +
-            std::to_string(smaaT2xPairToken_) + " count=" +
+            std::to_string(pairToken) + " count=" +
             std::to_string(smaaT2xCaptureCount_[eye]) + " boundary=" +
             boundaryName + " event=" +
             std::to_string(renderPassEvent) + " resourceFormat=" +
@@ -15070,7 +15037,10 @@ bool UnityStereoRenderer::CaptureTscmaaMotionVectorTexture(
     return true;
 }
 
-bool UnityStereoRenderer::CaptureQueuedSmaaT2xMotionVectors() noexcept {
+bool UnityStereoRenderer::BindQueuedSmaaT2xMotionVectors() noexcept {
+    static thread_local perf::Accumulator motionTiming;
+    perf::Scope motionScope(motionTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        "stereo.motion-copy", [this](std::string_view line) noexcept { Log(line); });
     if ((!smaaT2xRequestedForPair_ && !tscmaaRequestedForPair_) || !stageArmed_ ||
         smaaT2xPairToken_ == 0U) {
         return false;
@@ -15092,10 +15062,9 @@ bool UnityStereoRenderer::CaptureQueuedSmaaT2xMotionVectors() noexcept {
             return false;
         }
     }
-    // The complete SRP render loop has returned, so Unity has submitted the
-    // context that contains both queued copies. The per-eye copy targets are
-    // mod-owned and only written by those ordered copies, so the immutable
-    // snapshot can never observe another pass recycling the shared RTHandle.
+    // SRP return proves command recording, not render-thread execution.
+    // Cache only the mod-owned copy targets here. The pending GPU ticket holds
+    // its own COM references and snapshots their pixels after Unity's copies.
     for (std::size_t eye = 0; eye < smaaT2xMotionCopyTargets_.size(); ++eye) {
         void* target = smaaT2xMotionCopyTargets_[eye];
         if (target == nullptr || !IsUnityManagedObjectAlive(target)) {
@@ -15109,11 +15078,17 @@ bool UnityStereoRenderer::CaptureQueuedSmaaT2xMotionVectors() noexcept {
             RetireSmaaT2xMotionCopyTargets("dead-object");
             return false;
         }
-        using GetNativeTexturePtr = void* (*)(void*, void*);
         void* nativePointer = nullptr;
-        if (!InvokeManagedResult<void*, GetNativeTexturePtr>(
-                api_.textureGetNativeTexturePtr, &nativePointer, target) ||
-            nativePointer == nullptr) {
+        ID3D11Texture2D* texture = nullptr;
+        static thread_local perf::Accumulator nativeTiming[2];
+        perf::Scope nativeScope(nativeTiming[eye], GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+            eye == 0 ? "mv.left.native-pointer" : "mv.right.native-pointer",
+            [this](std::string_view line) noexcept { Log(line); });
+        const bool nativeReady = BindNativeTextureLease(
+            target, smaaT2xMotionCopyEpoch_, motionNativeLeases_[eye],
+            "motion", eye, &nativePointer, &texture);
+        nativeScope.Stop();
+        if (!nativeReady || texture == nullptr) {
             const auto count = ++smaaT2xCaptureFaultCount_[eye];
             if (count <= 2U || count % 300U == 0U) {
                 Log(aaFaultTag + "mv-copy-native eye=" +
@@ -15123,29 +15098,7 @@ bool UnityStereoRenderer::CaptureQueuedSmaaT2xMotionVectors() noexcept {
             }
             return false;
         }
-        ID3D11Texture2D* texture = nullptr;
-        if (!QueryD3D11Texture(nativePointer, &texture) ||
-            texture == nullptr) {
-            const auto count = ++smaaT2xCaptureFaultCount_[eye];
-            if (count <= 2U || count % 300U == 0U) {
-                Log(aaFaultTag + "mv-copy-query eye=" +
-                    std::string(eye == 0U ? "left" : "right") + " token=" +
-                    std::to_string(smaaT2xPairToken_) + " count=" +
-                    std::to_string(count));
-            }
-            return false;
-        }
-        const bool captured = tscmaaRequestedForPair_
-            ? CaptureTscmaaMotionVectorTexture(
-                  eye, texture, smaaT2xMotionCopyEvents_[eye],
-                  eye == 0U ? "loop-copy-left" : "loop-copy-right")
-            : CaptureSmaaT2xMotionVectorTexture(
-                  eye, texture, smaaT2xMotionCopyEvents_[eye],
-                  eye == 0U ? "loop-copy-left" : "loop-copy-right");
-        texture->Release();
-        if (!captured) {
-            return false;
-        }
+        texture->Release(); // The epoch cache retains the binding, not pixel freshness.
         const std::uint64_t count = ++smaaT2xMotionBoundaryCount_;
         if (count <= 4U || count % 600U == 0U ||
             smaaT2xComprehensiveProbeForPair_ ||
@@ -15153,7 +15106,7 @@ bool UnityStereoRenderer::CaptureQueuedSmaaT2xMotionVectors() noexcept {
             const std::string aaTag = tscmaaRequestedForPair_
                 ? "[VR][tscmaa] TSCMAA_MV_BOUNDARY source=render-loop "
                 : "[VR][smaa-t2x] SMAA_T2X_MV_BOUNDARY source=render-loop ";
-            Log(aaTag + "action=capture target=" +
+            Log(aaTag + "action=bind-source target=" +
                 std::string(eye == 0U ? "left" : "right") + " token=" +
                 std::to_string(smaaT2xPairToken_) + " count=" +
                 std::to_string(count));
@@ -15197,7 +15150,12 @@ void UnityStereoRenderer::RetireSmaaT2xMotionCopyTargets(
     smaaT2xMotionCopyEvents_.fill(0);
     smaaT2xMotionCopyWidth_ = 0;
     smaaT2xMotionCopyHeight_ = 0;
+    ResetNativeTextureLease(motionNativeLeases_[0]);
+    ResetNativeTextureLease(motionNativeLeases_[1]);
+    ++smaaT2xMotionCopyEpoch_;
     if (retired) {
+        Log("[VR][stereo] NATIVE_POINTER_CACHE_INVALIDATE role=motion reason=" +
+            std::string(reason != nullptr ? reason : "unknown"));
         const std::string aaTag = tscmaa
             ? "[VR][tscmaa] TSCMAA_MV_COPY_RETIRED reason="
             : "[VR][smaa-t2x] SMAA_T2X_MV_COPY_RETIRED reason=";
@@ -15305,7 +15263,7 @@ void UnityStereoRenderer::ResetTemporalHistories(const char* reason) noexcept {
     tscmaaComprehensiveProbeForPair_ = false;
     smaaT2xExpectedProjectionValid_.fill(false);
     smaaT2xMotionCopyTokens_.fill(0);
-    smaaT2xOrderedMotionReadyForPair_ = false;
+    smaaT2xMotionSourcesReadyForPair_ = false;
     ++temporalHistoryResetCount_;
     if (lastTemporalHistoryResetReason_ != tag ||
         temporalHistoryResetCount_ <= 2U ||
@@ -15340,6 +15298,182 @@ void UnityStereoRenderer::FallBackTscmaa(const char* reason) noexcept {
         " action=withhold-temporal-pair next=urp-smaa-warmup");
 }
 
+void UnityStereoRenderer::NativeTextureLease::Reset() noexcept {
+    if (texture != nullptr) {
+        texture->Release();
+        texture = nullptr;
+    }
+    managed = nullptr;
+    nativePointer = nullptr;
+    generation = 0;
+    width = 0;
+    height = 0;
+    format = DXGI_FORMAT_UNKNOWN;
+    device = 0;
+    hitCount = 0;
+    srgbKnown = false;
+    srgb = false;
+}
+
+bool UnityStereoRenderer::NativeTextureLease::Matches(
+    void* managedObject, std::uint64_t resourceGeneration) const noexcept {
+    return managed != nullptr && texture != nullptr &&
+        nativePointer != nullptr && managed == managedObject &&
+        generation == resourceGeneration;
+}
+
+void UnityStereoRenderer::ResetNativeTextureLease(
+    NativeTextureLease& lease) noexcept {
+    lease.Reset();
+}
+
+void UnityStereoRenderer::ResetAllNativeTextureLeases() noexcept {
+    ResetNativeTextureLease(colorNativeLeases_[0]);
+    ResetNativeTextureLease(colorNativeLeases_[1]);
+    ResetNativeTextureLease(motionNativeLeases_[0]);
+    ResetNativeTextureLease(motionNativeLeases_[1]);
+}
+
+bool UnityStereoRenderer::BindNativeTextureLease(
+    void* managed,
+    std::uint64_t generation,
+    NativeTextureLease& lease,
+    const char* role,
+    std::size_t eye,
+    void** nativePointer,
+    ID3D11Texture2D** texture) noexcept {
+    if (nativePointer != nullptr) {
+        *nativePointer = nullptr;
+    }
+    if (texture != nullptr) {
+        *texture = nullptr;
+    }
+    if (managed == nullptr || nativePointer == nullptr || texture == nullptr) {
+        return false;
+    }
+
+    const auto roleName = role != nullptr ? role : "unknown";
+    const auto eyeName = eye == 0U ? "left" : "right";
+    const auto logMiss = [&](const char* reason) noexcept {
+        Log("[VR][stereo] NATIVE_POINTER_CACHE hit=0 role=" +
+            std::string(roleName) + " eye=" + std::string(eyeName) +
+            " reason=" + std::string(reason != nullptr ? reason : "unknown") +
+            " generation=" + std::to_string(generation));
+    };
+
+    if (!IsUnityManagedObjectAlive(managed)) {
+        ResetNativeTextureLease(lease);
+        logMiss("dead-object");
+        return false;
+    }
+
+    const char* miss = nullptr;
+    if (lease.Matches(managed, generation)) {
+        D3D11_TEXTURE2D_DESC description{};
+        lease.texture->GetDesc(&description);
+        ID3D11Device* device = nullptr;
+        lease.texture->GetDevice(&device);
+        const auto deviceId = reinterpret_cast<std::uintptr_t>(device);
+        if (device != nullptr) {
+            device->Release();
+        }
+        if (description.Width != lease.width ||
+            description.Height != lease.height ||
+            description.Format != lease.format) {
+            miss = "desc-mismatch";
+        } else if (deviceId != lease.device) {
+            miss = "device-mismatch";
+        } else {
+            lease.texture->AddRef();
+            *nativePointer = lease.nativePointer;
+            *texture = lease.texture;
+            ++lease.hitCount;
+            if (lease.hitCount <= 2U || lease.hitCount % 300U == 0U) {
+                Log("[VR][stereo] NATIVE_POINTER_CACHE hit=1 role=" +
+                    std::string(roleName) + " eye=" +
+                    std::string(eyeName) + " generation=" +
+                    std::to_string(generation) + " count=" +
+                    std::to_string(lease.hitCount));
+            }
+            return true;
+        }
+    } else if (lease.managed == nullptr) {
+        miss = "empty";
+    } else if (lease.managed != managed) {
+        miss = "managed-changed";
+    } else if (lease.generation != generation) {
+        miss = "generation-changed";
+    } else {
+        miss = "unbound";
+    }
+
+    ResetNativeTextureLease(lease);
+    logMiss(miss);
+
+    using GetNativeTexturePtr = void* (*)(void*, void*);
+    void* fetched = nullptr;
+    if (!api_.textureGetNativeTexturePtr.Ready() ||
+        !InvokeManagedResult<void*, GetNativeTexturePtr>(
+            api_.textureGetNativeTexturePtr, &fetched, managed) ||
+        fetched == nullptr) {
+        return false;
+    }
+    ID3D11Texture2D* queried = nullptr;
+    if (!QueryD3D11Texture(fetched, &queried) || queried == nullptr) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC description{};
+    queried->GetDesc(&description);
+    ID3D11Device* device = nullptr;
+    queried->GetDevice(&device);
+    const auto deviceId = reinterpret_cast<std::uintptr_t>(device);
+    if (device != nullptr) {
+        device->Release();
+    }
+
+    lease.managed = managed;
+    lease.nativePointer = fetched;
+    lease.texture = queried;
+    lease.generation = generation;
+    lease.width = description.Width;
+    lease.height = description.Height;
+    lease.format = description.Format;
+    lease.device = deviceId;
+    lease.hitCount = 0;
+    lease.srgbKnown = false;
+    lease.srgb = false;
+
+    queried->AddRef();
+    *nativePointer = fetched;
+    *texture = queried;
+    return true;
+}
+
+bool UnityStereoRenderer::ReadLeaseSrgb(
+    void* managed, NativeTextureLease& lease, bool* srgb) noexcept {
+    if (srgb == nullptr || managed == nullptr) {
+        return false;
+    }
+    if (lease.managed == managed && lease.srgbKnown) {
+        *srgb = lease.srgb;
+        return true;
+    }
+    using GetBool = bool (*)(void*, void*);
+    bool value = false;
+    if (!api_.renderTextureGetSrgb.Ready() ||
+        !InvokeManagedResult<bool, GetBool>(
+            api_.renderTextureGetSrgb, &value, managed)) {
+        return false;
+    }
+    *srgb = value;
+    if (lease.managed == managed) {
+        lease.srgb = value;
+        lease.srgbKnown = true;
+    }
+    return true;
+}
+
 void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
     if (!publishPending_ || stage_ != LadderStage::StereoFull ||
         renderLoopSerial_ < publishAfterLoopSerial_) {
@@ -15348,7 +15482,7 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
     if (!SceneReadyAllowsStereoPublish()) {
         publishPending_ = false;
         smaaT2xMotionCopyTokens_.fill(0);
-        smaaT2xOrderedMotionReadyForPair_ = false;
+        smaaT2xMotionSourcesReadyForPair_ = false;
         if (SceneReadyConsumePublishHoldLog()) {
             Log("[VR][scene-ready] SCENE_READY_HOLD reason=withhold-mailbox");
         }
@@ -15357,15 +15491,23 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
     // The diagnostic boundary is one-shot. Any clean failure below moves the
     // ladder to Failed and must not repeat native calls on later render loops.
     publishPending_ = false;
-    using GetNativeTexturePtr = void* (*)(void*, void*);
+    static thread_local perf::Accumulator publishTiming;
+    perf::Scope publishScope(publishTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        "stereo.prepare-publish", [this](std::string_view line) noexcept { Log(line); });
     std::array<void*, 2> nativePointers{};
     std::array<ID3D11Texture2D*, 2> textures{};
     for (std::size_t eye = 0; eye < 2U; ++eye) {
         Log("[VR][stereo] CALL_BEGIN stage=native.get-texture eye=" +
             std::string(eye == 0U ? "left" : "right"));
-        if (!InvokeManagedResult<void*, GetNativeTexturePtr>(
-                api_.textureGetNativeTexturePtr, &nativePointers[eye],
-                fullTargets_[eye]) || nativePointers[eye] == nullptr) {
+        static thread_local perf::Accumulator nativeTiming[2];
+        const auto timingSink = [this](std::string_view line) noexcept { Log(line); };
+        perf::Scope nativeScope(nativeTiming[eye], GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+            eye == 0 ? "color.left.native-pointer" : "color.right.native-pointer", timingSink);
+        const bool nativeReady = BindNativeTextureLease(
+            fullTargets_[eye], fullGeneration_, colorNativeLeases_[eye],
+            "color", eye, &nativePointers[eye], &textures[eye]);
+        nativeScope.Stop();
+        if (!nativeReady || textures[eye] == nullptr) {
             for (auto* texture : textures) {
                 if (texture != nullptr) texture->Release();
             }
@@ -15375,23 +15517,8 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         Log("[VR][stereo] CALL_OK stage=native.get-texture eye=" +
             std::string(eye == 0U ? "left" : "right") + " ptr=" +
             std::to_string(reinterpret_cast<std::uintptr_t>(nativePointers[eye])));
-        Log("[VR][stereo] CALL_BEGIN stage=native.query-d3d11 eye=" +
-            std::string(eye == 0U ? "left" : "right"));
-        if (!QueryD3D11Texture(nativePointers[eye], &textures[eye])) {
-            for (auto* texture : textures) {
-                if (texture != nullptr) texture->Release();
-            }
-            FailStage("native.query-d3d11", eye);
-            return;
-        }
-        Log("[VR][stereo] CALL_OK stage=native.query-d3d11 eye=" +
-            std::string(eye == 0U ? "left" : "right"));
         D3D11_TEXTURE2D_DESC description{};
-        Log("[VR][stereo] CALL_BEGIN stage=native.get-desc eye=" +
-            std::string(eye == 0U ? "left" : "right"));
         textures[eye]->GetDesc(&description);
-        Log("[VR][stereo] CALL_OK stage=native.get-desc eye=" +
-            std::string(eye == 0U ? "left" : "right"));
         std::ostringstream ready;
         ready << "[VR][stereo] NATIVE_POINTER_READY eye="
               << (eye == 0U ? "left" : "right") << " ptr=" << textures[eye]
@@ -15400,16 +15527,16 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
               << " samples=" << description.SampleDesc.Count;
         Log(ready.str());
     }
-    std::array<ID3D11Texture2D*, 2> publishTextures = textures;
+    StereoGpuPublishMode gpuMode = StereoGpuPublishMode::MailboxOnly;
+    bool gpuSrgb = false;
+    bool resolveTemporal = false;
     if (smaaT2xRequestedForPair_) {
-        const bool orderedMotionReady = smaaT2xOrderedMotionReadyForPair_;
-        using GetBool = bool (*)(void*, void*);
+        const bool orderedMotionReady = smaaT2xMotionSourcesReadyForPair_;
         std::array<bool, 2> srgb{};
         bool srgbReady = true;
         for (std::size_t eye = 0; eye < srgb.size(); ++eye) {
-            if (!InvokeManagedResult<bool, GetBool>(
-                    api_.renderTextureGetSrgb, &srgb[eye],
-                    fullTargets_[eye])) {
+            if (!ReadLeaseSrgb(
+                    fullTargets_[eye], colorNativeLeases_[eye], &srgb[eye])) {
                 srgbReady = false;
                 break;
             }
@@ -15426,27 +15553,14 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         }
         D3D11_TEXTURE2D_DESC colorDescription{};
         textures[0]->GetDesc(&colorDescription);
-        const bool capturedBeforePrepare = orderedMotionReady &&
-            smaaT2xPass_.HasFreshMotionVectors(smaaT2xPairToken_);
         d3d11::SmaaT2xPass::PrepareDiagnostics prepare{};
         const bool prepared = srgbReady && device != nullptr &&
             smaaT2xPass_.Prepare(
                 device, colorDescription, srgb[0], &prepare);
-        const bool freshAfterPrepare = prepared &&
-            smaaT2xPass_.HasFreshMotionVectors(smaaT2xPairToken_);
 
         if (smaaT2xActiveForPair_) {
-            std::array<ID3D11Texture2D*, 2> resolved{};
-            const bool collectReprojectionAlignment =
-                smaaT2xComprehensiveProbeForPair_;
-            const bool resolvedReady = prepared && capturedBeforePrepare &&
-                freshAfterPrepare && context != nullptr &&
-                smaaT2xPass_.ResolveStereo(
-                    context, textures, srgb[0],
-                    GakumasLocal::Config::vrEyeSmaaQuality,
-                    smaaT2xPairPhase_, smaaT2xPairToken_,
-                    collectReprojectionAlignment, resolved);
-            if (!resolvedReady) {
+            if (!(srgbReady && prepared && orderedMotionReady &&
+                  context != nullptr)) {
                 if (context != nullptr) context->Release();
                 if (device != nullptr) device->Release();
                 for (auto* texture : textures) {
@@ -15458,109 +15572,18 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
                         ? std::string("prepare-") +
                             d3d11::SmaaT2xPass::StatusName(
                                 smaaT2xPass_.LastStatus())
-                        : !capturedBeforePrepare || !freshAfterPrepare
-                            ? "motion-vectors-missing-or-stale"
-                            : std::string("resolve-") +
-                                d3d11::SmaaT2xPass::StatusName(
-                                    smaaT2xPass_.LastStatus());
+                        : "motion-vectors-missing-or-stale";
                 FallBackSmaaT2x(failure.c_str());
                 return;
             }
-            publishTextures = resolved;
-            ++smaaT2xResolvedCount_;
-            if (collectReprojectionAlignment) {
-                d3d11::SmaaT2xPass::ReprojectionAlignmentDiagnostics
-                    alignment{};
-                const bool alignmentReady =
-                    smaaT2xPass_.ReadReprojectionAlignment(context, alignment);
-                const std::array<const char*,
-                    d3d11::SmaaT2xPass::ProbeGroupCount> candidateLabels{
-                    "own-current,other-current,average-current,zero",
-                    "own-current,own-previous,other-previous,average-previous",
-                    "own,expected-jitter,inverse-jitter,jitter-only",
-                    "current-alpha,history-alpha,history-weight,color-error",
-                    "resolved-current-error,current-luma,resolved-luma,alpha-delta",
-                };
-                for (std::size_t group = 0;
-                     group < d3d11::SmaaT2xPass::ProbeGroupCount; ++group) {
-                    std::ostringstream line;
-                    line << std::fixed << std::setprecision(7)
-                         << "[VR][smaa-t2x] SMAA_T2X_PROBE token="
-                         << smaaT2xPairToken_ << " count="
-                         << smaaT2xResolvedCount_ << " ready="
-                         << (alignmentReady ? 1 : 0) << " group="
-                         << d3d11::SmaaT2xPass::ProbeGroupName(
-                                static_cast<d3d11::SmaaT2xPass::ProbeGroup>(group))
-                         << " candidates=" << candidateLabels[group];
-                    for (std::size_t eye = 0; eye < 2U; ++eye) {
-                        const auto& values = alignment.groups[group][eye];
-                        const char* prefix = eye == 0U ? "left" : "right";
-                        const auto append = [&](const char* suffix, const auto& list) {
-                            line << ' ' << prefix << suffix << '=';
-                            for (std::size_t candidate = 0;
-                                 candidate < list.size(); ++candidate) {
-                                if (candidate != 0U) line << ',';
-                                line << list[candidate];
-                            }
-                        };
-                        append("Mean", values.meanValue);
-                        append("Min", values.minimumValue);
-                        append("Max", values.maximumValue);
-                        append("Valid", values.validSampleCount);
-                    }
-                    Log(line.str());
-                }
-                const auto resources = smaaT2xPass_.GetResourceDiagnostics();
-                std::ostringstream resourceLine;
-                resourceLine << "[VR][smaa-t2x] SMAA_T2X_RESOURCES token="
-                             << smaaT2xPairToken_ << " count="
-                             << smaaT2xResolvedCount_ << " phase="
-                             << smaaT2xPairPhase_ << " poseRevision="
-                             << armedFrame_.trackingSample.revision
-                             << " poseEpoch="
-                             << armedFrame_.trackingSample.poseEpoch;
-                const auto& currentPhase =
-                    d3d11::kSmaaT2xPhases[smaaT2xPairPhase_];
-                const auto& previousPhase =
-                    d3d11::kSmaaT2xPhases[smaaT2xPairPhase_ ^ 1U];
-                resourceLine << std::fixed << std::setprecision(9)
-                             << " jitterDeltaUv="
-                             << (previousPhase.jitterX - currentPhase.jitterX) /
-                                    static_cast<float>(colorDescription.Width)
-                             << ','
-                             << (previousPhase.jitterY - currentPhase.jitterY) /
-                                    static_cast<float>(colorDescription.Height);
-                for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
-                    const auto& value = resources.eyes[eye];
-                    resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
-                                 << std::hex << "input:0x"
-                                 << reinterpret_cast<std::uintptr_t>(textures[eye])
-                                 << ",native:0x"
-                                 << reinterpret_cast<std::uintptr_t>(nativePointers[eye])
-                                 << ",mv:0x" << value.motion
-                                 << ",currentMv:0x" << value.currentMotionProbe
-                                 << ",prevMv:0x" << value.previousMotionProbe
-                                 << ",current:0x" << value.currentSpatial
-                                 << ",previous:0x" << value.previousSpatial
-                                 << ",resolved:0x" << value.resolved << std::dec
-                                 << ",mvToken:" << value.motionPairToken
-                                 << ",currentMvToken:"
-                                 << value.currentMotionProbePairToken
-                                 << ",prevMvToken:"
-                                 << value.previousMotionProbePairToken
-                                 << ",nextSpatial:" << value.nextSpatialWriteIndex
-                                 << ",history:" << (value.historyValid ? 1 : 0);
-                }
-                Log(resourceLine.str());
-            }
-            Log("[VR][smaa-t2x] SMAA_T2X_FRAME resolved=1 token=" +
-                std::to_string(smaaT2xPairToken_) + " phase=" +
-                std::to_string(smaaT2xPairPhase_) + " history=" +
-                std::string(smaaT2xPass_.HasHistory() ? "valid" : "cold"));
-        } else if (prepared && capturedBeforePrepare) {
-            // Prepare may rebuild size-dependent resources and intentionally
-            // retire the warmup MV copies. Readiness begins on the next pair,
-            // whose captures will target the final immutable snapshots.
+            gpuMode = StereoGpuPublishMode::SmaaT2x;
+            gpuSrgb = srgb[0];
+            resolveTemporal = true;
+        } else if (prepared && orderedMotionReady) {
+            gpuMode = StereoGpuPublishMode::SmaaT2x;
+            gpuSrgb = srgb[0];
+            // Publish URP SMAA for this warmup. The callback validates/captures
+            // both motion sources after Prepare; the next pair can use T2x.
             smaaT2xReady_ = true;
             smaaT2xPhase_ = 0;
             Log("[VR][smaa-t2x] SMAA_T2X_READY size=" +
@@ -15592,14 +15615,12 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         if (context != nullptr) context->Release();
         if (device != nullptr) device->Release();
     } else if (tscmaaRequestedForPair_) {
-        const bool orderedMotionReady = smaaT2xOrderedMotionReadyForPair_;
-        using GetBool = bool (*)(void*, void*);
+        const bool orderedMotionReady = smaaT2xMotionSourcesReadyForPair_;
         std::array<bool, 2> srgb{};
         bool srgbReady = true;
         for (std::size_t eye = 0; eye < srgb.size(); ++eye) {
-            if (!InvokeManagedResult<bool, GetBool>(
-                    api_.renderTextureGetSrgb, &srgb[eye],
-                    fullTargets_[eye])) {
+            if (!ReadLeaseSrgb(
+                    fullTargets_[eye], colorNativeLeases_[eye], &srgb[eye])) {
                 srgbReady = false;
                 break;
             }
@@ -15616,27 +15637,14 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         }
         D3D11_TEXTURE2D_DESC colorDescription{};
         textures[0]->GetDesc(&colorDescription);
-        const bool capturedBeforePrepare = orderedMotionReady &&
-            tscmaaPass_.HasFreshMotionVectors(smaaT2xPairToken_);
         d3d11::TscmaaPass::PrepareDiagnostics prepare{};
         const bool prepared = srgbReady && device != nullptr &&
             tscmaaPass_.Prepare(
                 device, colorDescription, srgb[0], &prepare);
-        const bool freshAfterPrepare = prepared &&
-            tscmaaPass_.HasFreshMotionVectors(smaaT2xPairToken_);
 
         if (tscmaaActiveForPair_) {
-            std::array<ID3D11Texture2D*, 2> resolved{};
-            d3d11::TscmaaPass::TemporalStats temporalStats{};
-            const bool resolvedReady = prepared && capturedBeforePrepare &&
-                freshAfterPrepare && context != nullptr &&
-                tscmaaPass_.ResolveStereo(
-                    context, textures, srgb[0],
-                    GakumasLocal::Config::vrEyeSmaaQuality,
-                    smaaT2xPairToken_, resolved,
-                    tscmaaComprehensiveProbeForPair_ ? &temporalStats
-                                                     : nullptr);
-            if (!resolvedReady) {
+            if (!(srgbReady && prepared && orderedMotionReady &&
+                  context != nullptr)) {
                 if (context != nullptr) context->Release();
                 if (device != nullptr) device->Release();
                 for (auto* texture : textures) {
@@ -15648,96 +15656,18 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
                         ? std::string("prepare-") +
                             d3d11::TscmaaPass::StatusName(
                                 tscmaaPass_.LastStatus())
-                        : !capturedBeforePrepare || !freshAfterPrepare
-                            ? "motion-vectors-missing-or-stale"
-                            : std::string("resolve-") +
-                                d3d11::TscmaaPass::StatusName(
-                                    tscmaaPass_.LastStatus());
+                        : "motion-vectors-missing-or-stale";
                 FallBackTscmaa(failure.c_str());
                 return;
             }
-            publishTextures = resolved;
-            ++tscmaaResolvedCount_;
-            if (tscmaaComprehensiveProbeForPair_) {
-                const auto resources = tscmaaPass_.GetResourceDiagnostics();
-                std::ostringstream resourceLine;
-                resourceLine << "[VR][tscmaa] TSCMAA_RESOURCES token="
-                             << smaaT2xPairToken_ << " count="
-                             << tscmaaResolvedCount_
-                             << " poseRevision="
-                             << armedFrame_.trackingSample.revision
-                             << " poseEpoch="
-                             << armedFrame_.trackingSample.poseEpoch
-                             << " quality="
-                             << GakumasLocal::Config::vrEyeSmaaQuality
-                             << " workingEdges=0x" << std::hex
-                             << resources.workingEdges
-                             << " workingShapeCandidates=0x"
-                             << resources.workingShapeCandidates
-                             << " workingDeferredItems=0x"
-                             << resources.workingDeferredItems;
-                for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
-                    const auto& value = resources.eyes[eye];
-                    resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
-                                 << "input:0x"
-                                 << reinterpret_cast<std::uintptr_t>(textures[eye])
-                                 << ",native:0x"
-                                 << reinterpret_cast<std::uintptr_t>(nativePointers[eye])
-                                 << ",mv:0x" << value.motion
-                                 << ",spatial:0x" << value.spatial
-                                 << ",history:0x" << value.resolvedHistory
-                                 << ",output:0x" << value.resolvedOutput
-                                 << std::dec
-                                 << ",mvToken:" << value.motionPairToken
-                                 << ",nextResolved:"
-                                 << value.nextResolvedWriteIndex
-                                 << ",historyValid:"
-                                 << (value.historyValid ? 1 : 0);
-                }
-                Log(resourceLine.str());
-            }
-            if (tscmaaComprehensiveProbeForPair_) {
-                std::ostringstream statsLine;
-                statsLine << "[VR][tscmaa] TSCMAA_TEMPORAL_STATS token="
-                          << smaaT2xPairToken_ << " count="
-                          << tscmaaResolvedCount_ << " valid="
-                          << (temporalStats.valid ? 1 : 0);
-                const double pixelCount =
-                    static_cast<double>(colorDescription.Width) *
-                    static_cast<double>(colorDescription.Height);
-                for (std::size_t eye = 0;
-                     eye < temporalStats.eyes.size(); ++eye) {
-                    const auto& value = temporalStats.eyes[eye];
-                    const double blended =
-                        static_cast<double>(value.blendedPixels);
-                    statsLine << ' ' << (eye == 0U ? "left=" : "right=")
-                              << "edges:" << value.edgeCandidatePixels
-                              << ",edgePct:"
-                              << (pixelCount > 0.0
-                                      ? 100.0 * value.edgeCandidatePixels /
-                                            pixelCount
-                                      : 0.0)
-                              << ",blended:" << value.blendedPixels
-                              << ",meanWeight:"
-                              << (blended > 0.0
-                                      ? value.weightMilliSum /
-                                            (1000.0 * blended)
-                                      : 0.0)
-                              << ",meanDelta:"
-                              << (blended > 0.0
-                                      ? value.deltaMilliSum /
-                                            (1000.0 * blended)
-                                      : 0.0);
-                }
-                Log(statsLine.str());
-            }
-            Log("[VR][tscmaa] TSCMAA_FRAME resolved=1 token=" +
-                std::to_string(smaaT2xPairToken_) + " history=" +
-                std::string(tscmaaPass_.HasHistory() ? "valid" : "cold") +
-                " jitter=off");
-        } else if (prepared && capturedBeforePrepare) {
-            // Prepare may rebuild size-dependent resources and retire the
-            // warmup MV snapshots. Readiness begins on the next complete pair.
+            gpuMode = StereoGpuPublishMode::Tscmaa;
+            gpuSrgb = srgb[0];
+            resolveTemporal = true;
+        } else if (prepared && orderedMotionReady) {
+            gpuMode = StereoGpuPublishMode::Tscmaa;
+            gpuSrgb = srgb[0];
+            // Keep one URP-SMAA warmup. Motion capture/validation still runs
+            // in the callback so a bad source cannot silently arm TSCMAA.
             tscmaaReady_ = true;
             Log("[VR][tscmaa] TSCMAA_READY size=" +
                 std::to_string(prepare.width) + "x" +
@@ -15769,25 +15699,336 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         if (context != nullptr) context->Release();
         if (device != nullptr) device->Release();
     }
-    d3d11::StereoRenderMailbox::PublishDiagnostics diagnostics{};
-    // GPU readback is useful for admission diagnostics but stalls the shared
-    // immediate context. Never repeat it during steady immersive rendering.
-    if (verboseFrameLog_ && publishedFrames_ < 2U) {
+    const bool queued = QueueStereoGpuPublish(
+        textures, nativePointers, gpuMode, gpuSrgb, resolveTemporal);
+    for (auto* texture : textures) {
+        if (texture != nullptr) texture->Release();
+    }
+    if (!queued) {
+        FailStage("native.gpu-queue");
+        return;
+    }
+    const char* modeName = gpuMode == StereoGpuPublishMode::SmaaT2x
+        ? "smaa-t2x"
+        : gpuMode == StereoGpuPublishMode::Tscmaa ? "tscmaa" : "mailbox";
+    Log("[VR][stereo] STEREO_GPU_QUEUED mode=" + std::string(modeName) +
+        " poseRevision=" +
+        std::to_string(armedFrame_.trackingSample.revision));
+}
+
+void UnityStereoRenderer::PendingStereoGpuPublish::Reset() noexcept {
+    for (ID3D11Texture2D*& texture : colors) {
+        if (texture != nullptr) {
+            texture->Release();
+            texture = nullptr;
+        }
+    }
+    for (ID3D11Texture2D*& texture : motionSources) {
+        if (texture != nullptr) {
+            texture->Release();
+            texture = nullptr;
+        }
+    }
+    motionEvents = {};
+    resolveTemporal = false;
+    nativePointers = {};
+    tracking = {};
+    mode = StereoGpuPublishMode::MailboxOnly;
+    srgb = false;
+    comprehensiveProbe = false;
+    quality = 0;
+    phase = 0;
+    token = 0;
+    valid = false;
+}
+
+bool UnityStereoRenderer::PendingStereoGpuPublish::HasWork() const noexcept {
+    return valid && colors[0] != nullptr && colors[1] != nullptr;
+}
+
+bool UnityStereoRenderer::QueueStereoGpuPublish(
+    const std::array<ID3D11Texture2D*, 2>& colors,
+    const std::array<void*, 2>& nativePointers,
+    StereoGpuPublishMode mode,
+    bool srgb,
+    bool resolveTemporal) noexcept {
+    if (colors[0] == nullptr || colors[1] == nullptr) {
+        return false;
+    }
+    if (mode != StereoGpuPublishMode::MailboxOnly &&
+        (!smaaT2xMotionSourcesReadyForPair_ ||
+         motionNativeLeases_[0].texture == nullptr ||
+         motionNativeLeases_[1].texture == nullptr)) {
+        return false;
+    }
+    colors[0]->AddRef();
+    colors[1]->AddRef();
+    std::lock_guard lock(pendingGpuMutex_);
+    pendingGpuPublish_.Reset();
+    pendingGpuPublish_.colors = colors;
+    if (mode != StereoGpuPublishMode::MailboxOnly) {
+        for (std::size_t eye = 0; eye < 2U; ++eye) {
+            auto* source = motionNativeLeases_[eye].texture;
+            source->AddRef();
+            pendingGpuPublish_.motionSources[eye] = source;
+        }
+        pendingGpuPublish_.motionEvents = smaaT2xMotionCopyEvents_;
+    }
+    pendingGpuPublish_.resolveTemporal = resolveTemporal;
+    pendingGpuPublish_.nativePointers = nativePointers;
+    pendingGpuPublish_.tracking = armedFrame_.trackingSample;
+    pendingGpuPublish_.mode = mode;
+    pendingGpuPublish_.srgb = srgb;
+    pendingGpuPublish_.comprehensiveProbe = mode == StereoGpuPublishMode::SmaaT2x
+        ? smaaT2xComprehensiveProbeForPair_
+        : mode == StereoGpuPublishMode::Tscmaa
+            ? tscmaaComprehensiveProbeForPair_
+            : false;
+    pendingGpuPublish_.quality = GakumasLocal::Config::vrEyeSmaaQuality;
+    pendingGpuPublish_.phase = smaaT2xPairPhase_;
+    pendingGpuPublish_.token = smaaT2xPairToken_;
+    pendingGpuPublish_.valid = true;
+    return true;
+}
+
+bool UnityStereoRenderer::HasPendingStereoGpuPublish() const noexcept {
+    std::lock_guard lock(pendingGpuMutex_);
+    return pendingGpuPublish_.HasWork();
+}
+
+void UnityStereoRenderer::DropPendingStereoGpuPublish() noexcept {
+    std::lock_guard lock(pendingGpuMutex_);
+    pendingGpuPublish_.Reset();
+}
+
+void UnityStereoRenderer::ApplyPendingGpuFailure() noexcept {
+    if (!IsOwnerThread()) {
+        return;
+    }
+    const char* stage = pendingGpuFailure_.exchange(nullptr, std::memory_order_acq_rel);
+    if (stage != nullptr) {
+        FailStage(stage);
+    }
+}
+
+bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
+    PendingStereoGpuPublish work{};
+    {
+        std::lock_guard lock(pendingGpuMutex_);
+        if (!pendingGpuPublish_.HasWork()) {
+            return true;
+        }
+        work.colors = pendingGpuPublish_.colors;
+        work.motionSources = pendingGpuPublish_.motionSources;
+        work.motionEvents = pendingGpuPublish_.motionEvents;
+        work.resolveTemporal = pendingGpuPublish_.resolveTemporal;
+        work.nativePointers = pendingGpuPublish_.nativePointers;
+        work.tracking = pendingGpuPublish_.tracking;
+        work.mode = pendingGpuPublish_.mode;
+        work.srgb = pendingGpuPublish_.srgb;
+        work.comprehensiveProbe = pendingGpuPublish_.comprehensiveProbe;
+        work.quality = pendingGpuPublish_.quality;
+        work.phase = pendingGpuPublish_.phase;
+        work.token = pendingGpuPublish_.token;
+        work.valid = true;
+        pendingGpuPublish_.colors = {};
+        pendingGpuPublish_.motionSources = {};
+        pendingGpuPublish_.Reset();
+    }
+
+    const char* modeName = work.mode == StereoGpuPublishMode::SmaaT2x
+        ? "smaa-t2x"
+        : work.mode == StereoGpuPublishMode::Tscmaa ? "tscmaa" : "mailbox";
+    Log("[VR][stereo] STEREO_GPU_CONSUME mode=" + std::string(modeName) +
+        " poseRevision=" + std::to_string(work.tracking.revision));
+
+    std::array<ID3D11Texture2D*, 2> publishTextures = work.colors;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    work.colors[0]->GetDevice(&device);
+    if (device != nullptr) {
+        device->GetImmediateContext(&context);
+    }
+
+    const auto releaseLocals = [&]() noexcept {
+        if (context != nullptr) {
+            context->Release();
+            context = nullptr;
+        }
+        if (device != nullptr) {
+            device->Release();
+            device = nullptr;
+        }
+        work.Reset();
+    };
+
+    if (work.mode != StereoGpuPublishMode::MailboxOnly) {
+        bool captured = context != nullptr;
+        for (std::size_t eye = 0; eye < 2U && captured; ++eye) {
+            captured = work.mode == StereoGpuPublishMode::Tscmaa
+                ? CaptureTscmaaMotionVectorTexture(
+                      eye, work.motionSources[eye], work.token, work.motionEvents[eye],
+                      "ordered-render-callback")
+                : CaptureSmaaT2xMotionVectorTexture(
+                      eye, work.motionSources[eye], work.token, work.motionEvents[eye],
+                      "ordered-render-callback");
+        }
+        const bool fresh = captured && (work.mode == StereoGpuPublishMode::Tscmaa
+            ? tscmaaPass_.HasFreshMotionVectors(work.token)
+            : smaaT2xPass_.HasFreshMotionVectors(work.token));
+        if (!fresh) {
+            const bool tscmaa = work.mode == StereoGpuPublishMode::Tscmaa;
+            releaseLocals();
+            if (tscmaa) FallBackTscmaa("ordered-motion-capture");
+            else FallBackSmaaT2x("ordered-motion-capture");
+            return false;
+        }
+        if (work.token <= 4U || work.token % 300U == 0U || work.comprehensiveProbe) {
+            Log("[VR][stereo] TEMPORAL_MV_ORDERED mode=" + std::string(modeName) +
+                " token=" + std::to_string(work.token) +
+                " poseRevision=" + std::to_string(work.tracking.revision) +
+                " tid=" + std::to_string(GetCurrentThreadId()) +
+                " fresh=both resolve=" + std::to_string(work.resolveTemporal ? 1 : 0));
+        }
+    }
+
+    if (work.resolveTemporal && work.mode == StereoGpuPublishMode::SmaaT2x) {
+        std::array<ID3D11Texture2D*, 2> resolved{};
+        const bool resolvedReady = context != nullptr &&
+            smaaT2xPass_.ResolveStereo(
+                context, work.colors, work.srgb, work.quality, work.phase,
+                work.token, false, resolved);
+        if (!resolvedReady) {
+            releaseLocals();
+            FallBackSmaaT2x((std::string("resolve-") +
+                d3d11::SmaaT2xPass::StatusName(
+                    smaaT2xPass_.LastStatus())).c_str());
+            return false;
+        }
+        publishTextures = resolved;
+        ++smaaT2xResolvedCount_;
+        if (work.comprehensiveProbe) {
+            const auto resources = smaaT2xPass_.GetResourceDiagnostics();
+            D3D11_TEXTURE2D_DESC colorDescription{};
+            work.colors[0]->GetDesc(&colorDescription);
+            std::ostringstream resourceLine;
+            resourceLine << "[VR][smaa-t2x] SMAA_T2X_RESOURCES token="
+                         << work.token << " count="
+                         << smaaT2xResolvedCount_ << " phase="
+                         << work.phase << " poseRevision="
+                         << work.tracking.revision
+                         << " poseEpoch="
+                         << work.tracking.poseEpoch;
+            const auto& currentPhase = d3d11::kSmaaT2xPhases[work.phase];
+            const auto& previousPhase =
+                d3d11::kSmaaT2xPhases[work.phase ^ 1U];
+            resourceLine << std::fixed << std::setprecision(9)
+                         << " jitterDeltaUv="
+                         << (previousPhase.jitterX - currentPhase.jitterX) /
+                                static_cast<float>(colorDescription.Width)
+                         << ','
+                         << (previousPhase.jitterY - currentPhase.jitterY) /
+                                static_cast<float>(colorDescription.Height);
+            for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
+                const auto& value = resources.eyes[eye];
+                resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
+                             << std::hex << "input:0x"
+                             << reinterpret_cast<std::uintptr_t>(work.colors[eye])
+                             << ",native:0x"
+                             << reinterpret_cast<std::uintptr_t>(
+                                    work.nativePointers[eye])
+                             << ",mv:0x" << value.motion
+                             << ",currentMv:0x" << value.currentMotionProbe
+                             << ",prevMv:0x" << value.previousMotionProbe
+                             << ",current:0x" << value.currentSpatial
+                             << ",previous:0x" << value.previousSpatial
+                             << ",resolved:0x" << value.resolved << std::dec
+                             << ",mvToken:" << value.motionPairToken
+                             << ",currentMvToken:"
+                             << value.currentMotionProbePairToken
+                             << ",prevMvToken:"
+                             << value.previousMotionProbePairToken
+                             << ",nextSpatial:" << value.nextSpatialWriteIndex
+                             << ",history:" << (value.historyValid ? 1 : 0);
+            }
+            Log(resourceLine.str());
+        }
+        Log("[VR][smaa-t2x] SMAA_T2X_FRAME resolved=1 token=" +
+            std::to_string(work.token) + " phase=" +
+            std::to_string(work.phase) + " history=" +
+            std::string(smaaT2xPass_.HasHistory() ? "valid" : "cold"));
+    } else if (work.resolveTemporal && work.mode == StereoGpuPublishMode::Tscmaa) {
+        std::array<ID3D11Texture2D*, 2> resolved{};
+        static thread_local perf::Accumulator aaTiming;
+        perf::Scope aaScope(aaTiming,
+            GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+            "stereo.tscmaa-resolve",
+            [this](std::string_view line) noexcept { Log(line); });
+        const bool resolvedReady = context != nullptr &&
+            tscmaaPass_.ResolveStereo(
+                context, work.colors, work.srgb, work.quality, work.token,
+                resolved, nullptr);
+        aaScope.Stop();
+        if (!resolvedReady) {
+            releaseLocals();
+            FallBackTscmaa((std::string("resolve-") +
+                d3d11::TscmaaPass::StatusName(
+                    tscmaaPass_.LastStatus())).c_str());
+            return false;
+        }
+        publishTextures = resolved;
+        ++tscmaaResolvedCount_;
+        if (work.comprehensiveProbe) {
+            const auto resources = tscmaaPass_.GetResourceDiagnostics();
+            std::ostringstream resourceLine;
+            resourceLine << "[VR][tscmaa] TSCMAA_RESOURCES token="
+                         << work.token << " count="
+                         << tscmaaResolvedCount_
+                         << " poseRevision="
+                         << work.tracking.revision
+                         << " poseEpoch="
+                         << work.tracking.poseEpoch
+                         << " quality="
+                         << work.quality
+                         << " workingEdges=0x" << std::hex
+                         << resources.workingEdges
+                         << " workingShapeCandidates=0x"
+                         << resources.workingShapeCandidates
+                         << " workingDeferredItems=0x"
+                         << resources.workingDeferredItems;
+            for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
+                const auto& value = resources.eyes[eye];
+                resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
+                             << "input:0x"
+                             << reinterpret_cast<std::uintptr_t>(work.colors[eye])
+                             << ",native:0x"
+                             << reinterpret_cast<std::uintptr_t>(
+                                    work.nativePointers[eye])
+                             << ",mv:0x" << value.motion
+                             << ",spatial:0x" << value.spatial
+                             << ",history:0x" << value.resolvedHistory
+                             << ",output:0x" << value.resolvedOutput
+                             << std::dec
+                             << ",mvToken:" << value.motionPairToken
+                             << ",nextResolved:"
+                             << value.nextResolvedWriteIndex
+                             << ",historyValid:"
+                             << (value.historyValid ? 1 : 0);
+            }
+            Log(resourceLine.str());
+        }
+        Log("[VR][tscmaa] TSCMAA_FRAME resolved=1 token=" +
+            std::to_string(work.token) + " history=" +
+            std::string(tscmaaPass_.HasHistory() ? "valid" : "cold") +
+            " jitter=off");
+    }
+
+    if (verboseFrameLog_ && publishedFrames_ < 2U && context != nullptr) {
         std::array<std::uint64_t, 2> fingerprints{};
         std::array<bool, 2> sampled{};
-        ID3D11Device* device = nullptr;
-        ID3D11DeviceContext* context = nullptr;
-        textures[0]->GetDevice(&device);
-        if (device != nullptr) {
-            device->GetImmediateContext(&context);
-            device->Release();
-        }
-        if (context != nullptr) {
-            for (std::size_t eye = 0; eye < textures.size(); ++eye) {
-                sampled[eye] = d3d11::ComputeTextureFingerprint(
-                    context, publishTextures[eye], 0, fingerprints[eye]);
-            }
-            context->Release();
+        for (std::size_t eye = 0; eye < publishTextures.size(); ++eye) {
+            sampled[eye] = d3d11::ComputeTextureFingerprint(
+                context, publishTextures[eye], 0, fingerprints[eye]);
         }
         std::ostringstream content;
         content << "[VR][stereo] STEREO_SOURCE_FINGERPRINT nextFrame="
@@ -15807,37 +16048,55 @@ void UnityStereoRenderer::TryPublishStereoAtSafePoint() noexcept {
         }
         Log(content.str());
     }
-    Log("[VR][stereo] MAILBOX_PUBLISH_BEGIN poseRevision=" +
-        std::to_string(armedFrame_.trackingSample.revision));
-    const bool published = PublishUnityStereoFrame(
-        publishTextures[0], publishTextures[1], armedFrame_.trackingSample,
-        &diagnostics);
-    for (auto* texture : textures) {
-        if (texture != nullptr) texture->Release();
+    if (context != nullptr) {
+        context->Release();
+        context = nullptr;
     }
+    if (device != nullptr) {
+        device->Release();
+        device = nullptr;
+    }
+
+    d3d11::StereoRenderMailbox::PublishDiagnostics diagnostics{};
+    Log("[VR][stereo] MAILBOX_PUBLISH_BEGIN poseRevision=" +
+        std::to_string(work.tracking.revision));
+    static thread_local perf::Accumulator mailboxTiming;
+    perf::Scope mailboxScope(mailboxTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        "stereo.mailbox-lease", [this](std::string_view line) noexcept { Log(line); });
+    const bool published = PublishUnityStereoFrame(
+        publishTextures[0], publishTextures[1], work.tracking, &diagnostics);
+    mailboxScope.Stop();
+    const auto publishedMode = work.mode;
+    const auto publishedRevision = work.tracking.revision;
+    work.Reset();
     if (!published) {
         Log("[VR][stereo] MAILBOX_PUBLISH_REJECTED reason=" +
             std::string(d3d11::StereoRenderMailbox::PublishStatusName(
-                diagnostics.status)) + " stagingHr=" +
-            std::to_string(static_cast<long>(diagnostics.stagingHresult)));
-        FailStage("native.mailbox-publish");
-        return;
+                diagnostics.status)));
+        pendingGpuFailure_.store("native.mailbox-publish", std::memory_order_release);
+        return false;
     }
     continuousStereo_ = true;
     ++publishedFrames_;
-    if (smaaT2xActiveForPair_) {
+    if (publishedMode == StereoGpuPublishMode::SmaaT2x) {
         smaaT2xPhase_ ^= 1U;
     }
     Log("[VR][stereo] MAILBOX_PUBLISHED frame=" +
         std::to_string(publishedFrames_) + " poseRevision=" +
-        std::to_string(armedFrame_.trackingSample.revision) + " stagingSlot=" +
-        std::to_string(diagnostics.stagingSlot));
+        std::to_string(publishedRevision) + " lease=1");
+    return true;
 }
 
 void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
     if (!IsOwnerThread()) {
         return;
     }
+    BindStereoGpuPublishOwner(this);
+    ApplyPendingGpuFailure();
+    static thread_local perf::Accumulator completedTiming;
+    perf::Scope completedScope(completedTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
+        "stereo.after-render-loop", [this](std::string_view line) noexcept { Log(line); },
+        SceneReadyAllowsStereoPublish() ? 1U : 0U);
     if (!renderLoopBoundaryLogged_) {
         renderLoopBoundaryLogged_ = true;
         Log("[VR][stereo] RENDER_LOOP_BOUNDARY_READY tid=" +
@@ -15868,12 +16127,12 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
     } else if (EyeArmHeld() && stageArmed_ && !decisionPending_) {
         QueueStageDecision(false, "scene-ineligible");
     }
-    // Both eyes queued their MV copies inside the just-submitted context, so
-    // the mod-owned per-eye copy targets are now the stable snapshot sources.
+    // Bind the two per-eye MV sources. Only the ordered graphics callback
+    // may read their pixels; cached native pointers do not synchronize Unity.
     if ((smaaT2xRequestedForPair_ || tscmaaRequestedForPair_) && stageArmed_ &&
-        !smaaT2xOrderedMotionReadyForPair_) {
-        smaaT2xOrderedMotionReadyForPair_ =
-            CaptureQueuedSmaaT2xMotionVectors();
+        !smaaT2xMotionSourcesReadyForPair_) {
+        smaaT2xMotionSourcesReadyForPair_ =
+            BindQueuedSmaaT2xMotionVectors();
     }
     ConsumeStageDecisionAtSafePoint();
     TryPublishStereoAtSafePoint();
@@ -15956,7 +16215,7 @@ bool UnityStereoRenderer::FailStage(
     publishPending_ = false;
     decisionPending_ = false;
     smaaT2xMotionCopyTokens_.fill(0);
-    smaaT2xOrderedMotionReadyForPair_ = false;
+    smaaT2xMotionSourcesReadyForPair_ = false;
     stage_ = LadderStage::Failed;
     RestoreSourceCamera("stage-failed");
     RestoreUiTextureOverlays("stage-failed");
@@ -15973,6 +16232,7 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
         // "impossible" pattern of counters rising while their log lines
         // vanished, resuming instantly in scene-ineligible windows).
         const bool alwaysKeep =
+            message.find("PERF_TIMING") != std::string_view::npos ||
             message.find("[VR][shadow]") != std::string_view::npos ||
             message.find("[VR][fov]") != std::string_view::npos ||
             message.find("FAILED") != std::string_view::npos ||
@@ -16041,12 +16301,63 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             message.find("LIFETIME_") != std::string_view::npos ||
             message.find("PORTRAIT_LATCH") != std::string_view::npos ||
             message.find("FREECAM_HEAD_SKIP") != std::string_view::npos ||
-            message.find("HAND_GLOW") != std::string_view::npos;
+            message.find("HAND_GLOW") != std::string_view::npos ||
+            message.find("WAIT_ENTERED") != std::string_view::npos ||
+            message.find("WAIT_RETURNED") != std::string_view::npos ||
+            message.find("CPU_READY") != std::string_view::npos ||
+            message.find("GRAPHICS_GATE") != std::string_view::npos ||
+            message.find("GRAPHICS_DISPATCH") != std::string_view::npos ||
+            message.find("GRAPHICS_SUBMITTED") != std::string_view::npos ||
+            message.find("BEGIN_ENTERED") != std::string_view::npos ||
+            message.find("END_QUEUED") != std::string_view::npos ||
+            message.find("END_ENTERED") != std::string_view::npos ||
+            message.find("END_RETURNED") != std::string_view::npos ||
+            message.find("TICKET_CONSUME") != std::string_view::npos ||
+            message.find("TICKET_REPEAT") != std::string_view::npos ||
+            message.find("PROJECTION_FALLBACK") != std::string_view::npos ||
+            message.find("FRAME_LAYERS_EMPTY") != std::string_view::npos ||
+            message.find("MIRROR_LAYOUT_GATE") != std::string_view::npos ||
+            message.find("MIRROR_LAYOUT_CHANGED") != std::string_view::npos ||
+            message.find("changed incompatibly") != std::string_view::npos ||
+            message.find("FRAME_DRIVE") != std::string_view::npos ||
+            message.find("SUBMIT_FAILED") != std::string_view::npos ||
+            message.find("SUBMIT_DEFERRED") != std::string_view::npos ||
+            message.find("STEREO_GPU_") != std::string_view::npos ||
+            message.find("TEMPORAL_MV_ORDERED") != std::string_view::npos ||
+            message.find("NATIVE_POINTER_CACHE") != std::string_view::npos ||
+            message.find("MAILBOX_PUBLISH") != std::string_view::npos ||
+            message.find("UI_INPUT_STATE") != std::string_view::npos;
         if (!alwaysKeep) {
             return;
         }
     }
     WriteVrLog(message);
+}
+
+namespace {
+UnityStereoRenderer* g_stereoGpuPublishOwner = nullptr;
+}
+
+void BindStereoGpuPublishOwner(UnityStereoRenderer* renderer) noexcept {
+    g_stereoGpuPublishOwner = renderer;
+}
+
+bool HasPendingStereoGpuPublish() noexcept {
+    return g_stereoGpuPublishOwner != nullptr &&
+        g_stereoGpuPublishOwner->HasPendingStereoGpuPublish();
+}
+
+bool ConsumePendingStereoGpuPublish() noexcept {
+    if (g_stereoGpuPublishOwner == nullptr) {
+        return true;
+    }
+    return g_stereoGpuPublishOwner->ConsumePendingStereoGpuPublish();
+}
+
+void DropPendingStereoGpuPublish() noexcept {
+    if (g_stereoGpuPublishOwner != nullptr) {
+        g_stereoGpuPublishOwner->DropPendingStereoGpuPublish();
+    }
 }
 
 } // namespace gakumas::vr

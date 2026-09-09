@@ -26,14 +26,16 @@ public:
         std::int64_t nowNanoseconds,
         std::int64_t maximumAgeNanoseconds,
         float worldScale,
-        Pose& composed) noexcept;
+        Pose& composed,
+        const PoseAdmission* admission = nullptr) noexcept;
     [[nodiscard]] BridgeUpdateResult UpdateStereo(
         const Pose& gameRequested,
         const StereoPoseSample& sample,
         std::int64_t nowNanoseconds,
         std::int64_t maximumAgeNanoseconds,
         float worldScale,
-        StereoComposedPose& composed) noexcept;
+        StereoComposedPose& composed,
+        const PoseAdmission* admission = nullptr) noexcept;
 
 private:
     bool baselineReady_ = false;

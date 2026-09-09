@@ -324,12 +324,33 @@ template<class Fn> void Hook(Method* m, Fn detour, Fn* orig, const char* name) {
     Log("HOOK name=" + std::string(name) + " installed=" + std::to_string(ok));
 }
 
-std::vector<void*> Objects(Class* c) {
-    if (!c || !api.findObjects) return {};
-    void* t = c->GetType(); void* args[]{t}; void* array = nullptr;
-    if (!t || !Invoke(api.findObjects, nullptr, args, &array) || !array) return {};
-    return static_cast<UnityResolve::UnityType::Array<void*>*>(array)->ToVector();
-}
+// Native std::vector storage is not a managed GC root. Keep the returned
+// managed array alive throughout the range-for (including every getter and
+// allocation in its body), so all snapshot receivers remain rooted.
+class ObjectSnapshot {
+    Il2CppGCHandle root_ = nullptr;
+    std::vector<void*> objects_;
+public:
+    explicit ObjectSnapshot(Class* c) {
+        if (!c || !api.findObjects) return;
+        void* t = c->GetType(); void* args[]{t}; void* array = nullptr;
+        if (!t || !Invoke(api.findObjects, nullptr, args, &array) || !array) return;
+        root_ = UnityResolve::Invoke<Il2CppGCHandle>("il2cpp_gchandle_new", array, false);
+        if (!root_) return;
+        try {
+            objects_ = static_cast<UnityResolve::UnityType::Array<void*>*>(array)->ToVector();
+        } catch (...) {
+            FreeHandle(root_);
+            throw;
+        }
+    }
+    ObjectSnapshot(const ObjectSnapshot&) = delete;
+    ObjectSnapshot& operator=(const ObjectSnapshot&) = delete;
+    ~ObjectSnapshot() { FreeHandle(root_); }
+    auto begin() const { return objects_.begin(); }
+    auto end() const { return objects_.end(); }
+};
+ObjectSnapshot Objects(Class* c) { return ObjectSnapshot(c); }
 
 // Read-only census: bounds are candidates, never authority to erase a draw.
 // A full-size Graphic can still contain a sprite/stencil hole or just a border.

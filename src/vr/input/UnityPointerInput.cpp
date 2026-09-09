@@ -5,6 +5,7 @@
 #include "../../hooks/HookManager.hpp"
 #include "../config/VrifyConfig.hpp"
 #include "../VrRuntime.hpp"
+#include "../frame/FrameLoopDriver.hpp"
 
 #include <Windows.h>
 #include <atomic>
@@ -98,7 +99,7 @@ void* MouseData(void* self, int id, void* method) {
     void* result = g_mouseData(self, id, method);
     if (g_scope && result && !g_scope->consumed) {
         g_scope->consumed = true;
-        g_queue.Acknowledge(g_scope->sample);
+        g_queue.Acknowledge(g_scope->sample, GetTickCount64());
         if (g_scope->sample.down || g_scope->sample.up) {
             std::ostringstream out;
             out << "[VR][input] NATIVE_POINTER_CONSUMED serial=" << g_scope->sample.serial
@@ -113,12 +114,17 @@ void* MouseData(void* self, int id, void* method) {
 }
 void Focus(void* self, bool focused, void* method) {
     // Preserve a genuine focus event arriving reentrantly during a UI callback.
-    if (g_scope && g_scope->eventSystem == self) g_scope->savedFocus = focused;
-    g_focus(self, focused, method);
     if (g_scope && g_scope->eventSystem == self) {
+        g_scope->savedFocus = focused;
+        g_focus(self, focused, method);
         bool active = true;
         FocusValue(self, &active, true);
+        return;
     }
+    if (!focused) {
+        g_queue.NoteFocusLost();
+    }
+    g_focus(self, focused, method);
 }
 void Update(void* self, void* method) {
     if (g_scope) {
@@ -136,9 +142,17 @@ void Update(void* self, void* method) {
         g_update(self, method);
         return;
     }
+    // Startup notices already run the verified EventSystem.Update even when
+    // there is no SRP/camera Tick yet. Install on this attached Unity thread;
+    // the next Initialization/Tail own the XR frame, not this UI callback.
+    FrameLoopDriverEnsureOnUnityThread();
     UpdateScope scope;
     scope.sample = g_queue.Begin(GetTickCount64());
     if (!scope.sample.active) { g_update(self, method); return; }
+    if (scope.sample.up && scope.sample.u < 0.0F) {
+        Log("[VR][input] NATIVE_POINTER_DISCONNECT_CANCEL serial=" +
+            std::to_string(scope.sample.serial));
+    }
     const int width = ScreenSize(g_width), height = ScreenSize(g_height);
     if (width <= 0 || height <= 0 || !FocusValue(self, &scope.savedFocus, false)) {
         g_queue.Cancel();
@@ -256,4 +270,15 @@ bool QueueUnityPointer(float u, float v, bool held, bool down, bool up) noexcept
 }
 void RenewUnityPointer() noexcept { g_queue.Renew(GetTickCount64()); }
 void CancelUnityPointer() noexcept { g_queue.Cancel(); }
+void RegisterUnityPointerWait(
+    std::uint64_t frameId,
+    std::uint64_t sessionGeneration) noexcept {
+    g_queue.RegisterWait(frameId, sessionGeneration);
+}
+void RegisterUnityPointerEndQueued(
+    std::uint64_t frameId,
+    std::uint64_t sessionGeneration) noexcept {
+    g_queue.RegisterEndQueued(frameId, sessionGeneration);
+}
+void ClearUnityPointerLease() noexcept { g_queue.ClearLease(); }
 } // namespace gakumas::vr::input
