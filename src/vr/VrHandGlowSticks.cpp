@@ -5,6 +5,7 @@
 #include "config/VrifyConfig.hpp"
 #include "pose/HandPoseMailbox.hpp"
 #include "pose/PoseMath.hpp"
+#include "pose/PoseSmoother.hpp"
 #include "../GakumasLocalify/Il2cppUtils.hpp"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 
@@ -38,6 +39,11 @@ using Il2CppGCHandle = void*;
 constexpr std::uint32_t kDiscoverInterval = 120;
 constexpr std::uint32_t kMaxListLines = 24;
 constexpr float kHandScaleMultiplier = 1.15F;
+// ~1.5 frames at 40 Hz Live: enough to hide swing stepping without a rubber
+// band. First sample and large jumps snap. Advance once per hand revision.
+constexpr float kHandGlowSmoothTauSeconds = 0.040F;
+constexpr float kHandGlowSmoothSnapMeters = 0.45F;
+constexpr float kHandGlowSmoothSnapAbsDot = 0.85F;
 constexpr const char* kHandBaseShader = "Campus/Actor/Default";
 constexpr const char* kHandEmissionShader =
     "Universal Render Pipeline/Particles/Unlit";
@@ -310,13 +316,20 @@ struct GlowState {
     CrowdDrawResources crowdDrawResources{};
     std::array<pose::Pose, 2> crowdHandPoses{};
     std::array<bool, 2> crowdHandPoseValid{};
+    std::array<pose::PoseSmoother, 2> crowdHandSmoothers{};
+    std::array<pose::Pose, 2> crowdLatchedDrawPoses{};
+    std::array<bool, 2> crowdLatchedDrawValid{};
+    bool crowdDrawLatchValid = false;
     pose::Pose crowdGameHeadsetPose{};
     pose::Pose crowdOpenXrHeadCenter{};
     float crowdWorldScale = 1.0F;
     std::uint64_t crowdPoseBridgeRevision = 0;
     std::uint64_t crowdAppliedBridgeRevision = 0;
     std::uint64_t crowdAppliedHandRevision = 0;
+    std::uint64_t crowdSmoothedHandRevision = 0;
+    std::int64_t crowdSmoothedDisplayTime = 0;
     bool crowdPoseBridgeValid = false;
+    bool poseSmoothLogged = false;
     std::vector<std::pair<void*, float>> crowdIntensitySources{};
     std::array<std::vector<std::pair<void*, void*>>, 2> crowdDrawPairs{};
     bool crowdDrawActive = false;
@@ -3918,14 +3931,27 @@ UnityMatrix4x4 CrowdPoseMatrix(const pose::Pose& pose) noexcept {
     return matrix;
 }
 
+void ResetHandPoseFollow() noexcept {
+    for (auto& smoother : g_state.crowdHandSmoothers) {
+        smoother.Reset();
+    }
+    g_state.crowdHandPoseValid.fill(false);
+    g_state.crowdLatchedDrawValid.fill(false);
+    g_state.crowdDrawLatchValid = false;
+    g_state.crowdAppliedHandRevision = 0;
+    g_state.crowdAppliedBridgeRevision = 0;
+    g_state.crowdSmoothedHandRevision = 0;
+    g_state.crowdSmoothedDisplayTime = 0;
+}
+
 bool RefreshCrowdHandPosesFromMailbox() noexcept {
     if (!g_state.crowdPoseBridgeValid) {
-        g_state.crowdHandPoseValid.fill(false);
+        ResetHandPoseFollow();
         return false;
     }
     pose::HandPoseSample hands{};
     if (!pose::HandTrackingMailbox().Read(hands) || !hands.valid) {
-        g_state.crowdHandPoseValid.fill(false);
+        ResetHandPoseFollow();
         return false;
     }
     if (hands.revision == g_state.crowdAppliedHandRevision &&
@@ -3935,24 +3961,67 @@ bool RefreshCrowdHandPosesFromMailbox() noexcept {
             g_state.crowdHandPoseValid[1];
     }
 
+    const pose::Pose& openXrHead = hands.headCenterValid
+        ? hands.openXrHeadCenter
+        : g_state.crowdOpenXrHeadCenter;
+    const bool newHands =
+        hands.revision != g_state.crowdSmoothedHandRevision;
+    float dtSeconds = 0.0F;
+    if (newHands && g_state.crowdSmoothedDisplayTime != 0 &&
+        hands.predictedDisplayTime > g_state.crowdSmoothedDisplayTime) {
+        dtSeconds = static_cast<float>(
+            static_cast<double>(
+                hands.predictedDisplayTime - g_state.crowdSmoothedDisplayTime) *
+            1.0e-9);
+        dtSeconds = std::min(dtSeconds, 0.10F);
+    }
+    if (newHands && !g_state.poseSmoothLogged) {
+        g_state.poseSmoothLogged = true;
+        auto line = ClassicLine();
+        line << "[VR][stereo] HAND_GLOW pose-smooth tau="
+             << kHandGlowSmoothTauSeconds
+             << " paired-head=" << (hands.headCenterValid ? 1 : 0);
+        LogHandGlow(line.str());
+    }
+
     g_state.crowdHandPoseValid.fill(false);
     for (std::size_t hand = 0; hand < g_state.crowdHandPoses.size(); ++hand) {
         if (!hands.hands[hand].valid ||
             !pose::IsFinite(hands.hands[hand].pose.position) ||
             !pose::IsFinite(hands.hands[hand].pose.orientation)) {
+            g_state.crowdHandSmoothers[hand].Reset();
             continue;
+        }
+        pose::Pose trackingPose = hands.hands[hand].pose;
+        if (newHands) {
+            pose::Pose smoothed{};
+            if (g_state.crowdHandSmoothers[hand].Filter(
+                    trackingPose,
+                    dtSeconds,
+                    kHandGlowSmoothTauSeconds,
+                    kHandGlowSmoothSnapMeters,
+                    kHandGlowSmoothSnapAbsDot,
+                    smoothed)) {
+                trackingPose = smoothed;
+            }
+        } else if (g_state.crowdHandSmoothers[hand].initialized) {
+            trackingPose = g_state.crowdHandSmoothers[hand].pose;
         }
         pose::Pose worldPose{};
         if (!pose::TryComposeGamePose(
                 g_state.crowdGameHeadsetPose,
-                g_state.crowdOpenXrHeadCenter,
-                hands.hands[hand].pose,
+                openXrHead,
+                trackingPose,
                 g_state.crowdWorldScale,
                 worldPose)) {
             continue;
         }
         g_state.crowdHandPoses[hand] = worldPose;
         g_state.crowdHandPoseValid[hand] = true;
+    }
+    if (newHands) {
+        g_state.crowdSmoothedHandRevision = hands.revision;
+        g_state.crowdSmoothedDisplayTime = hands.predictedDisplayTime;
     }
     g_state.crowdAppliedHandRevision = hands.revision;
     g_state.crowdAppliedBridgeRevision = g_state.crowdPoseBridgeRevision;
@@ -4152,8 +4221,17 @@ void DrawControllerSticksThroughCrowd(
         !SceneReadyAllowsStereoRender()) {
         return;
     }
-    if (!RefreshCrowdHandPosesFromMailbox()) {
+    const bool reuseDrawLatch =
+        eventType == 1 && g_state.crowdDrawLatchValid;
+    if (reuseDrawLatch) {
+        g_state.crowdHandPoses = g_state.crowdLatchedDrawPoses;
+        g_state.crowdHandPoseValid = g_state.crowdLatchedDrawValid;
+    } else if (!RefreshCrowdHandPosesFromMailbox()) {
         return;
+    } else {
+        g_state.crowdLatchedDrawPoses = g_state.crowdHandPoses;
+        g_state.crowdLatchedDrawValid = g_state.crowdHandPoseValid;
+        g_state.crowdDrawLatchValid = true;
     }
     const int validCount = static_cast<int>(
         g_state.crowdHandPoseValid[0]) +
@@ -5166,14 +5244,35 @@ void RefreshOfficialAssets() noexcept {
 
 } // namespace
 
+void UpdateHandGlowComposeBridge(
+    const pose::Pose& gameHeadset,
+    const pose::Pose& openXrHeadCenter,
+    bool openXrHeadValid,
+    float worldScale) noexcept {
+    if (!pose::IsFinite(gameHeadset.position) ||
+        !pose::IsFinite(gameHeadset.orientation) ||
+        !std::isfinite(worldScale) || worldScale < 0.0F) {
+        return;
+    }
+    g_state.crowdGameHeadsetPose = gameHeadset;
+    if (openXrHeadValid && pose::IsFinite(openXrHeadCenter.position) &&
+        pose::IsFinite(openXrHeadCenter.orientation)) {
+        g_state.crowdOpenXrHeadCenter = openXrHeadCenter;
+    }
+    g_state.crowdWorldScale = worldScale;
+    g_state.crowdPoseBridgeValid = true;
+    ++g_state.crowdPoseBridgeRevision;
+}
+
 void TickHandGlowSticks(
     const pose::Pose& headsetPose,
     bool headsetValid,
     const pose::StereoPoseSample& trackingSample) noexcept {
     ++g_state.ticks;
-    g_state.crowdHandPoseValid.fill(false);
     if (!GakumasLocal::Config::vrHandGlowSticks) {
         ClearAudienceColors("config-off");
+        g_state.crowdPoseBridgeValid = false;
+        ResetHandPoseFollow();
         HideHands("config-off");
         return;
     }
@@ -5183,15 +5282,18 @@ void TickHandGlowSticks(
         g_state.crowdPoseBridgeValid = false;
         g_state.crowdIntensitySources.clear();
         g_state.audienceIntensity = 0.0F;
+        ResetHandPoseFollow();
         HideHands("scene-not-ready");
         return;
     }
     if (!headsetValid || !pose::IsFinite(headsetPose.position) ||
         !pose::IsFinite(headsetPose.orientation)) {
+        ResetHandPoseFollow();
         HideHands("headset-invalid");
         return;
     }
     if (!trackingSample.valid || trackingSample.viewCount != 2U) {
+        ResetHandPoseFollow();
         HideHands("tracking-invalid");
         return;
     }
@@ -5200,6 +5302,7 @@ void TickHandGlowSticks(
     std::array<pose::Pose, 2> eyes{
         trackingSample.eyes[0].pose, trackingSample.eyes[1].pose};
     if (!pose::TryCenterStereoPose(eyes, hmdOpenXrCenter)) {
+        ResetHandPoseFollow();
         HideHands("hmd-center");
         return;
     }
@@ -5208,11 +5311,11 @@ void TickHandGlowSticks(
         return;
     }
 
-    g_state.crowdGameHeadsetPose = headsetPose;
-    g_state.crowdOpenXrHeadCenter = hmdOpenXrCenter;
-    g_state.crowdWorldScale = GakumasLocal::Config::vrWorldScale;
-    g_state.crowdPoseBridgeValid = true;
-    ++g_state.crowdPoseBridgeRevision;
+    UpdateHandGlowComposeBridge(
+        headsetPose,
+        hmdOpenXrCenter,
+        true,
+        GakumasLocal::Config::vrWorldScale);
     if (!RefreshCrowdHandPosesFromMailbox()) {
         HideHands("pose-invalid");
         return;

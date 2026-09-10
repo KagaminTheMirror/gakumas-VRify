@@ -1,7 +1,9 @@
 #include "GripBlurSource.hpp"
+#include "GripBlurDiscoverPolicy.hpp"
 #include "GripFullscreenBlurClassifier.hpp"
 #include "GripBlurTextureWrite.hpp"
 #include "GripTraceFieldReader.hpp"
+#include "SrpPerformanceTrace.hpp"
 #include "UnityStereoRenderer.hpp"
 #include "VrRuntime.hpp"
 #include "config/VrifyConfig.hpp"
@@ -32,6 +34,9 @@ using DrawBlurFn = void(*)(void*, void*, void*, void*);
 DrawBlurFn original = nullptr;
 using SubmitMaterialFn = void(*)(void*, void*, int, void*);
 SubmitMaterialFn originalSubmitMaterial = nullptr;
+using LifecycleFn = void(*)(void*, void*);
+LifecycleFn originalOnEnable = nullptr, originalOnDisable = nullptr;
+LifecycleFn originalAddBlur = nullptr, originalRemoveBlur = nullptr;
 // A weak texture reference, never a cached managed UIRenderPass shell. Canvas
 // rebuilds can submit materials outside Execute, before the next camera pass.
 thread_local void* cachedDefault = nullptr;
@@ -46,7 +51,14 @@ Method *getTexture{}, *setTexture{}, *hasTexture{};
 Class *blurClass{}, *rectClass{}, *maskClass{}, *rectMaskClass{};
 Field *defaultTexture{}, *blurId{};
 std::atomic<bool> installed{false};
+std::atomic<bool> discoverDirty{true};
+std::atomic<bool> lifecycleReady{false};
+std::atomic<const char*> lastDirtyReason{"seed"};
 std::atomic<unsigned long long> applies{0}, restores{0}, skips{0}, nextLog{0};
+std::atomic<unsigned long long> nextDiscoverLog{0};
+thread_local std::vector<void*> cachedBlurs;
+thread_local bool discoverSeeded = false;
+thread_local unsigned discoverRefreshLogs = 0;
 
 struct Rect { float x, y, w, h; };
 struct Point { float x, y, z; };
@@ -134,11 +146,73 @@ bool Assignable(Class* klass, void* object) {
         UnityResolve::Invoke<bool>("il2cpp_class_is_assignable_from", klass->address, actual);
 }
 std::vector<void*> Objects(Class* klass) {
+    perf::SrpSpan span(perf::srpPerformance, "mod.blur-discover");
     if (!klass || !findObjects) return {};
     void* type = klass->GetType(); void* args[]{type}; void* array = nullptr;
     if (!type || !Invoke(findObjects, nullptr, args, &array) || !array) return {};
     return static_cast<UnityResolve::UnityType::Array<void*>*>(array)->ToVector();
 }
+void MarkDiscoverDirty(const char* reason, bool alwaysLog = false) {
+    lastDirtyReason.store(reason && reason[0] ? reason : "dirty", std::memory_order_release);
+    discoverDirty.store(true, std::memory_order_release);
+    if (!alwaysLog) {
+        const auto now = GetTickCount64();
+        auto due = nextDiscoverLog.load();
+        if (now < due || !nextDiscoverLog.compare_exchange_strong(due, now + 5000)) return;
+    }
+    Log(std::string("DISCOVER_DIRTY reason=") + (reason && reason[0] ? reason : "dirty"));
+}
+void ClearCachedBlurs() {
+    for (auto& handle : cachedBlurs) Free(handle);
+    cachedBlurs.clear();
+}
+void ReplaceCachedBlurs(const std::vector<void*>& objects) {
+    ClearCachedBlurs();
+    for (void* blur : objects) if (Alive(blur)) cachedBlurs.push_back(Weak(blur));
+}
+std::vector<void*> CachedBlurObjects() {
+    std::vector<void*> live;
+    for (auto it = cachedBlurs.begin(); it != cachedBlurs.end();) {
+        void* blur = Target(*it);
+        if (!Alive(blur)) {
+            Free(*it);
+            it = cachedBlurs.erase(it);
+            continue;
+        }
+        live.push_back(blur);
+        ++it;
+    }
+    return live;
+}
+std::vector<void*> DiscoverBlurs(const char*& actionName) {
+    const bool ready = lifecycleReady.load(std::memory_order_acquire);
+    const bool dirty = discoverDirty.load(std::memory_order_acquire);
+    if (GripBlurDiscoverDecision(ready, discoverSeeded, dirty) == GripBlurDiscoverAction::Reuse) {
+        actionName = "reuse";
+        return CachedBlurObjects();
+    }
+    discoverDirty.store(false, std::memory_order_release);
+    actionName = "refresh";
+    const char* reason = !ready ? "hooks-unavailable" : (!discoverSeeded ? "seed" :
+        (lastDirtyReason.load(std::memory_order_acquire) ? lastDirtyReason.load() : "dirty"));
+    auto objects = Objects(blurClass);
+    ReplaceCachedBlurs(objects);
+    discoverSeeded = true;
+    if (discoverRefreshLogs++ < 8) {
+        Log(std::string("DISCOVER_REFRESH reason=") + reason + " count=" + std::to_string(objects.size()) +
+            " lifecycle=" + std::to_string(ready));
+    }
+    return objects;
+}
+void LifecycleHook(LifecycleFn original, void* self, void* method, const char* reason) {
+    if (original) original(self, method);
+    if (installed.load(std::memory_order_acquire) && GakumasLocal::Config::vrRuntimeStartupEnabled)
+        MarkDiscoverDirty(reason);
+}
+void OnEnableHook(void* self, void* method) { LifecycleHook(originalOnEnable, self, method, "on-enable"); }
+void OnDisableHook(void* self, void* method) { LifecycleHook(originalOnDisable, self, method, "on-disable"); }
+void AddBlurHook(void* self, void* method) { LifecycleHook(originalAddBlur, self, method, "add-blur"); }
+void RemoveBlurHook(void* self, void* method) { LifecycleHook(originalRemoveBlur, self, method, "remove-blur"); }
 bool CoversRoot(void* rect, void* rootTransform) {
     Rect r{}, root{};
     if (!Value(getRect, rect, nullptr, r) || !Value(getRect, rootTransform, nullptr, root) ||
@@ -246,6 +320,7 @@ void RestoreAll(const char* reason) {
     if (count) { restores += count; Log("RESTORE count=" + std::to_string(count) + " reason=" + reason); }
 }
 bool ApplySelective(void* pass) {
+    perf::SrpSpan span(perf::srpPerformance, "mod.blur-selective");
     void* fallback = DefaultTexture(pass);
     if (!fallback) return false;
     if (Target(cachedDefault) != fallback) {
@@ -255,7 +330,8 @@ bool ApplySelective(void* pass) {
     int property = BlurProperty();
     std::vector<void*> seen;
     unsigned fullScreen = 0, local = 0;
-    for (void* blur : Objects(blurClass)) {
+    const char* discoverAction = "refresh";
+    for (void* blur : DiscoverBlurs(discoverAction)) {
         if (!IsFullscreenBlur(blur)) {
             if (Alive(blur) && Value<bool>(active, blur)) ++local;
             continue;
@@ -286,12 +362,19 @@ bool ApplySelective(void* pass) {
     if (now >= due && nextLog.compare_exchange_strong(due, now + 5000)) {
         Log("APPLY_SELECTIVE fullscreenMaterials=" + std::to_string(fullScreen) + " localPreserved=" +
             std::to_string(local) + " owned=" + std::to_string(owned.size()) +
+            " discover=" + discoverAction +
+            " lifecycle=" + std::to_string(lifecycleReady.load(std::memory_order_acquire)) +
+            " cached=" + std::to_string(cachedBlurs.size()) +
             " classifier=root-coverage-unmasked source=pass-default");
     }
     return true;
 }
 void DrawBlurHook(void* self, void* cmd, void* cameraData, void* method) {
-    original(self, cmd, cameraData, method);
+    {
+        perf::SrpSpan span(perf::srpPerformance, "ui.draw-blur-original");
+        original(self, cmd, cameraData, method);
+    }
+    perf::SrpSpan span(perf::srpPerformance, "mod.blur-postfix");
     if (!installed.load(std::memory_order_acquire) || scopedPass != self || !self ||
         !GakumasLocal::Config::vrRuntimeStartupEnabled) return;
     try {
@@ -304,6 +387,7 @@ void DrawBlurHook(void* self, void* cmd, void* cameraData, void* method) {
 // (including all modifiers), then calls this exact SetMaterial overload.
 // Patch its argument BEFORE native submission, including pre-Execute rebuilds.
 void SubmitMaterialHook(void* self, void* material, int index, void* method) {
+    perf::SrpSpan span(perf::srpPerformance, "mod.blur-submit-material");
     try {
         if (installed.load(std::memory_order_acquire) &&
             GakumasLocal::Config::vrRuntimeStartupEnabled) {
@@ -347,12 +431,19 @@ void SubmitMaterialHook(void* self, void* material, int index, void* method) {
             }
         }
     } catch (...) { ++skips; Log("SKIP reason=material-submit-exception original-global-and-local-retained"); }
+    span.Stop();
     originalSubmitMaterial(self, material, index, method);
 }
 } // namespace
 
+void InvalidateGripBlurDiscover(const char* reason) noexcept {
+    try { MarkDiscoverDirty(reason && reason[0] ? reason : "invalidate", true); }
+    catch (...) {}
+}
+
 GripBlurSourceScope::GripBlurSourceScope(void* pass, bool allowed) noexcept
     : previous_(std::exchange(scopedPass, allowed ? pass : nullptr)) {
+    perf::SrpSpan span(perf::srpPerformance, "mod.blur-scope-enter");
     if (!allowed && !owned.empty()) {
         try { RestoreAll("scope-not-authorized"); }
         catch (...) { Log("RESTORE_SKIP reason=exception"); }
@@ -424,14 +515,38 @@ void InstallGripBlurSource() noexcept {
             Log("INIT_SKIP reason=live-api-shape rectSize=" + std::to_string(rectSize) +
                 " pointSize=" + std::to_string(pointSize)); return;
         }
+        auto* onEnable = Exact(blurClass, "OnEnable", false, "System.Void", {});
+        auto* onDisable = Exact(blurClass, "OnDisable", false, "System.Void", {});
+        auto* addBlur = Exact(blurClass, "AddBlur", false, "System.Void", {});
+        auto* removeBlur = Exact(blurClass, "RemoveBlur", false, "System.Void", {});
         const bool drawOk = GakumasVR::Hooks::CreateAndEnable(draw->function,
             reinterpret_cast<void*>(&DrawBlurHook), reinterpret_cast<void**>(&original), "Grip fullscreen blur source");
         const bool submitOk = GakumasVR::Hooks::CreateAndEnable(submitMaterial->function,
             reinterpret_cast<void*>(&SubmitMaterialHook), reinterpret_cast<void**>(&originalSubmitMaterial),
             "Grip fullscreen blur material submission");
+        const bool enableOk = onEnable && GakumasVR::Hooks::CreateAndEnable(onEnable->function,
+            reinterpret_cast<void*>(&OnEnableHook), reinterpret_cast<void**>(&originalOnEnable),
+            "Grip BackgroundBlur OnEnable discover dirty");
+        const bool disableOk = onDisable && GakumasVR::Hooks::CreateAndEnable(onDisable->function,
+            reinterpret_cast<void*>(&OnDisableHook), reinterpret_cast<void**>(&originalOnDisable),
+            "Grip BackgroundBlur OnDisable discover dirty");
+        const bool addOk = addBlur && GakumasVR::Hooks::CreateAndEnable(addBlur->function,
+            reinterpret_cast<void*>(&AddBlurHook), reinterpret_cast<void**>(&originalAddBlur),
+            "Grip BackgroundBlur AddBlur discover dirty");
+        const bool removeOk = removeBlur && GakumasVR::Hooks::CreateAndEnable(removeBlur->function,
+            reinterpret_cast<void*>(&RemoveBlurHook), reinterpret_cast<void**>(&originalRemoveBlur),
+            "Grip BackgroundBlur RemoveBlur discover dirty");
+        const bool lifeOk = enableOk && disableOk && addOk && removeOk;
+        lifecycleReady.store(lifeOk, std::memory_order_release);
+        discoverDirty.store(true, std::memory_order_release);
+        discoverSeeded = false;
         installed.store(drawOk && submitOk, std::memory_order_release);
         Log("READY installed=" + std::to_string(drawOk && submitOk) + " draw=" + std::to_string(drawOk) +
             " materialSubmit=" + std::to_string(submitOk) +
+            " lifecycleDiscover=" + std::to_string(lifeOk) +
+            " onEnable=" + std::to_string(enableOk) + " onDisable=" + std::to_string(disableOk) +
+            " addBlur=" + std::to_string(addOk) + " removeBlur=" + std::to_string(removeOk) +
+            " discover=dirty-cache" +
             " scope=armed-non-eye classifier=root-coverage-unmasked materialLocal=1 localBlurPreserved=1"
             " bindAt=enter+drawblur+before-material-submit submitGate=live-armed readback=diagnostic-only");
     } catch (...) { Log("INIT_SKIP reason=exception"); }

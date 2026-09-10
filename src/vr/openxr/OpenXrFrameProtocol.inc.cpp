@@ -176,9 +176,12 @@ OpenXrContext::FrameResult OpenXrContext::WaitAndPrepare(
     const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
     const auto timingSink = [&log](std::string_view line) noexcept { log.Write(line); };
     perf::Scope waitScope(waitTiming, timing, "xr.wait-frame", timingSink, sessionState_);
+    perf::HitchCall waitHitch(timing);
     const XrResult waitResult = dispatch_.WaitFrame()(session_, &waitInfo, &frameState);
+    waitHitch.Stop();
     lastResult_ = waitResult;
     waitScope.Stop();
+    waitHitch.Report("wait", ticket.frameId, waitResult, timingSink);
     if (XR_FAILED(waitResult)) {
         log.Write(
             "[VR][runtime] xrWaitFrame failed: " +
@@ -255,8 +258,17 @@ OpenXrContext::FrameResult OpenXrContext::WaitAndPrepare(
             dispatch_.ResultText(instance_, work->locateResult));
     }
 
+    pose::Pose waitHeadCenter{};
+    const bool waitHeadValid = tracking.valid && tracking.viewCount == 2U &&
+        pose::TryCenterStereoPose(
+            {tracking.eyes[0].pose, tracking.eyes[1].pose}, waitHeadCenter);
     UpdatePanelPlacementFrame(frameState.predictedDisplayTime, log);
-    SyncPointerInput(frame.pointers, frameState.predictedDisplayTime, log);
+    SyncPointerInput(
+        frame.pointers,
+        frameState.predictedDisplayTime,
+        waitHeadCenter,
+        waitHeadValid,
+        log);
     // PublishPreparedOutputs dispatches game input immediately after this
     // phase. Resolve Grip/menu ownership now, not at the render-tail Submit.
     // The previous submitted role describes the panel currently on display.
@@ -330,8 +342,11 @@ OpenXrContext::FrameResult OpenXrContext::BeginPrepared(
     const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
     const auto timingSink = [&log](std::string_view line) noexcept { log.Write(line); };
     perf::Scope beginScope(beginTiming, timing, "xr.begin-frame", timingSink, sessionState_);
+    perf::HitchCall beginHitch(timing);
     lastResult_ = dispatch_.BeginFrame()(session_, &beginInfo);
+    beginHitch.Stop();
     beginScope.Stop();
+    beginHitch.Report("begin", ticket.frameId, lastResult_, timingSink);
     if (XR_FAILED(lastResult_)) {
         log.Write(
             "[VR][runtime] xrBeginFrame failed: " +
@@ -409,7 +424,9 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
             !projectionDisabledForSession_.load(std::memory_order_acquire) &&
             (!stereoLandscapeOnly_ || gpu.mirrorWidth >= gpu.mirrorHeight);
         if (stereoSceneEligible && stereoFrameFresh) {
+            VR_PERF_SCOPE(projection, "xr.render-projection", [&](std::string_view line) noexcept { log.Write(line); });
             projectionReady = RenderProjectionFrame(*stereoFrame, log);
+            projection.Stop();
             if (!projectionReady) {
                 log.Write(
                     "[VR][stereo] PROJECTION_DISABLED_FOR_SESSION result=" +
@@ -473,6 +490,7 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
                 mirrorCopySuspended_ = false;
                 log.Write("[VR][display] MIRROR_COPY_RESUMED reason=grip-or-panel-or-fallback");
             }
+            VR_PERF_SCOPE(mirror, "xr.render-mirror", [&](std::string_view line) noexcept { log.Write(line); });
             mirrorReady = RenderMirrorFrame(
                 sourceFrame, sourceFrameGeneration, frame.pointers, log);
             mirrorResult = lastResult_;
@@ -494,12 +512,14 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
                 (!projectionReady || frame.stereoUiPanelVisible);
         }
         if (gpu.aaMenuVisible) {
+            VR_PERF_SCOPE(menu, "xr.render-menu", [&](std::string_view line) noexcept { log.Write(line); });
             menuReady = RenderMenuFrame(frame.pointers, log);
             if (menuReady) {
                 graphics.uiGpu += 1;
             }
         }
         if (gpu.panelAdjustMode || gpu.panelToastKind != 0) {
+            VR_PERF_SCOPE(overlay, "xr.render-panel-overlay", [&](std::string_view line) noexcept { log.Write(line); });
             overlayReady = RenderPanelOverlayFrame(frame.pointers, log);
             if (overlayReady) {
                 graphics.uiGpu += 1;
@@ -700,13 +720,32 @@ OpenXrContext::FrameResult OpenXrContext::EndPrepared(
     static thread_local perf::Accumulator endTiming;
     const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
     const auto timingSink = [&log](std::string_view line) noexcept { log.Write(line); };
+    static thread_local perf::Accumulator markerBeginTiming;
+    perf::Scope markerBeginScope(markerBeginTiming, timing, "xr.hitch-marker-begin", timingSink);
+    auto gpuMarker = endGpuMarker_.Begin(timing, sessionDevice_, sessionContext_);
+    markerBeginScope.Stop();
     perf::Scope endScope(endTiming, timing, "xr.end-frame", timingSink,
         sessionState_, endInfo.layerCount);
+    perf::HitchCall endHitch(timing);
     const XrResult endResult = dispatch_.EndFrame()(session_, &endInfo);
+    endHitch.Stop();
     endScope.Stop();
+    static thread_local perf::Accumulator markerFinishTiming;
+    perf::Scope markerFinishScope(markerFinishTiming, timing, "xr.hitch-marker-finish", timingSink);
+    endGpuMarker_.Finish(sessionContext_, gpuMarker);
+    markerFinishScope.Stop();
     const bool success = XR_SUCCEEDED(endResult);
     (void)coordinator_.CompleteEnd(ticket.frameId, success);
     LogFrame(log, "END_RETURNED", ticket, work->layers.displayTime);
+    if (timing) {
+        char gpuDetails[256]{};
+        perf::EndGpuMarker::Describe(gpuMarker, gpuDetails);
+        if (!hitchReadyLogged_) {
+            hitchReadyLogged_ = true;
+            log.Write(std::string("[VR][perf] FRAME_HITCH_READY thresholdMs=20 mode=nonflush-event ") + gpuDetails);
+        }
+        endHitch.Report("end", ticket.frameId, endResult, timingSink, gpuDetails);
+    }
     if (XR_FAILED(endResult)) {
         lastResult_ = endResult;
         log.Write(

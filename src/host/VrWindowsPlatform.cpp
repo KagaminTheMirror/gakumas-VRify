@@ -69,11 +69,6 @@ namespace
 
     using LoadLibraryWFunction = HMODULE(WINAPI*)(LPCWSTR);
     LoadLibraryWFunction g_loadLibraryWOriginal = nullptr;
-    using GetProcAddressFunction = FARPROC(WINAPI*)(HMODULE, LPCSTR);
-    using Il2CppInitFunction = int (*)(const char*);
-    GetProcAddressFunction g_getProcAddressOriginal = nullptr;
-    std::atomic<Il2CppInitFunction> g_il2cppInitOriginal{nullptr};
-    std::atomic_bool g_earlyRuntimeReady = false;
     std::atomic<HANDLE> g_patchRequestEvent = nullptr;
     std::atomic_bool g_gameAssemblyPatched = false;
 
@@ -115,13 +110,11 @@ namespace
         if (WaitForSingleObject(requestEvent, INFINITE) == WAIT_OBJECT_0) {
             try {
                 if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-                    gakumas::vr::WriteVrLog(g_earlyRuntimeReady.load(std::memory_order_acquire)
-                        ? "UNITY_BOOTSTRAP_MILESTONE source=il2cpp_init_success"
-                        : "UNITY_BOOTSTRAP_MILESTONE source=vuplex_fallback");
+                    gakumas::vr::WriteVrLog(
+                        "UNITY_BOOTSTRAP_MILESTONE source=vuplex");
                 }
-                GakumasLocal::Log::Info(g_earlyRuntimeReady.load(std::memory_order_acquire)
-                    ? "Unity bootstrap milestone: il2cpp_init returned successfully."
-                    : "Unity bootstrap milestone: Vuplex fallback.");
+                GakumasLocal::Log::Info(
+                    "Unity bootstrap milestone: Vuplex loaded.");
                 PatchGameAssembly();
             }
             catch (const std::exception& exception) {
@@ -176,32 +169,6 @@ namespace
         }
     }
 
-    int EarlyIl2CppInit(const char* domainName) {
-        const auto original = g_il2cppInitOriginal.load(std::memory_order_acquire);
-        const int result = original(domainName);
-        if (result != 0) {
-            g_earlyRuntimeReady.store(true, std::memory_order_release);
-            RequestGameAssemblyPatch();
-        }
-        return result;
-    }
-
-    FARPROC WINAPI GetProcAddressHook(HMODULE module, LPCSTR name) {
-        const auto resolved = g_getProcAddressOriginal(module, name);
-        // UnityPlayer's verified LoadIl2Cpp resolves this export into its init
-        // slot. Lookup does no Unity work; only successful init signals the
-        // existing worker. Ordinal lookups and every other export pass through.
-        if (resolved && reinterpret_cast<std::uintptr_t>(name) > 0xffff &&
-            std::strcmp(name, "il2cpp_init") == 0 &&
-            module == GetModuleHandleW(L"GameAssembly.dll") &&
-            GakumasLocal::Config::vrRuntimeStartupEnabled) {
-            g_il2cppInitOriginal.store(
-                reinterpret_cast<Il2CppInitFunction>(resolved), std::memory_order_release);
-            return reinterpret_cast<FARPROC>(&EarlyIl2CppInit);
-        }
-        return resolved;
-    }
-
     HMODULE WINAPI LoadLibraryWHook(const wchar_t* path)
     {
         if (!g_loadLibraryWOriginal) {
@@ -210,6 +177,7 @@ namespace
 
         const auto module = g_loadLibraryWOriginal(path);
         if (module && IsVuplexWebViewPath(path)) {
+            // Same milestone as upstream Localify: VuplexWebViewWindows.dll.
             // Do not initialize Unity, allocate, or perform file I/O while the
             // loader is active. The already-running worker does the real work.
             RequestGameAssemblyPatch();
@@ -245,12 +213,6 @@ bool initHook() {
     }
 
     const auto kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (GakumasLocal::Config::vrRuntimeStartupEnabled && kernel32) {
-        const auto lookup = reinterpret_cast<void*>(GetProcAddress(kernel32, "GetProcAddress"));
-        GakumasVR::Hooks::CreateAndEnable(
-            lookup, reinterpret_cast<void*>(&GetProcAddressHook),
-            reinterpret_cast<void**>(&g_getProcAddressOriginal), "VR.EarlyIl2CppLookup");
-    }
     const auto loadLibraryW = kernel32
         ? reinterpret_cast<void*>(GetProcAddress(kernel32, "LoadLibraryW"))
         : nullptr;
@@ -763,13 +725,47 @@ namespace GakumasLocal::WinHooks {
         }
 
         void InstallWndProcHook() {
-            auto hWnd = FindWindowW(L"UnityWndClass", L"gakumas");
+            static std::atomic_bool installed{false};
+            if (installed.exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+
+            HWND hWnd = FindWindowW(L"UnityWndClass", L"gakumas");
+            if (!hWnd) {
+                const auto currentProcessId = GetCurrentProcessId();
+                HWND candidate = nullptr;
+                while ((candidate = FindWindowExW(
+                            nullptr,
+                            candidate,
+                            L"UnityWndClass",
+                            nullptr)) != nullptr) {
+                    DWORD windowProcessId = 0;
+                    GetWindowThreadProcessId(candidate, &windowProcessId);
+                    if (windowProcessId == currentProcessId) {
+                        hWnd = candidate;
+                        break;
+                    }
+                }
+            }
+            if (!hWnd) {
+                GakumasLocal::Log::Error("WndProc hook skipped: Unity window not found.");
+                if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+                    static_cast<void>(gakumas::vr::WriteVrLog("WNDPROC_HOOK hwnd=0 miss=1"));
+                }
+                installed.store(false, std::memory_order_release);
+                return;
+            }
+
             g_pfnOldWndProc = (WNDPROC)GetWindowLongPtr(hWnd, GWLP_WNDPROC);
-            SetWindowLongPtr(FindWindowW(L"UnityWndClass", L"gakumas"), GWLP_WNDPROC, (LONG_PTR)WndProcCallback);
-            // 添加可调整大小的边框和最大化按钮
+            SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)WndProcCallback);
             LONG style = GetWindowLong(hWnd, GWL_STYLE);
             style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
             SetWindowLong(hWnd, GWL_STYLE, style);
+            if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+                std::ostringstream line;
+                line << "WNDPROC_HOOK hwnd=" << hWnd << " miss=0";
+                static_cast<void>(gakumas::vr::WriteVrLog(line.str()));
+            }
         }
 
         void UninstallWndProcHook(HWND hWnd)

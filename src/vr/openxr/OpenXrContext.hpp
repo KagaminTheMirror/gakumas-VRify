@@ -1,11 +1,13 @@
 #pragma once
 
 #include "OpenXrDispatch.hpp"
+#include "../FrameHitchProbe.hpp"
 #include "../PanelPlacement.hpp"
 #include "../d3d11/StereoRenderMailbox.hpp"
 #include "../d3d11/VerticalFlipPass.hpp"
 #include "../frame/FrameCoordinator.hpp"
 #include "../input/PointerSmoother.hpp"
+#include "../pose/PoseMath.hpp"
 
 #include <array>
 #include <atomic>
@@ -329,7 +331,12 @@ private:
     bool CreateReferenceSpaces(VrLog& log);
     bool CreateInputActions(VrLog& log);
     bool AttachInputActions(VrLog& log);
-    void SyncPointerInput(std::array<PointerState, 2>& pointers, XrTime displayTime, VrLog& log);
+    void SyncPointerInput(
+        std::array<PointerState, 2>& pointers,
+        XrTime displayTime,
+        const pose::Pose& openXrHeadCenter,
+        bool openXrHeadValid,
+        VrLog& log);
     void PollLivePauseButton(XrTime displayTime, VrLog& log);
     void PollCameraButtons(XrTime displayTime, VrLog& log);
     void PollPanelAdjustButton(XrTime displayTime, VrLog& log);
@@ -686,6 +693,8 @@ private:
     d3d11::VerticalFlipPass projectionVerticalFlip_;
     ID3D11DeviceContext* sessionContext_ = nullptr;
     ID3D11Device* sessionDevice_ = nullptr;
+    perf::EndGpuMarker endGpuMarker_;
+    bool hitchReadyLogged_ = false;
     std::atomic<XrResult> lastResult_{XR_SUCCESS};
 };
 

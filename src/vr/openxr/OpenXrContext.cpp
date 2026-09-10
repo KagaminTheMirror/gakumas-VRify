@@ -9,6 +9,7 @@
 #include "../config/VrifyConfig.hpp"
 #include "../VrLog.hpp"
 #include "../PerformanceTiming.hpp"
+#include "../PerformanceProbe.hpp"
 #include "../frame/FrameCoordinator.hpp"
 
 #include <d3d11_4.h>
@@ -1469,6 +1470,8 @@ bool OpenXrContext::AttachInputActions(VrLog& log) {
 void OpenXrContext::SyncPointerInput(
     std::array<PointerState, 2>& pointers,
     XrTime displayTime,
+    const pose::Pose& openXrHeadCenter,
+    bool openXrHeadValid,
     VrLog& log) {
     pointers = {};
     if (pointerFilterLayoutGeneration_ != mirrorLayoutGeneration_) {
@@ -1682,6 +1685,13 @@ void OpenXrContext::SyncPointerInput(
     const XrSpace trackingSpace =
         stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_;
     pose::HandPoseSample handSample{};
+    handSample.predictedDisplayTime = displayTime;
+    if (openXrHeadValid &&
+        pose::IsFinite(openXrHeadCenter.position) &&
+        pose::IsFinite(openXrHeadCenter.orientation)) {
+        handSample.headCenterValid = true;
+        handSample.openXrHeadCenter = openXrHeadCenter;
+    }
     if (trackingSpace != XR_NULL_HANDLE) {
         for (std::size_t hand = 0; hand < pointers.size(); ++hand) {
             auto& pointer = pointers[hand];
@@ -2978,6 +2988,8 @@ bool OpenXrContext::DestroyMirrorSwapchainForRebuild(VrLog& log) {
     mirrorSourceFormat_ = DXGI_FORMAT_UNKNOWN;
     mirrorSwapchainFormat_ = 0;
     ReleasePortraitLatch();
+    endGpuMarker_.Reset();
+    hitchReadyLogged_ = false;
     if (sessionContext_ != nullptr) {
         sessionContext_->Release();
         sessionContext_ = nullptr;
@@ -4070,6 +4082,8 @@ void OpenXrContext::ResetMirrorSwapchain() noexcept {
     lastMirrorFingerprintGeneration_ = 0;
     mirrorFingerprint_ = 0;
     mirrorFingerprintValid_ = false;
+    endGpuMarker_.Reset();
+    hitchReadyLogged_ = false;
     if (sessionContext_ != nullptr) {
         sessionContext_->Release();
         sessionContext_ = nullptr;

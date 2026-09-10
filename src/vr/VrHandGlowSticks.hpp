@@ -13,6 +13,14 @@ void TickHandGlowSticks(
     bool headsetValid,
     const pose::StereoPoseSample& trackingSample) noexcept;
 
+// Latest composed headset from Cinemachine / Tick. Crowd late-latch uses this
+// Unity anchor with the Wait-paired OpenXR head stored on HandPoseSample.
+void UpdateHandGlowComposeBridge(
+    const pose::Pose& gameHeadset,
+    const pose::Pose& openXrHeadCenter,
+    bool openXrHeadValid,
+    float worldScale) noexcept;
+
 // Advance both hands to the next unique official ColorTable color.
 // No-op when the live palette has fewer than two uniques.
 void CycleHandGlowStickColor() noexcept;

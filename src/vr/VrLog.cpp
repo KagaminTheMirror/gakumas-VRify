@@ -7,6 +7,8 @@
 #include <Windows.h>
 
 #include "VrLog.hpp"
+#include "PerformanceTiming.hpp"
+#include "config/VrifyConfig.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -171,6 +173,17 @@ void VrLog::Close() noexcept {
 }
 
 bool VrLog::Write(std::string_view message) noexcept {
+    // Scope is outside the mutex lifetime: summaries cannot re-enter Write
+    // under mutex_. The recursive summary write is deliberately not measured.
+    static thread_local bool reportingCost = false;
+    static thread_local perf::Accumulator writeTiming;
+    perf::Scope writeCost(writeTiming,
+        GakumasLocal::Config::vrDiagnosticsStartupEnabled && !reportingCost,
+        "log.write-total", [this](std::string_view line) noexcept {
+            reportingCost = true;
+            Write(std::string(line) + " tid=" + std::to_string(GetCurrentThreadId()));
+            reportingCost = false;
+        });
     try {
         std::lock_guard lock(mutex_);
         if (!opened_) {

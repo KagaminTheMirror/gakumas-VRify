@@ -20,6 +20,12 @@ struct HandPoseSample {
     bool valid = false;
     std::uint64_t revision = 0;
     std::int64_t hostPublishTimeNanoseconds = 0;
+    // Same Wait predictedDisplayTime / view-center as LocateViews, so Crowd
+    // can compose hands against a contemporaneous OpenXR head instead of a
+    // stale Tick head when the Unity Tick is sparse inside Live.
+    std::int64_t predictedDisplayTime = 0;
+    bool headCenterValid = false;
+    Pose openXrHeadCenter{};
     std::array<HandSample, 2> hands{};
 };
 

@@ -2,6 +2,7 @@
 
 #ifndef GAKUMAS_LIVENESS_PROBE_TEST
 #include "VrRuntime.hpp"
+#include "../deps/UnityResolve/UnityResolve.hpp"
 #endif
 #include "VrVersion.hpp"
 
@@ -22,6 +23,8 @@ namespace {
 
 constexpr std::uintptr_t kAddProcessObjectFaultRva = 0x008D6F5AU;
 constexpr std::uintptr_t kAddProcessObjectCallerReturnRva = 0x008DC096U;
+constexpr std::uintptr_t kSecondHasReferencesFaultRva = 0x008D7CF2U;
+constexpr std::uintptr_t kSecondHasReferencesSignatureRva = 0x008D7CE1U;
 constexpr std::array<std::uint8_t, 7> kFaultSignature{
     0x0F, 0xB6, 0xB0, 0x35, 0x01, 0x00, 0x00};
 // Exact unpacked code archived in stereo.329-hardware, not inferred ABI.
@@ -35,11 +38,16 @@ constexpr std::array<std::uint8_t, 65> kCallerSignature{
     0x8b,0xc7,0x49,0x0f,0xa3,0xc6,0x73,0x0c,0x48,0x8b,0x0c,0xde,
     0x48,0x8b,0xd5,0xe8,0x9a,0xae,0xff,0xff,0xff,0xcf,
     0x48,0xff,0xc3,0x48,0x83,0xfb,0x3e,0x7c,0xe1};
+// Exact unpacked bytes from .401 pid 16096 at GameAssembly+0x8d7ce1.
+constexpr std::array<std::uint8_t, 24> kSecondHasReferencesSignature{
+    0x48,0x85,0xdb,0x74,0x71,0xf6,0x03,0x01,0x75,0x6c,0x48,0x8b,0x03,
+    0x48,0x83,0xe0,0xfe,0x0f,0xb6,0xb0,0x35,0x01,0x00,0x00};
 
 // 0 = may retry (GameAssembly/log not ready), 1 = installing, 2 = armed,
 // -1 = permanently unavailable for this process (signature/API mismatch).
 volatile LONG g_installState = 0;
 volatile LONG g_crashCaptured = 0;
+volatile LONG g_secondSiteArmed = 0;
 std::uintptr_t g_gameAssemblyBase = 0;
 HANDLE g_crashLogHandle = INVALID_HANDLE_VALUE;
 PVOID g_vectoredHandler = nullptr;
@@ -47,6 +55,10 @@ PVOID g_vectoredHandler = nullptr;
 struct FixedTextBuffer {
     std::array<char, 16384> bytes{};
     std::size_t size = 0;
+
+    void Clear() noexcept {
+        size = 0;
+    }
 
     void Append(const char* text) noexcept {
         if (text == nullptr) {
@@ -78,6 +90,37 @@ struct FixedTextBuffer {
         }
     }
 };
+
+// The faulting thread is already within a few KiB of StackLimit (.413
+// pid 27964: rsp = StackLimit+0x16c8). .401 pid 21176 and .413 pid 27964
+// stored `__chkstk` inside this handler (`rax=0x45e0`) and never wrote
+// the sidecar. Keep the 16 KiB line buffer and scratch off that stack.
+struct CaptureWorkspace {
+    FixedTextBuffer output;
+    std::array<std::uint8_t, 1024> stackBytes{};
+    std::array<std::uint8_t, 256> objectBytes{};
+    std::array<std::uint8_t, 128> stateBytes{};
+    std::array<std::uint8_t, 8> word{};
+    std::array<std::uint8_t, 512> parent{};
+    std::array<std::uint8_t, 512> classBytes{};
+    std::array<std::uint8_t, 64> prefix{};
+    std::array<std::uint8_t, 128> pointed{};
+};
+
+CaptureWorkspace g_captureWorkspace;
+
+void FlushCapture() noexcept {
+    if (g_crashLogHandle == INVALID_HANDLE_VALUE ||
+        g_captureWorkspace.output.size == 0) {
+        return;
+    }
+    DWORD written = 0;
+    static_cast<void>(WriteFile(
+        g_crashLogHandle, g_captureWorkspace.output.bytes.data(),
+        static_cast<DWORD>(g_captureWorkspace.output.size),
+        &written, nullptr));
+    static_cast<void>(FlushFileBuffers(g_crashLogHandle));
+}
 
 template <std::size_t Size>
 SIZE_T ReadCurrentProcessMemory(
@@ -146,24 +189,105 @@ void AppendParentContext(FixedTextBuffer& output, const CONTEXT& context,
         return;
     }
     output.Append(" parentStatus=descriptor-caller");
-    std::array<std::uint8_t, 8> word{};
+    auto& word = g_captureWorkspace.word;
+    auto& parent = g_captureWorkspace.parent;
+    auto& classBytes = g_captureWorkspace.classBytes;
+    auto& prefix = g_captureWorkspace.prefix;
+    auto& pointed = g_captureWorkspace.pointed;
+    std::memset(word.data(), 0, word.size());
+    std::memset(parent.data(), 0, parent.size());
+    std::memset(classBytes.data(), 0, classBytes.size());
+    std::memset(prefix.data(), 0, prefix.size());
     AppendMemory(output, "parentSlot", context.Rsi + index * 8U, word);
-    std::array<std::uint8_t, 512> parent{};
     AppendMemory(output, "parent", context.Rsi, parent);
     // Read header separately: a parent near a page boundary may not admit 512B.
     if (AppendMemory(output, "parentHeader", context.Rsi, word) != word.size()) return;
     const auto klass = ReadWord(word.data()) & ~std::uint64_t{1};
-    std::array<std::uint8_t, 512> classBytes{};
     AppendMemory(output, "parentClass", klass, classBytes);
-    std::array<std::uint8_t, 64> prefix{};
     if (AppendMemory(output, "classPrefix", klass, prefix) != prefix.size()) return;
     // Untyped pointer windows, NOT assumed Il2CppClass fields. Persist raw
     // metadata/string candidates without calling IL2CPP while GC is faulting.
     for (std::size_t offset = 0; offset < prefix.size(); offset += 8U) {
         AppendRegister(output, "classPointerOffset", offset);
-        std::array<std::uint8_t, 128> pointed{};
+        std::memset(pointed.data(), 0, pointed.size());
         AppendMemory(output, "classPointerWindow", ReadWord(prefix.data() + offset), pointed);
     }
+}
+
+void CaptureLivenessCrashBody(
+    const EXCEPTION_RECORD* exception,
+    const CONTEXT* context,
+    std::uintptr_t faultAddress,
+    bool isPrimary) noexcept {
+    auto& ws = g_captureWorkspace;
+    ws.output.Clear();
+    std::memset(ws.stackBytes.data(), 0, ws.stackBytes.size());
+    std::memset(ws.objectBytes.data(), 0, ws.objectBytes.size());
+    std::memset(ws.stateBytes.data(), 0, ws.stateBytes.size());
+
+    // Tiny breadcrumb first: later RPM / parent walks must not erase the RIP.
+    ws.output.Append("[VR][liveness] LIVENESS_CRASH_BEGIN");
+    AppendRegister(ws.output, "fault", faultAddress);
+    ws.output.Append(isPrimary ? " site=add-process-object"
+                               : " site=inlined-add-process-object");
+    ws.output.Append("\r\n");
+    FlushCapture();
+    ws.output.Clear();
+
+    const SIZE_T stackRead =
+        ReadCurrentProcessMemory(context->Rsp, ws.stackBytes);
+    // The proven AddProcessObject prologue keeps object in RBX and state in
+    // RDI at the failing klass->has_references load.
+    const SIZE_T objectRead =
+        ReadCurrentProcessMemory(context->Rbx, ws.objectBytes);
+    const SIZE_T stateRead =
+        ReadCurrentProcessMemory(context->Rdi, ws.stateBytes);
+
+    ws.output.Append("[VR][liveness] LIVENESS_CRASH_CONTEXT format=2 version=");
+    ws.output.Append(GAKUMAS_VR_VERSION);
+    ws.output.Append(isPrimary ? " site=add-process-object"
+                               : " site=inlined-add-process-object");
+    AppendRegister(ws.output, "pid", GetCurrentProcessId());
+    AppendRegister(ws.output, "tid", GetCurrentThreadId());
+    AppendRegister(ws.output, "code", exception->ExceptionCode);
+    AppendRegister(ws.output, "fault", faultAddress);
+    if (exception->NumberParameters >= 2U) {
+        AppendRegister(ws.output, "access", exception->ExceptionInformation[0]);
+        AppendRegister(ws.output, "target", exception->ExceptionInformation[1]);
+    }
+    AppendRegister(ws.output, "rax", context->Rax);
+    AppendRegister(ws.output, "rbx", context->Rbx);
+    AppendRegister(ws.output, "rcx", context->Rcx);
+    AppendRegister(ws.output, "rdx", context->Rdx);
+    AppendRegister(ws.output, "rsi", context->Rsi);
+    AppendRegister(ws.output, "rdi", context->Rdi);
+    AppendRegister(ws.output, "rbp", context->Rbp);
+    AppendRegister(ws.output, "rsp", context->Rsp);
+    AppendRegister(ws.output, "r8", context->R8);
+    AppendRegister(ws.output, "r9", context->R9);
+    AppendRegister(ws.output, "r10", context->R10);
+    AppendRegister(ws.output, "r11", context->R11);
+    AppendRegister(ws.output, "r12", context->R12);
+    AppendRegister(ws.output, "r13", context->R13);
+    AppendRegister(ws.output, "r14", context->R14);
+    AppendRegister(ws.output, "r15", context->R15);
+    AppendRegister(ws.output, "rip", context->Rip);
+    AppendRegister(ws.output, "stackRead", stackRead);
+    ws.output.Append(" stack=");
+    ws.output.AppendBytes(ws.stackBytes.data(), stackRead);
+    AppendRegister(ws.output, "objectRead", objectRead);
+    ws.output.Append(" object=");
+    ws.output.AppendBytes(ws.objectBytes.data(), objectRead);
+    AppendRegister(ws.output, "stateRead", stateRead);
+    ws.output.Append(" state=");
+    ws.output.AppendBytes(ws.stateBytes.data(), stateRead);
+    if (isPrimary) {
+        AppendParentContext(ws.output, *context, ws.stackBytes, stackRead);
+    } else {
+        ws.output.Append(" parentStatus=not-descriptor-site");
+    }
+    ws.output.Append("\r\n");
+    FlushCapture();
 }
 
 LONG CALLBACK CaptureLivenessCrash(EXCEPTION_POINTERS* pointers) noexcept {
@@ -176,68 +300,18 @@ LONG CALLBACK CaptureLivenessCrash(EXCEPTION_POINTERS* pointers) noexcept {
     const EXCEPTION_RECORD* exception = pointers->ExceptionRecord;
     const auto faultAddress = reinterpret_cast<std::uintptr_t>(
         exception->ExceptionAddress);
+    const auto primaryFault = g_gameAssemblyBase + kAddProcessObjectFaultRva;
+    const auto secondFault = g_gameAssemblyBase + kSecondHasReferencesFaultRva;
+    const bool isPrimary = faultAddress == primaryFault;
+    const bool isSecond = faultAddress == secondFault && g_secondSiteArmed != 0;
     if (exception->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
-        faultAddress != g_gameAssemblyBase + kAddProcessObjectFaultRva ||
+        (!isPrimary && !isSecond) ||
         InterlockedCompareExchange(&g_crashCaptured, 1, 0) != 0) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    const CONTEXT* context = pointers->ContextRecord;
-    std::array<std::uint8_t, 1024> stackBytes{};
-    std::array<std::uint8_t, 256> objectBytes{};
-    std::array<std::uint8_t, 128> stateBytes{};
-    const SIZE_T stackRead = ReadCurrentProcessMemory(context->Rsp, stackBytes);
-    // The proven AddProcessObject prologue keeps object in RBX and state in
-    // RDI at the failing klass->has_references load.
-    const SIZE_T objectRead =
-        ReadCurrentProcessMemory(context->Rbx, objectBytes);
-    const SIZE_T stateRead = ReadCurrentProcessMemory(context->Rdi, stateBytes);
-
-    FixedTextBuffer output;
-    output.Append("[VR][liveness] LIVENESS_CRASH_CONTEXT format=2 version=");
-    output.Append(GAKUMAS_VR_VERSION);
-    AppendRegister(output, "pid", GetCurrentProcessId());
-    AppendRegister(output, "tid", GetCurrentThreadId());
-    AppendRegister(output, "code", exception->ExceptionCode);
-    AppendRegister(output, "fault", faultAddress);
-    if (exception->NumberParameters >= 2U) {
-        AppendRegister(output, "access", exception->ExceptionInformation[0]);
-        AppendRegister(output, "target", exception->ExceptionInformation[1]);
-    }
-    AppendRegister(output, "rax", context->Rax);
-    AppendRegister(output, "rbx", context->Rbx);
-    AppendRegister(output, "rcx", context->Rcx);
-    AppendRegister(output, "rdx", context->Rdx);
-    AppendRegister(output, "rsi", context->Rsi);
-    AppendRegister(output, "rdi", context->Rdi);
-    AppendRegister(output, "rbp", context->Rbp);
-    AppendRegister(output, "rsp", context->Rsp);
-    AppendRegister(output, "r8", context->R8);
-    AppendRegister(output, "r9", context->R9);
-    AppendRegister(output, "r10", context->R10);
-    AppendRegister(output, "r11", context->R11);
-    AppendRegister(output, "r12", context->R12);
-    AppendRegister(output, "r13", context->R13);
-    AppendRegister(output, "r14", context->R14);
-    AppendRegister(output, "r15", context->R15);
-    AppendRegister(output, "rip", context->Rip);
-    AppendRegister(output, "stackRead", stackRead);
-    output.Append(" stack=");
-    output.AppendBytes(stackBytes.data(), stackRead);
-    AppendRegister(output, "objectRead", objectRead);
-    output.Append(" object=");
-    output.AppendBytes(objectBytes.data(), objectRead);
-    AppendRegister(output, "stateRead", stateRead);
-    output.Append(" state=");
-    output.AppendBytes(stateBytes.data(), stateRead);
-    AppendParentContext(output, *context, stackBytes, stackRead);
-    output.Append("\r\n");
-
-    DWORD written = 0;
-    static_cast<void>(WriteFile(
-        g_crashLogHandle, output.bytes.data(),
-        static_cast<DWORD>(output.size), &written, nullptr));
-    static_cast<void>(FlushFileBuffers(g_crashLogHandle));
+    CaptureLivenessCrashBody(
+        exception, pointers->ContextRecord, faultAddress, isPrimary);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -290,8 +364,74 @@ void LogCodeRange(
 } // namespace
 
 #ifndef GAKUMAS_LIVENESS_PROBE_TEST
+void TryDumpOctoCachingStorage() noexcept {
+    static volatile LONG dumpState = 0;
+    if (dumpState != 0) {
+        return;
+    }
+    try {
+    auto* assembly = UnityResolve::Get("Octo.dll");
+    if (assembly == nullptr) {
+        return;
+    }
+    auto* klass = assembly->Get("Storage", "Octo.Caching");
+    if (klass == nullptr || klass->address == nullptr) {
+        return;
+    }
+    if (InterlockedCompareExchange(&dumpState, 1, 0) != 0) {
+        return;
+    }
+    const int instanceSize = UnityResolve::Invoke<int>(
+        "il2cpp_class_instance_size", klass->address);
+    WriteVrLog(
+        std::string("[VR][liveness] STORAGE_DUMP type=Octo.Caching.Storage "
+                    "instanceSize=") +
+        std::to_string(instanceSize) +
+        " resolveFields=" + std::to_string(klass->fields.size()) +
+        " resolveMethods=" + std::to_string(klass->methods.size()));
+    void* iter = nullptr;
+    void* field = nullptr;
+    std::uint32_t logged = 0;
+    while ((field = UnityResolve::Invoke<void*>(
+                "il2cpp_class_get_fields", klass->address, &iter)) != nullptr &&
+           logged < 32U) {
+        const char* name = UnityResolve::Invoke<const char*>(
+            "il2cpp_field_get_name", field);
+        const int offset =
+            UnityResolve::Invoke<int>("il2cpp_field_get_offset", field);
+        void* type = UnityResolve::Invoke<void*>("il2cpp_field_get_type", field);
+        const char* typeName = type != nullptr
+            ? UnityResolve::Invoke<const char*>("il2cpp_type_get_name", type)
+            : "?";
+        ++logged;
+        WriteVrLog(
+            std::string("[VR][liveness] STORAGE_FIELD name=") +
+            (name != nullptr ? name : "?") +
+            " type=" + (typeName != nullptr ? typeName : "?") +
+            " offset=" + std::to_string(offset));
+    }
+    void* methodIter = nullptr;
+    void* method = nullptr;
+    logged = 0;
+    while ((method = UnityResolve::Invoke<void*>(
+                "il2cpp_class_get_methods", klass->address, &methodIter)) !=
+               nullptr &&
+           logged < 32U) {
+        const char* name = UnityResolve::Invoke<const char*>(
+            "il2cpp_method_get_name", method);
+        ++logged;
+        WriteVrLog(
+            std::string("[VR][liveness] STORAGE_METHOD name=") +
+            (name != nullptr ? name : "?"));
+    }
+    } catch (...) {
+        InterlockedExchange(&dumpState, 0);
+    }
+}
+
 void EnsureLivenessCrashProbe() noexcept {
     try {
+        TryDumpOctoCachingStorage();
         const LONG state = InterlockedCompareExchange(&g_installState, 1, 0);
         if (state != 0) {
             return;
@@ -340,6 +480,24 @@ void EnsureLivenessCrashProbe() noexcept {
             return;
         }
 
+        std::array<std::uint8_t, kSecondHasReferencesSignature.size()>
+            secondSignature{};
+        const bool secondSite =
+            ReadExact(
+                base + kSecondHasReferencesSignatureRva,
+                secondSignature.data(), secondSignature.size()) &&
+            secondSignature == kSecondHasReferencesSignature &&
+            ReadExact(
+                base + kSecondHasReferencesFaultRva,
+                signature.data(), kFaultSignature.size()) &&
+            signature == kFaultSignature;
+        InterlockedExchange(&g_secondSiteArmed, secondSite ? 1 : 0);
+        if (!secondSite) {
+            WriteVrLog(
+                "[VR][liveness] LIVENESS_SECOND_SITE_SKIPPED reason="
+                "signature-mismatch faultRva=0x8d7cf2");
+        }
+
         g_gameAssemblyBase = base;
         g_crashLogHandle = crashLog;
         g_vectoredHandler = AddVectoredExceptionHandler(1, CaptureLivenessCrash);
@@ -348,6 +506,7 @@ void EnsureLivenessCrashProbe() noexcept {
             CloseHandle(g_crashLogHandle);
             g_crashLogHandle = INVALID_HANDLE_VALUE;
             g_gameAssemblyBase = 0;
+            InterlockedExchange(&g_secondSiteArmed, 0);
             WriteVrLog(
                 "[VR][liveness] LIVENESS_CRASH_PROBE_SKIPPED reason="
                 "veh-install-failed error=" + std::to_string(error));
@@ -361,10 +520,15 @@ void EnsureLivenessCrashProbe() noexcept {
               << GAKUMAS_VR_VERSION << " base=" << gameAssembly
               << " faultRva=0x" << std::hex << kAddProcessObjectFaultRva
               << " callerReturnRva=0x" << kAddProcessObjectCallerReturnRva
+              << " secondFaultRva=0x" << kSecondHasReferencesFaultRva
+              << " secondSite=" << (g_secondSiteArmed ? "1" : "0")
               << " captureFormat=2 crashFile=" << crashPath.string();
         WriteVrLog(armed.str());
         LogCodeRange(base, 0x008D6F30U, 0xB0U, "add-process-object");
         LogCodeRange(base, 0x008DBB00U, 0x800U, "add-process-caller");
+        if (g_secondSiteArmed != 0) {
+            LogCodeRange(base, 0x008D7C80U, 0x100U, "inlined-add-process-object");
+        }
         InterlockedExchange(&g_installState, 2);
     } catch (...) {
         // Diagnostics must never terminate the game. If the native handler was

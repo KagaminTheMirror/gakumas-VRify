@@ -1,6 +1,7 @@
 #include "VrRuntime.hpp"
 
 #include "StereoGpuPublish.hpp"
+#include "PerformanceProbe.hpp"
 #include "VrVersion.hpp"
 #include "GripTransparencyTrace.hpp"
 #include "VrAaMenu.hpp"
@@ -1181,6 +1182,8 @@ void VrRuntime::WorkerMainImpl() {
 }
 
 bool VrRuntime::RefreshMirrorSource() {
+    VR_PERF_SCOPE(whole, "runtime.refresh-mirror-source", [this](std::string_view line) noexcept { log_.Write(line); });
+
     d3d11::D3D11Capture::FrameSnapshot latest;
     if (!d3d11Capture_.GetLatestFrame(latest) || latest.texture == nullptr) {
         return activeSourceFrame_.IsComplete();
@@ -1212,6 +1215,8 @@ bool VrRuntime::RefreshMirrorSource() {
 }
 
 void VrRuntime::PublishPreparedOutputs(std::uint64_t runGeneration) {
+    VR_PERF_SCOPE(whole, "runtime.publish-prepared", [this](std::string_view line) noexcept { log_.Write(line); });
+
     auto& frame = prepareFrame_;
     frame.mirrorLayoutTransitionPending = activeSourceFrame_.layoutTransitionPending;
     PublishStereoTargetSpecChange();
@@ -1384,6 +1389,8 @@ void VrRuntime::NoteSubmittedOutputs(
 }
 
 bool VrRuntime::ProcessUnityEvents() noexcept {
+    VR_PERF_SCOPE(whole, "runtime.process-events", [this](std::string_view line) noexcept { log_.Write(line); });
+
     if (openXr_.HasInstance()) {
         const auto eventResult = openXr_.DrainEvents(log_);
         lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
@@ -1406,6 +1413,8 @@ bool VrRuntime::ProcessUnityEvents() noexcept {
 }
 
 void VrRuntime::OnUnityWaitPhase() noexcept {
+    VR_PERF_SCOPE(whole, "runtime.wait-phase", [this](std::string_view line) noexcept { log_.Write(line); });
+
     if (ticketPrepared_ && ticketSubmitted_ && prepareFrame_.referenceSpaceChanged) {
         if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
             Fault("OpenXR graphics callback did not retire after a reference-space change");
@@ -1450,6 +1459,7 @@ void VrRuntime::OnUnityWaitPhase() noexcept {
     prepareFrame_.gripPanelTransparent =
         gripPanelTransparent_.load(std::memory_order_acquire);
     frame::FrameIdentity ticket{};
+    VR_PERF_SCOPE(prepare, "runtime.wait-and-prepare", [this](std::string_view line) noexcept { log_.Write(line); });
     const auto result = openXr_.WaitAndPrepare(
         prepareFrame_,
         activeSourceFrame_.texture,
@@ -1457,6 +1467,7 @@ void VrRuntime::OnUnityWaitPhase() noexcept {
         activeSourceFrame_.layoutGeneration,
         ticket,
         log_);
+    prepare.Stop();
     lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
     if (result == openxr::OpenXrContext::FrameResult::SessionNotRunning) {
         ticketPrepared_ = false;
@@ -1491,21 +1502,31 @@ bool VrRuntime::ShouldDeferStereoSubmit() const noexcept {
 }
 
 void VrRuntime::EnsureGraphicsBegun() noexcept {
+    VR_PERF_SCOPE(whole, "runtime.ensure-graphics", [this](std::string_view line) noexcept { log_.Write(line); });
+
     if (stopRequested_.load(std::memory_order_acquire) || State() == VrRuntimeState::Faulted) {
         return;
     }
     if (!ticketPrepared_ || ticketBegun_ || prepareTicket_.frameId == 0) {
         return;
     }
-    if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
+    VR_PERF_SCOPE(retire, "runtime.graphics-retire-wait", [this](std::string_view line) noexcept { log_.Write(line); });
+    perf::HitchCall retireHitch(GakumasLocal::Config::vrDiagnosticsStartupEnabled);
+    const bool retired = endDispatch_.WaitForIdle(std::chrono::seconds(2));
+    retireHitch.Stop();
+    retireHitch.Report("retire", prepareTicket_.frameId, retired ? 1 : 0,
+        [this](std::string_view line) { log_.Write(line); });
+    if (!retired) {
         Fault("OpenXR graphics callback did not retire within 2 seconds");
         return;
     }
+    retire.Stop();
     if (!ProcessUnityEvents() || !openXr_.IsSessionRunning() ||
         prepareTicket_.sessionGeneration != openXr_.SessionRunGeneration()) {
         ticketPrepared_ = false;
         return;
     }
+    VR_PERF_SCOPE(gateWait, "runtime.graphics-ticket-gate", [this](std::string_view line) noexcept { log_.Write(line); });
     const auto gate = openXr_.Coordinator().WaitForGraphicsGate(prepareTicket_.frameId);
     if (gate != frame::TicketError::None) {
         log_.Write(
@@ -1513,6 +1534,8 @@ void VrRuntime::EnsureGraphicsBegun() noexcept {
             frame::TicketErrorName(gate));
         return;
     }
+    gateWait.Stop();
+    VR_PERF_SCOPE(begin, "runtime.begin-prepared", [this](std::string_view line) noexcept { log_.Write(line); });
     const auto begun = openXr_.BeginPrepared(prepareTicket_, prepareFrame_, log_);
     lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
     if (begun == openxr::OpenXrContext::FrameResult::Completed) {
@@ -1525,6 +1548,8 @@ void VrRuntime::EnsureGraphicsBegun() noexcept {
 }
 
 int VrRuntime::OnUnitySubmitPhase() noexcept {
+    VR_PERF_SCOPE(whole, "runtime.submit-phase", [this](std::string_view line) noexcept { log_.Write(line); });
+
     if (stopRequested_.load(std::memory_order_acquire) || State() == VrRuntimeState::Faulted) {
         return 0;
     }
@@ -1570,6 +1595,8 @@ int VrRuntime::OnUnitySubmitPhase() noexcept {
 }
 
 void VrRuntime::OnGraphicsEndEvent(int eventId) noexcept {
+    VR_PERF_SCOPE(whole, "runtime.graphics-callback", [this](std::string_view line) noexcept { log_.Write(line); });
+
     frame::FrameIdentity endingTicket{};
     if (!endDispatch_.Take(eventId, endingTicket)) {
         return;
@@ -1584,13 +1611,16 @@ void VrRuntime::OnGraphicsEndEvent(int eventId) noexcept {
         auto source = std::move(queuedSourceFrame_);
         // Color/AA/mailbox GPU work is part of this ordered callback. A
         // failed consume withholds that pair; Submit still legally ends.
+        VR_PERF_SCOPE(consume, "runtime.consume-stereo", [this](std::string_view line) noexcept { log_.Write(line); });
         if (!ConsumePendingStereoGpuPublish()) {
             log_.Write("[VR][stereo] STEREO_GPU_CONSUME_FAILED eventId=" +
                 std::to_string(eventId));
         }
+        consume.Stop();
         // EndPrepared fills this from the ticket's sealed FrameWork. Never read
         // prepareFrame_: the Unity thread may already be preparing N+1.
         openxr::OpenXrContext::StereoFrame ending{};
+        VR_PERF_SCOPE(submit, "runtime.submit-prepared", [this](std::string_view line) noexcept { log_.Write(line); });
         const auto submitted = openXr_.SubmitPrepared(
             endingTicket, ending, source.texture, source.generation,
             config_.stereoProjectionEnabled ? &stereoRenderMailbox_ : nullptr, log_);
@@ -1599,6 +1629,8 @@ void VrRuntime::OnGraphicsEndEvent(int eventId) noexcept {
             Fault("OpenXR graphics callback submission failed");
             return;
         }
+        submit.Stop();
+        VR_PERF_SCOPE(outputs, "runtime.submitted-outputs", [this](std::string_view line) noexcept { log_.Write(line); });
         NoteSubmittedOutputs(ending, openXr_.SessionRunGeneration());
         input::RegisterUnityPointerEndQueued(
             endingTicket.frameId, openXr_.SessionRunGeneration());
@@ -1608,6 +1640,8 @@ void VrRuntime::OnGraphicsEndEvent(int eventId) noexcept {
         // An epoch transition updates shared reference-space bookkeeping in End.
         // Keep CPU preparation behind the full callback for these rare frames.
         if (!ending.referenceSpaceChanged) endDispatch_.CompleteSubmission();
+        outputs.Stop();
+        VR_PERF_SCOPE(end, "runtime.end-prepared", [this](std::string_view line) noexcept { log_.Write(line); });
         const auto ended = openXr_.EndPrepared(endingTicket, ending, log_);
         lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
         if (ended != openxr::OpenXrContext::FrameResult::Completed &&

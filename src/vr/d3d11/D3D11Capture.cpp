@@ -1,6 +1,7 @@
 #include "D3D11Capture.hpp"
 #include "../GripTransparencyTrace.hpp"
 #include "../PerformanceTiming.hpp"
+#include "../PerformanceProbe.hpp"
 #include "../frame/FrameLoopDriver.hpp"
 #include "../VrRuntime.hpp"
 #include "../config/VrifyConfig.hpp"
@@ -534,12 +535,14 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
         }
     }
 
+    VR_PERF_SCOPE(getBuffer, "present.get-buffer", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
     ID3D11Texture2D* backBuffer = nullptr;
     if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) ||
         backBuffer == nullptr) {
         return;
     }
 
+    getBuffer.Stop();
     D3D11_TEXTURE2D_DESC sourceDescription{};
     backBuffer->GetDesc(&sourceDescription);
     if (sourceDescription.Width == 0 || sourceDescription.Height == 0 ||
@@ -560,8 +563,11 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
 
         if (capturedFrame_ != nullptr &&
             IsSameFrameLayout(capturedFrameDescription_, sourceDescription)) {
+            VR_PERF_SCOPE(trace, "present.grip-trace", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
         GripTracePresent(capturedContext_, backBuffer);
+            trace.Stop();
             ResetFrameCandidateLocked();
+            VR_PERF_SCOPE(copy, "present.copy-resource", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
             capturedContext_->CopyResource(capturedFrame_, backBuffer);
             ++frameGeneration_;
         } else {
@@ -601,6 +607,7 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
                 }
             }
         }
+        VR_PERF_SCOPE(probe, "present.transparency-probe", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
         MaybeRunTransparencyProbeLocked(backBuffer, sourceDescription);
     }
     backBuffer->Release();
@@ -610,6 +617,8 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
 }
 
 void D3D11Capture::ClearBackbufferTransparent(IDXGISwapChain* swapChain) noexcept {
+    VR_PERF_SCOPE(clear, "present.transparent-clear", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
+
     // Runs on Unity's Present thread, after the original Present, only for
     // the captured Unity swapchain. Clearing to alpha-0 black here means the
     // next frame's UI draws onto a transparent base; CaptureUnityFrame at the

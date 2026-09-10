@@ -1,6 +1,7 @@
 #include "FrameLoopDriver.hpp"
 
 #include "../VrRuntime.hpp"
+#include "../PerformanceProbe.hpp"
 #include "../config/VrifyConfig.hpp"
 #include "deps/UnityResolve/UnityResolve.hpp"
 
@@ -369,6 +370,8 @@ void* RewriteLoop(void* boxed, unsigned depth = 0) {
 }
 
 void EnsureLoop() {
+    VR_PERF_SCOPE(verify, "driver.verify-player-loop", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
+
     if (!setLoopMethod || !loopMethod) {
         return;
     }
@@ -408,6 +411,8 @@ void EnsureLoop() {
 }
 
 void IssueEndEvent(int eventId) {
+    VR_PERF_SCOPE(issue, "driver.issue-end-event", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
+
     if (!eventMethod || eventId <= 0) {
         return;
     }

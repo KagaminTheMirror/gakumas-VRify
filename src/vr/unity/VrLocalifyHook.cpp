@@ -18,6 +18,8 @@
 #include "GakumasLocalify/camera/camera.hpp"
 #include "vr/config/VrifyConfig.hpp"
 #include "vr/PerformanceTiming.hpp"
+#include "vr/PerformanceProbe.hpp"
+#include "vr/SrpPerformanceTrace.hpp"
 // #include <jni.h>
 #include <thread>
 #include <map>
@@ -33,6 +35,7 @@
 #include <initializer_list>
 #include <utility>
 #include <cctype>
+#include <intrin.h>
 #include "host/localify/PlatformDefine.hpp"
 
 #ifdef GKMS_WINDOWS
@@ -1777,6 +1780,12 @@ namespace GakumasLocal::HookMain {
             vrStereoCameraFrame.cinematicPoseValid = true;
             vrStereoCameraFrameValid = Config::vrStereoEnabled;
         }
+        gakumas::vr::pose::Pose openXrHeadCenter{};
+        const bool openXrHeadValid = gakumas::vr::pose::TryCenterStereoPose(
+            {trackedPose.eyes[0].pose, trackedPose.eyes[1].pose},
+            openXrHeadCenter);
+        gakumas::vr::UpdateHandGlowComposeBridge(
+            composed.center, openXrHeadCenter, openXrHeadValid, worldScale);
         unityStereoRenderer.NoteToonFollowIndex(GKCamera::followCharaIndex);
 
         std::lock_guard lock(vrHeadPoseBridgeMutex);
@@ -2793,6 +2802,9 @@ namespace GakumasLocal::HookMain {
     //   0x00 Lens.FieldOfView | 0x48 RawPosition | 0x54 RawOrientation
     //   0x64 PositionDampingBypass | 0x74 PositionCorrection | 0x80 OrientationCorrection
     DEFINE_HOOK(void, CinemachineBrain_PushStateToUnityCamera, (void* self, void* state, void* mtd)) {
+        VR_PERF_SCOPE(whole, "camera.push-state-hook", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
+        VR_PERF_SCOPE(pose, "camera.pose-mod", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
+
 #ifdef GKMS_WINDOWS
         PendingCinemachineObservation cameraObservation{};
         try {
@@ -2822,7 +2834,12 @@ namespace GakumasLocal::HookMain {
             }
         }
 
+        pose.Stop();
+        VR_PERF_SCOPE(original, "camera.push-state-original", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
         CinemachineBrain_PushStateToUnityCamera_Orig(self, state, mtd);
+        original.Stop();
+        VR_PERF_SCOPE(post, "camera.post-state", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
+
 
 #ifdef GKMS_WINDOWS
         try {
@@ -3203,6 +3220,138 @@ namespace GakumasLocal::HookMain {
     }
 #endif
 
+    using gakumas::vr::perf::srpPerformance;
+
+    struct SrpNativeCount {
+        std::atomic<std::uint64_t> calls{0}, sampled{0};
+        std::atomic<unsigned long> firstTid{0}, lastTid{0};
+        std::atomic<std::uintptr_t> firstCaller{0};
+    };
+    std::array<SrpNativeCount, 10> srpNativeCounts;
+    constexpr const char* srpNativeNames[]{"wrapper.cull", "wrapper.submit", "wrapper.command",
+        "native.cull", "native.submit", "native.execute-command-buffer",
+        "pipeline.initialize-rendering-data", "pipeline.add-render-passes",
+        "pipeline.pre-cull-passes", "ui.draw-base"};
+
+    void CountSrpNative(std::size_t index, void* caller) noexcept {
+        auto& c = srpNativeCounts[index];
+        const auto tid = GetCurrentThreadId();
+        c.calls.fetch_add(1, std::memory_order_relaxed);
+        if (srpPerformance.active) c.sampled.fetch_add(1, std::memory_order_relaxed);
+        unsigned long zeroTid = 0;
+        c.firstTid.compare_exchange_strong(zeroTid, tid, std::memory_order_relaxed);
+        c.lastTid.store(tid, std::memory_order_relaxed);
+        std::uintptr_t zero = 0;
+        c.firstCaller.compare_exchange_strong(zero,
+            reinterpret_cast<std::uintptr_t>(caller), std::memory_order_relaxed);
+    }
+
+    void DumpSrpBytes(const char* name, const void* address, std::size_t count) {
+        if (!Config::vrDiagnosticsStartupEnabled || !address) return;
+        // Bounded code evidence, SEH-guarded read; no field writes or calls.
+        std::array<unsigned char, 256> bytes{};
+        for (std::size_t offset = 0; offset < (std::min)(count, std::size_t{8192}); offset += bytes.size()) {
+            const auto size = (std::min)(bytes.size(), count - offset);
+            const auto* p = static_cast<const unsigned char*>(address) + offset;
+            const bool ok = TryCopyNativeBytes(p, bytes.data(), size);
+            std::ostringstream line;
+            line.imbue(std::locale::classic());
+            line << "[VR][perf] SRP_PERF_BYTES name=" << name << " address=0x"
+                 << std::hex << reinterpret_cast<std::uintptr_t>(p)
+                 << " readable=" << ok << " raw=" << std::setfill('0');
+            if (ok) for (std::size_t i = 0; i < size; ++i) line << std::setw(2) << unsigned(bytes[i]);
+            WriteUnityCameraDiagnosticEvent(line.str());
+            if (!ok) break;
+        }
+    }
+
+    void EmitSrpNativeCounts() {
+        static std::array<bool, 10> callerDumped{}; // owner-thread flush only
+        for (std::size_t i = 0; i < srpNativeCounts.size(); ++i) {
+            auto& c = srpNativeCounts[i];
+            const auto caller = c.firstCaller.load(std::memory_order_relaxed);
+            char line[384]{};
+            std::snprintf(line, sizeof(line),
+                "[VR][perf] SRP_PERF_HITS name=%s calls=%llu sampled=%llu firstTid=%lu lastTid=%lu firstCaller=0x%llx",
+                srpNativeNames[i], static_cast<unsigned long long>(c.calls.load()),
+                static_cast<unsigned long long>(c.sampled.load()), c.firstTid.load(), c.lastTid.load(),
+                static_cast<unsigned long long>(caller));
+            WriteUnityCameraDiagnosticEvent(line);
+            if (caller && !callerDumped[i]) {
+                callerDumped[i] = true;
+                DumpSrpBytes(srpNativeNames[i], reinterpret_cast<void*>(caller - 64), 256);
+            }
+        }
+    }
+
+    // Native icall ABI: no MethodInfo. Argument registers are forwarded intact.
+    // These signatures are evidenced by the exact UnityPlayer/PDB disassembly
+    // and current live managed signature; binding and bytes are checked below.
+    DEFINE_HOOK(void, SrpNativeCull, (void* parameters, void* context, void* results)) {
+        auto* caller = _ReturnAddress();
+        CountSrpNative(3, caller);
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.cull", reinterpret_cast<std::uintptr_t>(caller));
+        SrpNativeCull_Orig(parameters, context, results);
+    }
+    DEFINE_HOOK(void, SrpNativeSubmit, (void* context)) {
+        auto* caller = _ReturnAddress();
+        CountSrpNative(4, caller);
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.submit", reinterpret_cast<std::uintptr_t>(caller));
+        SrpNativeSubmit_Orig(context);
+    }
+    DEFINE_HOOK(void, SrpNativeCommand, (void* context, void* commandBuffer)) {
+        auto* caller = _ReturnAddress();
+        CountSrpNative(5, caller);
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.execute-command-buffer", reinterpret_cast<std::uintptr_t>(caller));
+        SrpNativeCommand_Orig(context, commandBuffer);
+    }
+
+    // Exact signatures and static/instance shape are checked against the live method
+    // table before installation. These only forward; no fields/state are changed.
+    DEFINE_HOOK(void, SrpPerfCull,
+                (void* parameters, void* context, void* results, void* method)) {
+        CountSrpNative(0, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.cull");
+        SrpPerfCull_Orig(parameters, context, results, method);
+    }
+    DEFINE_HOOK(void, SrpPerfSubmit, (void* context, void* method)) {
+        CountSrpNative(1, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.submit");
+        SrpPerfSubmit_Orig(context, method);
+    }
+    DEFINE_HOOK(void, SrpPerfExecuteCommandBuffer,
+                (void* context, void* commandBuffer, void* method)) {
+        CountSrpNative(2, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.command");
+        SrpPerfExecuteCommandBuffer_Orig(context, commandBuffer, method);
+    }
+
+    // dev.398 live signatures + actual pipeline call sites are
+    // archived. Only observe/forward these existing pipeline calls.
+    DEFINE_HOOK(void, SrpInitializeRenderingData,
+                (void* settings, void* cameraData, void* cullResults, void* command,
+                 void* renderingData, void* method)) {
+        CountSrpNative(6, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.initialize-rendering-data");
+        SrpInitializeRenderingData_Orig(settings, cameraData, cullResults, command, renderingData, method);
+    }
+    DEFINE_HOOK(void, SrpAddRenderPasses, (void* self, void* renderingData, void* method)) {
+        CountSrpNative(7, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.add-render-passes");
+        SrpAddRenderPasses_Orig(self, renderingData, method);
+    }
+    DEFINE_HOOK(void, SrpPreCullPasses, (void* self, void* cameraData, void* method)) {
+        CountSrpNative(8, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.pre-cull-passes");
+        SrpPreCullPasses_Orig(self, cameraData, method);
+    }
+    DEFINE_HOOK(void, SrpUiDrawBase,
+                (void* self, void* context, void* renderingData, void* method)) {
+        CountSrpNative(9, _ReturnAddress());
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "ui.draw-base");
+        SrpUiDrawBase_Orig(self, context, renderingData, method);
+    }
+
     DEFINE_HOOK(void, BeginContextRendering, (void* ctx, void* cameras, void* method)) {
         if (unityRenderPipelineGuardReady.load(std::memory_order_acquire) &&
             unityRenderPipelineDepth !=
@@ -3222,28 +3371,10 @@ namespace GakumasLocal::HookMain {
 
     DEFINE_HOOK(void, BeginCameraRendering, (void* ctx, void* camera, void* method)) {
 #ifdef GKMS_WINDOWS
-        try {
-            unityStereoRenderer.OnBeginCamera(camera);
-            if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
-                SetFpHeadColorSkip(
-                    unityStereoRenderer.IsEyeCamera(camera) &&
-                        gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
-                    "auto-photo-camera-begin");
-            }
-            if (std::string_view(unityStereoRenderer.ClassifyCamera(camera)) ==
-                "left") {
-                ResetActorShadowLeftReuse();
-            }
-            BeginEyeRenderPassTrace(camera);
-            gakumas::vr::GripTraceBeginCamera(camera, unityStereoRenderer);
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
+        if (srpPerformance.active) srpPerformance.BeginCamera(
+            reinterpret_cast<std::uintptr_t>(camera), unityStereoRenderer.ClassifyCamera(camera));
 #endif
-        BeginCameraRendering_Orig(ctx, camera, method);
-    }
-
-    DEFINE_HOOK(void, BeginCameraRenderingManager, (void* ctx, void* camera, void* method)) {
+        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-begin");
 #ifdef GKMS_WINDOWS
         try {
             unityStereoRenderer.OnBeginCamera(camera);
@@ -3263,11 +3394,46 @@ namespace GakumasLocal::HookMain {
             ReportVrUnityHookException();
         }
 #endif
+        callback.Stop();
+        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-begin");
+        BeginCameraRendering_Orig(ctx, camera, method);
+    }
+
+    DEFINE_HOOK(void, BeginCameraRenderingManager, (void* ctx, void* camera, void* method)) {
+#ifdef GKMS_WINDOWS
+        if (srpPerformance.active) srpPerformance.BeginCamera(
+            reinterpret_cast<std::uintptr_t>(camera), unityStereoRenderer.ClassifyCamera(camera));
+#endif
+        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-begin-manager");
+#ifdef GKMS_WINDOWS
+        try {
+            unityStereoRenderer.OnBeginCamera(camera);
+            if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
+                SetFpHeadColorSkip(
+                    unityStereoRenderer.IsEyeCamera(camera) &&
+                        gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
+                    "auto-photo-camera-begin");
+            }
+            if (std::string_view(unityStereoRenderer.ClassifyCamera(camera)) ==
+                "left") {
+                ResetActorShadowLeftReuse();
+            }
+            BeginEyeRenderPassTrace(camera);
+            gakumas::vr::GripTraceBeginCamera(camera, unityStereoRenderer);
+        } catch (...) {
+            ReportVrUnityHookException();
+        }
+#endif
+        callback.Stop();
+        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-begin-manager");
         BeginCameraRenderingManager_Orig(ctx, camera, method);
     }
 
     DEFINE_HOOK(void, EndCameraRendering, (void* ctx, void* camera, void* method)) {
+        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-end");
         EndCameraRendering_Orig(ctx, camera, method);
+        original.Stop();
+        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-end");
 
         bool ownedByVrQueue = false;
 #ifdef GKMS_WINDOWS
@@ -3299,11 +3465,22 @@ namespace GakumasLocal::HookMain {
                 }
             }
         }
+        callback.Stop();
+        if (srpPerformance.active) srpPerformance.EndCamera(
+            reinterpret_cast<std::uintptr_t>(camera));
     }
 
     DEFINE_HOOK(void, ScriptableRenderer_ExecuteRenderPass,
                 (void* self, void* context, void* renderPass,
-                 void* renderingData, void* method)) {
+                  void* renderingData, void* method)) {
+        gakumas::vr::perf::SrpSpan pass(srpPerformance, "pass.unknown",
+            reinterpret_cast<std::uintptr_t>(renderPass));
+        gakumas::vr::perf::SrpSpan before(srpPerformance, "mod.pass-before");
+        if (srpPerformance.active && renderPass != nullptr) {
+            const auto* klass = Il2cppUtils::get_class_from_instance(renderPass);
+            pass.Describe(klass != nullptr ? klass->name : "pass.unknown",
+                ReadEyeRenderPassEvent(renderPass));
+        }
 #ifdef GKMS_WINDOWS
         if (Config::vrDiagnosticsStartupEnabled) {
             gakumas::vr::GripTracePass(self, renderPass, context,
@@ -3326,8 +3503,12 @@ namespace GakumasLocal::HookMain {
             ReportVrUnityHookException();
         }
 #endif
+        before.Stop();
+        gakumas::vr::perf::SrpSpan original(srpPerformance, "pass.original");
         ScriptableRenderer_ExecuteRenderPass_Orig(
             self, context, renderPass, renderingData, method);
+        original.Stop();
+        gakumas::vr::perf::SrpSpan after(srpPerformance, "mod.pass-after");
 #ifdef GKMS_WINDOWS
         if (Config::vrDiagnosticsStartupEnabled) {
             gakumas::vr::GripTracePass(self, renderPass, context,
@@ -3388,6 +3569,7 @@ namespace GakumasLocal::HookMain {
         CommandBuffer_DrawProcedural_Orig(
             self, matrix, material, shaderPass, topology, vertexCount,
             instanceCount, properties, method);
+        gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.draw-procedural-observe");
 #ifdef GKMS_WINDOWS
         try {
             const bool fullScreenShape = instanceCount == 1 &&
@@ -3411,6 +3593,7 @@ namespace GakumasLocal::HookMain {
                  int shaderPass, void* method)) {
         CommandBuffer_Blit_Orig(
             self, source, destination, material, shaderPass, method);
+        gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.blit-observe");
 #ifdef GKMS_WINDOWS
         gakumas::vr::GripTraceFullscreen(material, shaderPass);
         try {
@@ -3461,6 +3644,9 @@ namespace GakumasLocal::HookMain {
     DEFINE_HOOK(void, DoRenderLoopInternal,
                 (void* pipelineAsset, std::intptr_t loopPtr,
                  void* renderRequest, void* method)) {
+        const auto perfSink = [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); };
+        VR_PERF_SCOPE(whole, "unity.render-hook", perfSink);
+        VR_PERF_SCOPE(before, "unity.before-srp", perfSink);
         const bool outerNormalLoop = renderRequest == nullptr &&
             unityRenderLoopDepth == 0U;
         ++unityRenderLoopDepth;
@@ -3489,13 +3675,41 @@ namespace GakumasLocal::HookMain {
             }
         }
 #endif
+        before.Stop();
         static thread_local gakumas::vr::perf::Accumulator renderTiming;
         gakumas::vr::perf::Scope renderScope(renderTiming,
             Config::vrDiagnosticsStartupEnabled && outerNormalLoop,
             "unity.render-loop-original",
             [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
+        bool traceSelected = false;
+#ifdef GKMS_WINDOWS
+        if (outerNormalLoop && Config::vrDiagnosticsStartupEnabled) {
+            traceSelected = srpPerformance.Select(true);
+            if (traceSelected) {
+                gakumas::vr::pose::PoseAdmission admission{};
+                (void)gakumas::vr::VrRuntime::Instance().CurrentPoseAdmission(admission);
+                srpPerformance.Begin(admission.frameId, admission.sessionGeneration,
+                    admission.inputEpoch);
+            }
+        }
+#endif
         DoRenderLoopInternal_Orig(pipelineAsset, loopPtr, renderRequest, method);
+        if (traceSelected) srpPerformance.End();
         renderScope.Stop();
+#ifdef GKMS_WINDOWS
+        if (traceSelected) {
+            const auto begin = gakumas::vr::perf::SrpTrace::Clock::now();
+            srpPerformance.Emit(GetCurrentThreadId(),
+                [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
+            EmitSrpNativeCounts();
+            char line[192]{};
+            std::snprintf(line, sizeof(line),
+                "[VR][perf] SRP_PERF_FLUSH tid=%lu loop=%llu wallMs=%.6f",
+                GetCurrentThreadId(), static_cast<unsigned long long>(srpPerformance.loop),
+                gakumas::vr::perf::SrpTrace::Ms(begin, gakumas::vr::perf::SrpTrace::Clock::now()));
+            WriteUnityCameraDiagnosticEvent(line);
+        }
+#endif
         if (unityRenderLoopDepth != 0U) {
             --unityRenderLoopDepth;
         }
@@ -3506,8 +3720,11 @@ namespace GakumasLocal::HookMain {
         if (outerNormalLoop && unityRenderLoopDepth == 0U &&
             unityRenderPipelineGuardReady.load(std::memory_order_acquire)) {
             try {
+                VR_PERF_SCOPE(contextEnd, "unity.after-srp-context", perfSink);
                 unityStereoRenderer.OnEndContext(true);
+                contextEnd.Stop();
                 unityStereoRenderer.OnRenderLoopCompleted();
+                VR_PERF_SCOPE(driver, "unity.after-srp-driver", perfSink);
                 gakumas::vr::FrameLoopDriverAfterSrp();
             } catch (...) {
                 ReportVrUnityHookException();
@@ -5010,6 +5227,7 @@ namespace GakumasLocal::HookMain {
     }
 
     void PrepareActorShadowFeatureCall() noexcept {
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "mod.shadow-feature-prepare");
         const std::string_view role = unityStereoRenderer.ClassifyCamera(
             unityStereoRenderer.CurrentCamera());
         if (role == "left") {
@@ -5018,6 +5236,7 @@ namespace GakumasLocal::HookMain {
     }
 
     void CaptureActorShadowLeftData(void* feature) noexcept {
+        gakumas::vr::perf::SrpSpan span(srpPerformance, "mod.shadow-left-capture");
         auto& reuse = actorShadowStereoReuse;
         const std::string_view role = unityStereoRenderer.ClassifyCamera(
             unityStereoRenderer.CurrentCamera());
@@ -5255,6 +5474,7 @@ namespace GakumasLocal::HookMain {
                 ReportVrUnityHookException();
             }
             try {
+                gakumas::vr::perf::SrpSpan original(srpPerformance, "feature.actor-shadow-original");
                 DrawActorShadowPass_AddRenderPasses_Orig(
                     self, renderer, renderingData, method);
             } catch (...) {
@@ -5424,8 +5644,10 @@ namespace GakumasLocal::HookMain {
             ReportVrUnityHookException();
         }
 #endif
-        VLDeferredPass_RenderActor_Orig(
-            self, context, renderingData, method);
+        {
+            gakumas::vr::perf::SrpSpan original(srpPerformance, "draw.actor-original");
+            VLDeferredPass_RenderActor_Orig(self, context, renderingData, method);
+        }
 #ifdef GKMS_WINDOWS
         if (locked) {
             try {
@@ -6392,14 +6614,20 @@ namespace GakumasLocal::HookMain {
     // onto that branch while transparency is armed; disarmed it is a no-op.
     DEFINE_HOOK(void, UIRenderPass_Execute,
                 (void* self, void* context, void* renderingData, void* mtd)) {
+        gakumas::vr::perf::SrpSpan policy(srpPerformance, "mod.ui-policy-enter");
         gakumas::vr::UnityStereoRenderer::GripUiPassExecState saved{};
         const bool modified =
             gakumas::vr::GripUiPassExecuteEnter(self, saved);
         void* camera = unityStereoRenderer.CurrentCamera();
+        policy.Stop();
         gakumas::vr::GripBlurSourceScope blurScope(self,
             modified && camera && !unityStereoRenderer.IsEyeCamera(camera));
-        UIRenderPass_Execute_Orig(self, context, renderingData, mtd);
+        {
+            gakumas::vr::perf::SrpSpan original(srpPerformance, "ui.execute-original");
+            UIRenderPass_Execute_Orig(self, context, renderingData, mtd);
+        }
         if (modified) {
+            gakumas::vr::perf::SrpSpan restore(srpPerformance, "mod.ui-policy-restore");
             gakumas::vr::GripUiPassExecuteExit(self, saved);
         }
     }
@@ -7085,6 +7313,118 @@ namespace GakumasLocal::HookMain {
         }
 
 #ifdef GKMS_WINDOWS
+        if (Config::enabled) {
+        ADD_HOOK(WindowHandle_SetWindowLong, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+            "WindowHandle", "SetWindowLong"));
+        ADD_HOOK(WindowManager_ApplyOrientationSettings, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+            "WindowManager", "ApplyOrientationSettings"));
+        ADD_HOOK(AspectRatioHandler_NudgeWindow, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+            "AspectRatioHandler", "NudgeWindow"));
+
+        if (GakumasLocal::Config::dmmUnlockSize) {
+            std::thread([]() {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+
+                const auto currentProcessId = GetCurrentProcessId();
+                HWND hWnd = nullptr;
+                HWND candidate = nullptr;
+
+                while ((candidate = FindWindowExW(
+                            nullptr,
+                            candidate,
+                            L"UnityWndClass",
+                            nullptr
+                        )) != nullptr) {
+                    DWORD windowProcessId = 0;
+                    GetWindowThreadProcessId(
+                        candidate,
+                        &windowProcessId
+                    );
+
+                    if (windowProcessId == currentProcessId) {
+                        hWnd = candidate;
+                        break;
+                    }
+                }
+
+                if (!hWnd) {
+                    Log::Error(
+                        "DMM unlock size failed: Unity window not found."
+                    );
+                    return;
+                }
+
+                SetLastError(ERROR_SUCCESS);
+
+                auto style = GetWindowLongPtrW(
+                    hWnd,
+                    GWL_STYLE
+                );
+
+                if (style == 0 &&
+                    GetLastError() != ERROR_SUCCESS) {
+                    Log::ErrorFmt(
+                        "DMM unlock size failed: "
+                        "GetWindowLongPtrW error=%lu",
+                        GetLastError()
+                    );
+                    return;
+                }
+
+                style |= WS_THICKFRAME |
+                         WS_MAXIMIZEBOX;
+
+                SetLastError(ERROR_SUCCESS);
+
+                const auto previousStyle =
+                    SetWindowLongPtrW(
+                        hWnd,
+                        GWL_STYLE,
+                        style
+                    );
+
+                if (previousStyle == 0 &&
+                    GetLastError() != ERROR_SUCCESS) {
+                    Log::ErrorFmt(
+                        "DMM unlock size failed: "
+                        "SetWindowLongPtrW error=%lu",
+                        GetLastError()
+                    );
+                    return;
+                }
+
+                if (!SetWindowPos(
+                        hWnd,
+                        nullptr,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE |
+                        SWP_NOSIZE |
+                        SWP_NOZORDER |
+                        SWP_NOACTIVATE |
+                        SWP_FRAMECHANGED
+                    )) {
+                    Log::ErrorFmt(
+                        "DMM unlock size failed: "
+                        "SetWindowPos error=%lu",
+                        GetLastError()
+                    );
+                    return;
+                }
+
+                Log::Info(
+                    "DMM window size unlocked."
+                );
+            }).detach();
+        }
+
+		GkmsResourceUpdate::CheckUpdateFromAPI(false);
+        }
+#endif
+
+#ifdef GKMS_WINDOWS
         const bool vrRuntime = IsVrUnityRuntimeEnabled();
 #else
         constexpr bool vrRuntime = false;
@@ -7099,9 +7439,18 @@ namespace GakumasLocal::HookMain {
 
             // Grip transparency Execute-branch fixup (.225); live class
             // proven in campus-submodule.Runtime.dll by the .224 run.
-            ADD_HOOK(UIRenderPass_Execute,
-                     Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer",
-                                                   "UIRenderPass", "Execute"));
+            auto* uiExecute = Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer",
+                                                           "UIRenderPass", "Execute");
+            if (Config::vrDiagnosticsStartupEnabled) {
+                auto* pass = Il2cppUtils::GetClass("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer", "UIRenderPass");
+                if (pass) for (const auto* m : pass->methods) {
+                    if (m && (m->name == "Execute" || m->name == "DrawBlur" || m->name == "OnDrawBaseUI")) {
+                        const auto label = std::string("UIRenderPass.pre-hook.") + m->name;
+                        DumpSrpBytes(label.c_str(), m->function, 8192);
+                    }
+                }
+            }
+            ADD_HOOK(UIRenderPass_Execute, uiExecute);
 
             const auto* cameraMainMethod = Il2cppUtils::GetMethod(
                 "UnityEngine.CoreModule.dll", "UnityEngine", "Camera", "get_main");
@@ -7334,6 +7683,226 @@ namespace GakumasLocal::HookMain {
             ADD_HOOK(
                 DoRenderLoopInternal,
                 doRenderLoopShape ? doRenderLoopMethod->function : nullptr);
+
+            if (Config::vrDiagnosticsStartupEnabled) {
+                auto* contextClass = Il2cppUtils::GetClass(
+                    "UnityEngine.CoreModule.dll", "UnityEngine.Rendering",
+                    "ScriptableRenderContext");
+                // Persist the actual class table (including misses) before any
+                // diagnostic hook. No historical RVA or guessed field offset.
+                if (contextClass != nullptr) {
+                    for (const auto* m : contextClass->methods) {
+                        if (m == nullptr) continue;
+                        std::ostringstream line;
+                        line << "[VR][perf] SRP_PERF_METHOD type=ScriptableRenderContext name="
+                             << m->name << " static=" << m->static_function
+                             << " return=" << (m->return_type ? m->return_type->name : "?")
+                             << " function=" << m->function << " info=" << m->address;
+                        for (std::size_t i = 0; i < m->args.size(); ++i) {
+                            line << " arg" << i << '='
+                                 << (m->args[i] && m->args[i]->pType ? m->args[i]->pType->name : "?");
+                        }
+                        WriteUnityCameraDiagnosticEvent(line.str());
+                    }
+                    for (const auto* f : contextClass->fields) {
+                        if (f == nullptr) continue;
+                        std::ostringstream line;
+                        line << "[VR][perf] SRP_PERF_FIELD type=ScriptableRenderContext name="
+                             << f->name << " offset=" << f->offset;
+                        WriteUnityCameraDiagnosticEvent(line.str());
+                    }
+                }
+                auto exact = [&](const char* name,
+                                 std::initializer_list<const char*> args,
+                                 bool isStatic = true) -> void* {
+                    UnityResolve::Method* found = nullptr;
+                    if (contextClass == nullptr) return nullptr;
+                    for (auto* m : contextClass->methods) {
+                        if (!m || m->name != name || m->static_function != isStatic ||
+                            !m->function || !m->address || !m->return_type ||
+                            m->return_type->name != "System.Void" || m->args.size() != args.size()) continue;
+                        bool match = true;
+                        std::size_t i = 0;
+                        for (const char* arg : args) {
+                            if (!m->args[i] || !m->args[i]->pType || m->args[i]->pType->name != arg) match = false;
+                            ++i;
+                        }
+                        if (!match) continue;
+                        if (found) return nullptr;
+                        found = m;
+                    }
+                    if (found) DumpSrpBytes(name, found->function, 256);
+                    return found ? found->function : nullptr;
+                };
+                ADD_HOOK(SrpPerfCull, exact("Internal_Cull_Injected", {
+                    "UnityEngine.Rendering.ScriptableCullingParameters&",
+                    "UnityEngine.Rendering.ScriptableRenderContext&", "System.IntPtr"}));
+                // Current metadata has instance Submit_Internal(), with no
+                // Submit_Internal_Injected. Forward the opaque value-type this
+                // unchanged; the hook never reads/unboxes it or invokes it itself.
+                ADD_HOOK(SrpPerfSubmit, exact("Submit_Internal", {}, false));
+                ADD_HOOK(SrpPerfExecuteCommandBuffer, exact("ExecuteCommandBuffer_Internal_Injected", {
+                    "UnityEngine.Rendering.ScriptableRenderContext&", "System.IntPtr"}));
+                const auto ga = GetModuleHandleW(L"GameAssembly.dll");
+                const auto unity = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"UnityPlayer.dll"));
+                using ResolveIcall = void* (*)(const char*);
+                auto resolveIcall = reinterpret_cast<ResolveIcall>(GetProcAddress(ga, "il2cpp_resolve_icall"));
+                char bases[192]{};
+                std::snprintf(bases, sizeof(bases),
+                    "[VR][perf] SRP_PERF_MODULES GameAssembly=0x%llx UnityPlayer=0x%llx",
+                    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(ga)),
+                    static_cast<unsigned long long>(unity));
+                WriteUnityCameraDiagnosticEvent(bases);
+                // Exact current file/PDB identity and ABI bytes are persisted
+                // in evidence/srp-performance-dev398. A missing or changed
+                // binding is a diagnostic miss, never a guessed RVA hook.
+                auto native = [&](const char* signature, std::uintptr_t rva,
+                                  const char* expected, std::size_t size,
+                                  bool liveWrapperReady) -> void* {
+                    if (!liveWrapperReady || !resolveIcall || !unity) return nullptr;
+                    void* target = resolveIcall(signature);
+                    DumpSrpBytes(signature, target, 256);
+                    IMAGE_DOS_HEADER dos{};
+                    IMAGE_NT_HEADERS64 nt{};
+                    std::array<unsigned char, 16> code{};
+                    const bool imageOk = TryCopyNativeBytes(reinterpret_cast<void*>(unity), &dos, sizeof(dos)) &&
+                        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 && dos.e_lfanew < 4096 &&
+                        TryCopyNativeBytes(reinterpret_cast<void*>(unity + dos.e_lfanew), &nt, sizeof(nt)) &&
+                        nt.Signature == IMAGE_NT_SIGNATURE && nt.FileHeader.TimeDateStamp == 0x6a1fcfac &&
+                        nt.OptionalHeader.SizeOfImage == 0x21b6000;
+                    const bool ok = imageOk && reinterpret_cast<std::uintptr_t>(target) == unity + rva &&
+                        size <= code.size() && TryCopyNativeBytes(target, code.data(), size) &&
+                        std::memcmp(code.data(), expected, size) == 0;
+                    char record[512]{};
+                    std::snprintf(record, sizeof(record),
+                        "[VR][perf] SRP_PERF_BIND signature=%s target=0x%llx rva=0x%llx imageOk=%d bytesOk=%d",
+                        signature, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(target)),
+                        static_cast<unsigned long long>(rva), imageOk, ok);
+                    WriteUnityCameraDiagnosticEvent(record);
+                    return ok ? target : nullptr;
+                };
+                ADD_HOOK(SrpNativeCull, native("UnityEngine.Rendering.ScriptableRenderContext::Internal_Cull_Injected",
+                    0xe5fa0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x57\x48\x83\xec\x20\x48", 16,
+                    SrpPerfCull_Orig != nullptr));
+                ADD_HOOK(SrpNativeSubmit, native("UnityEngine.Rendering.ScriptableRenderContext::Submit_Internal",
+                    0xe6210, "\x48\x8b\x09\xe9\xf8\x06\x41\x00", 8,
+                    SrpPerfSubmit_Orig != nullptr));
+                ADD_HOOK(SrpNativeCommand, native("UnityEngine.Rendering.ScriptableRenderContext::ExecuteCommandBuffer_Internal_Injected",
+                    0xe64d0, "\x48\x83\xec\x58\x48\x89\x5c\x24\x60\x48\x8d\x05\x8a\x12\xa5\x01", 16,
+                    SrpPerfExecuteCommandBuffer_Orig != nullptr));
+                // Capture verified classes' real member tables and bounded
+                // current method bytes to avoid another extract-only run.
+                for (const auto& type : {
+                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", "ScriptableRenderer"},
+                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", "UniversalRenderPipeline"},
+                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "VL.Rendering", "VLSRPRenderer"},
+                        std::array<const char*, 3>{"campus-submodule.Runtime.dll", "Campus.Common.UIRenderer", "UIRenderPass"},
+                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "Resources"},
+                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPI"},
+                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPIInternal"},
+                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "Object"}}) {
+                    auto* klass = Il2cppUtils::GetClass(type[0], type[1], type[2]);
+                    if (!klass) continue;
+                    for (const auto* m : klass->methods) {
+                        if (!m) continue;
+                        std::ostringstream record;
+                        record.imbue(std::locale::classic());
+                        record << "[VR][perf] SRP_PERF_CLASS_METHOD type=" << type[2] << " name=" << m->name
+                               << " static=" << m->static_function << " return=" << (m->return_type ? m->return_type->name : "?")
+                               << " function=" << m->function << " info=" << m->address;
+                        for (std::size_t i = 0; i < m->args.size(); ++i)
+                            record << " arg" << i << '=' << (m->args[i] && m->args[i]->pType ? m->args[i]->pType->name : "?");
+                        WriteUnityCameraDiagnosticEvent(record.str());
+                        if (std::string_view(type[0]) == "UnityEngine.CoreModule.dll") {
+                            // dev.405: read-only evidence for the remaining native
+                            // inventory cost. Do not invoke or hook these entries.
+                            if (m->name == "FindObjectsOfTypeAll" || m->name == "FindObjectsByType" ||
+                                m->name == "FindObjectsOfType" || m->name == "get_ActiveAPI" ||
+                                m->name == "get_overrideAPI") {
+                                const auto label = std::string(type[2]) + "." + m->name;
+                                DumpSrpBytes(label.c_str(), m->function, 512);
+                            }
+                            continue;
+                        }
+                        if (std::string_view(type[2]) == "UIRenderPass") continue; // pre-hook bytes already captured
+                        if (m->name == "RenderSingleCamera" || m->name == "RenderCameraStack" ||
+                            m->name == "Execute" || m->name == "ExecuteRenderPass" || m->name == "InternalStartRendering" ||
+                            m->name == "InternalFinishRendering" || m->name == "InitializeRenderingData" ||
+                            m->name == "AddRenderPasses" || m->name == "OnPreCullRenderPasses" ||
+                            m->name == "OnDrawBaseUI" || m->name == "DrawBlur" ||
+                            m->name == "Setup" || m->name == "SetupLights" || m->name == "SetupCullingParameters") {
+                            const auto label = std::string(type[2]) + "." + m->name;
+                            DumpSrpBytes(label.c_str(), m->function, 8192);
+                        }
+                    }
+                    for (const auto* f : klass->fields) {
+                        if (!f) continue;
+                        std::ostringstream record;
+                        record.imbue(std::locale::classic());
+                        record << "[VR][perf] SRP_PERF_CLASS_FIELD type=" << type[2] << " name=" << f->name
+                               << " offset=" << f->offset;
+                        WriteUnityCameraDiagnosticEvent(record.str());
+                    }
+                }
+                // New observation hooks are installed only after the class
+                // census above. Reject missing/ambiguous signatures and shared
+                // bodies; never hook a name-only match or a historical RVA.
+                auto stage = [&](const char* assembly, const char* space, const char* type,
+                                 const char* name, bool isStatic,
+                                 std::initializer_list<const char*> args) -> void* {
+                    auto* klass = Il2cppUtils::GetClass(assembly, space, type);
+                    UnityResolve::Method* found = nullptr;
+                    if (klass) for (auto* m : klass->methods) {
+                        if (!m || m->name != name || m->static_function != isStatic ||
+                            !m->function || !m->address || !m->return_type ||
+                            m->return_type->name != "System.Void" || m->args.size() != args.size()) continue;
+                        bool match = true;
+                        std::size_t i = 0;
+                        for (const char* arg : args) {
+                            if (!m->args[i] || !m->args[i]->pType || m->args[i]->pType->name != arg) match = false;
+                            ++i;
+                        }
+                        if (!match) continue;
+                        if (found) { found = nullptr; break; }
+                        found = m;
+                    }
+                    if (found) for (const auto* m : klass->methods) {
+                        if (m && m != found && m->function == found->function) { found = nullptr; break; }
+                    }
+                    std::ostringstream record;
+                    record.imbue(std::locale::classic());
+                    record << "[VR][perf] SRP_PERF_BIND stage=" << type << '.' << name
+                           << " exact=" << (found != nullptr) << " target=" << (found ? found->function : nullptr);
+                    WriteUnityCameraDiagnosticEvent(record.str());
+                    return found ? found->function : nullptr;
+                };
+                ADD_HOOK(SrpInitializeRenderingData, stage("Unity.RenderPipelines.Universal.Runtime.dll",
+                    "UnityEngine.Rendering.Universal", "UniversalRenderPipeline", "InitializeRenderingData", true,
+                    {"UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset", "UnityEngine.Rendering.Universal.CameraData&",
+                     "UnityEngine.Rendering.CullingResults&", "UnityEngine.Rendering.CommandBuffer", "UnityEngine.Rendering.Universal.RenderingData&"}));
+                ADD_HOOK(SrpAddRenderPasses, stage("Unity.RenderPipelines.Universal.Runtime.dll",
+                    "UnityEngine.Rendering.Universal", "ScriptableRenderer", "AddRenderPasses", false,
+                    {"UnityEngine.Rendering.Universal.RenderingData&"}));
+                ADD_HOOK(SrpPreCullPasses, stage("Unity.RenderPipelines.Universal.Runtime.dll",
+                    "UnityEngine.Rendering.Universal", "ScriptableRenderer", "OnPreCullRenderPasses", false,
+                    {"UnityEngine.Rendering.Universal.CameraData&"}));
+                ADD_HOOK(SrpUiDrawBase, stage("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer",
+                    "UIRenderPass", "OnDrawBaseUI", false,
+                    {"UnityEngine.Rendering.ScriptableRenderContext", "UnityEngine.Rendering.Universal.RenderingData&"}));
+                std::ostringstream line;
+                line << "[VR][perf] SRP_PERF_READY cull=" << (SrpPerfCull_Orig != nullptr)
+                     << " submit=" << (SrpPerfSubmit_Orig != nullptr)
+                     << " command=" << (SrpPerfExecuteCommandBuffer_Orig != nullptr)
+                     << " nativeCull=" << (SrpNativeCull_Orig != nullptr)
+                     << " nativeSubmit=" << (SrpNativeSubmit_Orig != nullptr)
+                     << " nativeCommand=" << (SrpNativeCommand_Orig != nullptr)
+                     << " initializeData=" << (SrpInitializeRenderingData_Orig != nullptr)
+                     << " addPasses=" << (SrpAddRenderPasses_Orig != nullptr)
+                     << " preCullPasses=" << (SrpPreCullPasses_Orig != nullptr)
+                     << " uiDrawBase=" << (SrpUiDrawBase_Orig != nullptr)
+                     << " burstLoops=4 periodMs=2000 clock=cpu-wall gpuTiming=0";
+                WriteUnityCameraDiagnosticEvent(line.str());
+            }
 
             // Direct owned-eye render-path census. This hooks the exact URP
             // dispatcher that receives every classic ScriptableRenderPass,
@@ -8503,126 +9072,6 @@ namespace GakumasLocal::HookMain {
             EnsureUnityCameraDiagnosticMarker();
         }
 #endif
-
-#ifdef GKMS_WINDOWS
-        if (Config::enabled) {
-        ADD_HOOK(WindowHandle_SetWindowLong, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-            "WindowHandle", "SetWindowLong"));
-        //ADD_HOOK(WindowHandle_SetWindowLong32, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-        //    "WindowHandle", "SetWindowLong32"));
-        //ADD_HOOK(WindowHandle_SetWindowLongPtr64, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-        //    "WindowHandle", "SetWindowLongPtr64"));
-        //ADD_HOOK(WindowSizeUtility_RestoreWindowSize, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-        //    "WindowSizeUtility", "RestoreWindowSize"));
-        ADD_HOOK(WindowManager_ApplyOrientationSettings, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-            "WindowManager", "ApplyOrientationSettings"));
-        ADD_HOOK(AspectRatioHandler_NudgeWindow, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-            "AspectRatioHandler", "NudgeWindow"));
-        //ADD_HOOK(AspectRatioHandler_WindowProc, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
-        //    "AspectRatioHandler", "WindowProc"));
-
-        if (GakumasLocal::Config::dmmUnlockSize) {
-            std::thread([]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-
-                const auto currentProcessId = GetCurrentProcessId();
-                HWND hWnd = nullptr;
-                HWND candidate = nullptr;
-
-                while ((candidate = FindWindowExW(
-                            nullptr,
-                            candidate,
-                            L"UnityWndClass",
-                            nullptr
-                        )) != nullptr) {
-                    DWORD windowProcessId = 0;
-                    GetWindowThreadProcessId(
-                        candidate,
-                        &windowProcessId
-                    );
-
-                    if (windowProcessId == currentProcessId) {
-                        hWnd = candidate;
-                        break;
-                    }
-                }
-
-                if (!hWnd) {
-                    Log::Error(
-                        "DMM unlock size failed: Unity window not found."
-                    );
-                    return;
-                }
-
-                SetLastError(ERROR_SUCCESS);
-
-                auto style = GetWindowLongPtrW(
-                    hWnd,
-                    GWL_STYLE
-                );
-
-                if (style == 0 &&
-                    GetLastError() != ERROR_SUCCESS) {
-                    Log::ErrorFmt(
-                        "DMM unlock size failed: "
-                        "GetWindowLongPtrW error=%lu",
-                        GetLastError()
-                    );
-                    return;
-                }
-
-                style |= WS_THICKFRAME |
-                         WS_MAXIMIZEBOX;
-
-                SetLastError(ERROR_SUCCESS);
-
-                const auto previousStyle =
-                    SetWindowLongPtrW(
-                        hWnd,
-                        GWL_STYLE,
-                        style
-                    );
-
-                if (previousStyle == 0 &&
-                    GetLastError() != ERROR_SUCCESS) {
-                    Log::ErrorFmt(
-                        "DMM unlock size failed: "
-                        "SetWindowLongPtrW error=%lu",
-                        GetLastError()
-                    );
-                    return;
-                }
-
-                if (!SetWindowPos(
-                        hWnd,
-                        nullptr,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE |
-                        SWP_NOSIZE |
-                        SWP_NOZORDER |
-                        SWP_NOACTIVATE |
-                        SWP_FRAMECHANGED
-                    )) {
-                    Log::ErrorFmt(
-                        "DMM unlock size failed: "
-                        "SetWindowPos error=%lu",
-                        GetLastError()
-                    );
-                    return;
-                }
-
-                Log::Info(
-                    "DMM window size unlocked."
-                );
-            }).detach();
-        }
-
-		GkmsResourceUpdate::CheckUpdateFromAPI(false);
-        }
-#endif // GKMS_WINDOWS
 
     }
     // 77 2640 5000

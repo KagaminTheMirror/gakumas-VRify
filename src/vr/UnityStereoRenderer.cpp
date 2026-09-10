@@ -3,6 +3,7 @@
 #include "StereoGpuPublish.hpp"
 #include "LivePause.hpp"
 #include "LivenessCrashProbe.hpp"
+#include "GripBlurSource.hpp"
 #include "GripTransparencyTrace.hpp"
 #include "SceneReadyGate.hpp"
 #include "VrHandGlowSticks.hpp"
@@ -16,6 +17,10 @@
 #include "../GakumasLocalify/Il2cppUtils.hpp"
 #include "config/VrifyConfig.hpp"
 #include "PerformanceTiming.hpp"
+#include "PerformanceProbe.hpp"
+#include "SrpPerformanceTrace.hpp"
+#include "DiscoveryPresenceIndex.hpp"
+#include "DiscoveryNativeQuery.hpp"
 #include "../deps/UnityResolve/UnityResolve.hpp"
 #include "../hooks/HookManager.hpp"
 
@@ -45,6 +50,10 @@ using UnityVector2 = UnityResolve::UnityType::Vector2;
 using UnityVector4 = UnityResolve::UnityType::Vector4;
 using UnityQuaternion = UnityResolve::UnityType::Quaternion;
 using UnityMatrix4x4 = UnityResolve::UnityType::Matrix4x4;
+
+// Only Tick's diagnostic-gated capture starts this tree. Helpers contribute
+// children on the owner thread; calls outside a sampled Tick remain inactive.
+thread_local perf::SrpTrace tickTrace;
 
 // The authored far-background mountain shell and VL cloud cards extend well
 // beyond the source camera's 1000 m far plane. Grip's narrow frustum mostly
@@ -3494,7 +3503,9 @@ void UnityStereoRenderer::SuppressSourceCamera(void* sourceCamera) noexcept {
 }
 
 void UnityStereoRenderer::SyncSourceCameraSuppression(void* sourceCamera) noexcept {
+    perf::SrpSpan photoProtection(tickTrace, "tick.suppression.photo-protection");
     RefreshLiveSourcePhotoProtection();
+    photoProtection.Stop();
     if (LiveSourcePhotoProtectionActive()) {
         // Preserve the official full-size capture surface during the Produce
         // automatic-photo task. Reuse the established
@@ -3539,6 +3550,7 @@ void UnityStereoRenderer::SyncSourceCameraSuppression(void* sourceCamera) noexce
 }
 
 void UnityStereoRenderer::PublishGripTransparency() noexcept {
+    perf::SrpSpan transparency(tickTrace, "tick.suppression.grip-transparency");
     // Reads the suppression state the apply/lift paths maintain; never
     // writes source-camera or target state itself. Config off, tiny lifted,
     // or source restored all publish "opaque" on the next pass. The UI
@@ -3586,7 +3598,22 @@ void UnityStereoRenderer::PublishGripTransparency() noexcept {
 std::string ManagedObjectName(void* object) noexcept;
 std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept;
 
+// One short batch, not a cross-frame/scene cache. A positive lookup discards
+// the index before its caller can mutate UI or invoke game callbacks.
+struct UiDiscoveryBatch;
+thread_local UiDiscoveryBatch* uiDiscoveryBatch = nullptr;
+struct UiDiscoveryBatch {
+    UiDiscoveryBatch* previous = uiDiscoveryBatch;
+    DiscoveryPresenceIndex presence;
+    bool attempted = false;
+    UiDiscoveryBatch() { uiDiscoveryBatch = this; }
+    ~UiDiscoveryBatch() { uiDiscoveryBatch = previous; }
+    void Reset() { presence.Reset(); attempted = false; }
+};
+std::vector<void*> FindUiObjectsWithPresenceCheck(UnityResolve::Class* klass) noexcept;
+
 void UnityStereoRenderer::SyncGripUiPassClear(bool armed) noexcept {
+    perf::SrpSpan passClear(tickTrace, "tick.grip.sync-pass-clear");
     if (!armed) {
         if (gripIntermediateLastPublished_ != 0U) {
             // Release the Present-hook clear targets the moment
@@ -4450,6 +4477,7 @@ void UnityStereoRenderer::GripUiPassExecuteExit(
 }
 
 void UnityStereoRenderer::ApplyGripUiPassClear() noexcept {
+    perf::SrpSpan resolve(tickTrace, "tick.grip.resolve-pass-api");
     // .256: keeps the Execute-hook offsets resolved (arms the wrapper via
     // g_gripUiPassFixupOwner) and drives the armed-state consumers. The
     // .224 feature writes / live-pass stamping / disarm restore that used
@@ -4458,9 +4486,18 @@ void UnityStereoRenderer::ApplyGripUiPassClear() noexcept {
     if (!ResolveGripUiPassApi()) {
         return;
     }
+    resolve.Stop();
+    perf::SrpSpan targets(tickTrace, "tick.grip.publish-clear-targets");
     PublishGripIntermediateClearTargets();
+    targets.Stop();
+    perf::SrpSpan plate(tickTrace, "tick.grip.plate-hide");
     ApplyGripPlateHide();
+    plate.Stop();
+    UiDiscoveryBatch discoveryBatch;
+    perf::SrpSpan background(tickTrace, "tick.grip.background-mute");
     ApplyGripScreenBackgroundMute();
+    background.Stop();
+    perf::SrpSpan adv(tickTrace, "tick.grip.adv-mute");
     ApplyGripAdvUiMute();
 }
 
@@ -4555,7 +4592,7 @@ void UnityStereoRenderer::ApplyGripAdvUiMute() noexcept {
     // Dormant engines parked on schedule screens keep instances alive
     // but their roots inactive, which is exactly the .253 gate trap.
     bool anyAdvVisible = false;
-    for (void* uiManager : FindManagedObjectsOfType(uiManagerClass)) {
+    for (void* uiManager : FindUiObjectsWithPresenceCheck(uiManagerClass)) {
         if (uiManager == nullptr || !IsUnityManagedObjectAlive(uiManager)) {
             continue;
         }
@@ -4678,7 +4715,7 @@ void UnityStereoRenderer::ApplyGripAdvUiMute() noexcept {
     bool anyHomeVisible = false;
     if (homePageClass != nullptr && rawImageReflectionType != nullptr &&
         api_.componentGetComponent.Ready()) {
-        for (void* homePage : FindManagedObjectsOfType(homePageClass)) {
+        for (void* homePage : FindUiObjectsWithPresenceCheck(homePageClass)) {
             if (homePage == nullptr || !IsUnityManagedObjectAlive(homePage)) {
                 continue;
             }
@@ -4825,7 +4862,7 @@ void UnityStereoRenderer::ApplyGripScreenBackgroundMute() noexcept {
         gripScreenBackgroundMutes_.end());
     using SetBool = void (*)(void*, bool, void*);
     using GetBool = bool (*)(void*, void*);
-    for (void* commonView : FindManagedObjectsOfType(commonViewClass)) {
+    for (void* commonView : FindUiObjectsWithPresenceCheck(commonViewClass)) {
         if (commonView == nullptr || !IsUnityManagedObjectAlive(commonView)) {
             continue;
         }
@@ -5964,6 +6001,7 @@ bool UnityStereoRenderer::ConfigureCameraData(
     void* sourceUniversalData = nullptr;
     void* sourceVlAdditionalData = nullptr;
     void* sourceVlController = nullptr;
+    perf::SrpSpan discoverData(tickTrace, "tick.data.discover", eye);
     const std::string eyeName = eye == 0U ? "left" : "right";
     Log("[VR][stereo] CALL_BEGIN stage=configure.camera-data-discover eye=" +
         eyeName);
@@ -5985,6 +6023,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
     latestSourceUniversalData_ = sourceUniversalData;
     Log("[VR][stereo] CALL_OK stage=configure.camera-data-discover eye=" +
         eyeName);
+    discoverData.Stop();
+    perf::SrpSpan readData(tickTrace, "tick.data.read-source", eye);
 
     std::int32_t rendererIndex = -1;
     int renderType = 0;
@@ -6105,6 +6145,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
             sourceCamera)) {
         return FailStage("configure.camera-data-read", eye);
     }
+    readData.Stop();
+    perf::SrpSpan resolveData(tickTrace, "tick.data.resolve-aa-history", eye);
     if (eye == 0U) {
         if (sourceCameraSuppressed_) {
             // Keep consuming the source's own pulse so it does not go stale
@@ -6177,6 +6219,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
             1.0F / static_cast<float>(fullHeight_));
     }
 
+    resolveData.Stop();
+    perf::SrpSpan writeData(tickTrace, "tick.data.write-eye", eye);
     Log("[VR][stereo] CALL_BEGIN stage=configure.camera-data-copy eye=" +
         eyeName);
     if (!InvokeManagedVoid<SetInt>(
@@ -6248,6 +6292,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
                            api_.universalRenderScaleOffset, renderScale)) {
         return FailStage("configure.camera-data-copy", eye);
     }
+    writeData.Stop();
+    perf::SrpSpan createVolume(tickTrace, "tick.data.ensure-volume", eye);
 
     using NoArgumentVoid = void (*)(void*, void*);
     if (!InvokeManagedVoid<NoArgumentVoid>(
@@ -6255,6 +6301,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
             eyeUniversalCameraData_[eye])) {
         return FailStage("configure.volume-stack-create", eye);
     }
+    createVolume.Stop();
+    perf::SrpSpan depthSetup(tickTrace, "tick.data.depth-setup", eye);
 
     // Unity's live API table in stereo.192 proved this exact public setter.
     // CopyFrom may preserve the source flags, but source-off mode skips
@@ -6278,8 +6326,10 @@ bool UnityStereoRenderer::ConfigureCameraData(
             eyeUniversalCameraData_[eye])) {
         return FailStage("configure.volume-update-mode", eye);
     }
+    depthSetup.Stop();
     bool volumeManuallyUpdated = false;
     {
+        perf::SrpSpan updateVolume(tickTrace, "tick.data.update-volume", eye);
         ClearEyeBloomOverrides(eye);
         using UpdateVolumeStack = void (*)(void*, void*);
         if (!InvokeManagedVoid<UpdateVolumeStack>(
@@ -6290,6 +6340,7 @@ bool UnityStereoRenderer::ConfigureCameraData(
         volumeManuallyUpdated = true;
     }
 
+    perf::SrpSpan verifyData(tickTrace, "tick.data.verify-eye", eye);
     bool eyeRequiresDepthTexture = false;
     bool eyeRequiresColorTexture = false;
     bool eyeCameraAllowHdr = false;
@@ -6371,6 +6422,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
             " motion=" + (motionAliased ? "1" : "0"));
         return FailStage("configure.per-eye-state-alias", eye);
     }
+    verifyData.Stop();
+    perf::SrpSpan bindEffects(tickTrace, "tick.data.bind-effects", eye);
     BindEyeDepthOfField(eye, sourceVolumeStack);
     BindEyeUrpDepthOfField(eye, sourceVolumeStack);
     latestSourceVolumeStack_ = sourceVolumeStack;
@@ -6386,6 +6439,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
     ApplyModeBodyBloom(eye);
     DeactivateBoundEyeDepthOfField();
 
+    bindEffects.Stop();
+    perf::SrpSpan temporalData(tickTrace, "tick.data.apply-temporal", eye);
     UnityTaaSettingsPrefix eyeTaaSettings{};
     bool taaSettingsCopied = false;
     if (eyeAa.writeTaa &&
@@ -6454,6 +6509,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
                 (perFrameReset ? " perFrame=1" : ""));
         }
     }
+    temporalData.Stop();
+    perf::SrpSpan dataReport(tickTrace, "tick.data.report", eye);
     Log("[VR][stereo] CALL_OK stage=configure.camera-data-copy eye=" +
         eyeName + " renderShadows=" + (renderShadows ? "1" : "0") +
         " allowXR=0");
@@ -7728,10 +7785,29 @@ std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept
     if (klass == nullptr) {
         return {};
     }
+    // Describe the already-resolved type, without changing the typed query,
+    // result ordering or fallback. No extra Unity call for this diagnostic.
+    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+        static thread_local std::unordered_set<void*> described;
+        if (described.insert(klass->address).second) {
+            WriteVrLog("[VR][perf] DISCOVERY_TYPED_CLASS class=" +
+                std::to_string(reinterpret_cast<std::uintptr_t>(klass->address)) +
+                " name=" + klass->name + " primary=Object.FindObjectsOfType(System.Type)");
+        }
+    }
+    perf::SrpSpan primary(tickTrace, "tick.discovery.primary-find",
+        reinterpret_cast<std::uintptr_t>(klass->address));
     auto objects = klass->FindObjectsByType<void*>();
+    primary.Describe("tick.discovery.primary-find", static_cast<int>(objects.size()));
+    primary.Stop();
     if (!objects.empty()) {
         return objects;
     }
+    perf::SrpSpan fallback(tickTrace, "tick.discovery.fallback-find",
+        reinterpret_cast<std::uintptr_t>(klass->address));
+    // event=-1 means no array returned; >=0 is the copied array length.
+    // Both spans include managed dispatch/type lookup and ToVector, not bare API time.
+    fallback.Describe("tick.discovery.fallback-find", -1);
     if (auto* objectClass =
             UnityResolve::Get("UnityEngine.CoreModule.dll")->Get("Object")) {
         auto* findAll = objectClass->Get<UnityResolve::Method>(
@@ -7741,11 +7817,168 @@ std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept
             if (auto* array =
                     findAll->Invoke<UnityResolve::UnityType::Array<void*>*>(
                         type)) {
-                return array->ToVector();
+                auto all = array->ToVector();
+                fallback.Describe("tick.discovery.fallback-find", static_cast<int>(all.size()));
+                return all;
             }
         }
     }
     return objects;
+}
+
+// Only the batch-local MonoBehaviour presence inventory uses this unsorted path.
+// Typed game/UI queries keep their original ordering and lifecycle behavior.
+UnityResolve::UnityType::Array<void*>* FindPresenceInventory(
+    void* type, void* klass, UnityResolve::Method* findAll) {
+    if (!type || !findAll) return nullptr;
+    static thread_local discovery::NativeQueryBinding native;
+    static thread_local bool attempted = false;
+    static auto* getOverride = ResolveStrictMethod(
+        "UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPI", "get_overrideAPI",
+        true, "UnityEngine.ResourcesAPI", {});
+    const auto path = [](std::string_view reason) {
+        if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) return;
+        static thread_local std::string last;
+        if (last == reason) return;
+        last = reason;
+        WriteVrLog("[VR][perf] DISCOVERY_INVENTORY_PATH " + std::string(reason));
+    };
+    if (GakumasLocal::Config::vrRuntimeStartupEnabled && native.find) {
+        void* overrideObject = nullptr;
+        void* exception = nullptr;
+        bool allowed = false;
+        {
+            perf::SrpSpan guard(tickTrace, "tick.discovery.presence-guard");
+            allowed = getOverride && RuntimeInvokeRaw(getOverride->address, nullptr, nullptr,
+                &overrideObject, &exception) && !exception && !overrideObject && klass &&
+                native.classFromType(type) == klass;
+        }
+        void* result = nullptr;
+        if (allowed && discovery::InvokeFullQuery(native.find, klass, 0, result)) {
+            path("path=native-unsorted reason=verified-full-mode");
+            return static_cast<UnityResolve::UnityType::Array<void*>*>(result);
+        }
+        if (allowed) {
+            native.find = nullptr; // A bad return permanently retires this binding.
+            native.reason = "native-return-failed";
+            path("path=resources reason=native-return-failed");
+        } else {
+            path("path=resources reason=override-or-class-guard");
+        }
+    } else {
+        path("path=resources reason=" + (attempted ? native.reason : std::string("bootstrap")));
+    }
+    void* args[]{type};
+    void* result = nullptr;
+    void* exception = nullptr;
+    if (!RuntimeInvokeRaw(findAll->address, nullptr, args, &result, &exception) || exception || !result)
+        return nullptr;
+    // The first real Resources call primes the actual icall cache; it is not an
+    // extra diagnostic query. Bootstrap stays available with diagnostics off.
+    if (!attempted && GakumasLocal::Config::vrRuntimeStartupEnabled) {
+        attempted = true;
+        auto* wrapper = ResolveStrictMethod(
+            "UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPIInternal", "FindObjectsOfTypeAll",
+            true, "UnityEngine.Object[]", {"System.Type"});
+        native.Initialize(wrapper ? wrapper->function : nullptr);
+        if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+            WriteVrLog("[VR][perf] DISCOVERY_NATIVE_BINDING supported=" + std::to_string(native.find != nullptr) +
+                " reason=" + native.reason + " use=presence-runtime fullBodies=90,2991,385");
+        }
+    }
+    return static_cast<UnityResolve::UnityType::Array<void*>*>(result);
+}
+
+std::vector<void*> FindUiObjectsWithPresenceCheck(UnityResolve::Class* klass) noexcept {
+    if (!GakumasLocal::Config::vrRuntimeStartupEnabled || !klass)
+        return FindManagedObjectsOfType(klass);
+    if (!uiDiscoveryBatch) {
+        UiDiscoveryBatch batch;
+        return FindUiObjectsWithPresenceCheck(klass);
+    }
+    auto& batch = *uiDiscoveryBatch;
+    // Positive hints only bypass the extra inventory, never the real query.
+    // UI-rich screens keep their existing cost after the first encounter;
+    // disappearance clears the hint and the next batch can prove absence.
+    static thread_local std::unordered_set<void*> positiveTypes;
+    const auto legacy = [&]() {
+        batch.Reset();
+        auto objects = FindManagedObjectsOfType(klass);
+        if (objects.empty()) positiveTypes.erase(klass->address);
+        else positiveTypes.insert(klass->address);
+        return objects;
+    };
+    if (positiveTypes.count(klass->address)) return legacy();
+    // Resources.FindObjectsOfTypeAll is a superset of the legacy active-first,
+    // all-on-empty lookup, including disabled objects and prefab components.
+    // Check the live inheritance relation; non-MonoBehaviour types fall back.
+    static auto* mono = Il2cppUtils::GetClass(
+        "UnityEngine.CoreModule.dll", "UnityEngine", "MonoBehaviour");
+    static auto* findAll = ResolveStrictMethod(
+        "UnityEngine.CoreModule.dll", "UnityEngine", "Resources",
+        "FindObjectsOfTypeAll", true, "UnityEngine.Object[]", {"System.Type"});
+    // These exports are already used by the presence index. Resolve once at
+    // the local call site instead of taking UnityResolve's string/map mutex
+    // for every object (5,825 calls per inventory in dev.404). Missing exports
+    // fall back to the original typed discovery, never to a false absence.
+    using ObjectGetClass = void* (*)(void*);
+    using ClassIsAssignable = bool (*)(void*, void*);
+    static const auto objectGetClass = reinterpret_cast<ObjectGetClass>(
+        GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_object_get_class"));
+    static const auto classIsAssignable = reinterpret_cast<ClassIsAssignable>(
+        GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_class_is_assignable_from"));
+    const auto assignable = [](void* base, void* actual) {
+        return classIsAssignable(base, actual);
+    };
+    const bool supported = mono && findAll && objectGetClass && classIsAssignable &&
+        assignable(mono->address, klass->address);
+    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
+        static std::unordered_set<void*> logged;
+        if (logged.insert(klass->address).second) {
+            WriteVrLog("[VR][stereo] UI_DISCOVERY_PRESENCE_API type=" + klass->name +
+                " class=" + std::to_string(reinterpret_cast<std::uintptr_t>(klass->address)) +
+                " supported=" + (supported ? "1" : "0") + " scope=one-batch fallback=legacy" +
+                " metadata=export-cached objectGetClass=" +
+                std::to_string(reinterpret_cast<std::uintptr_t>(objectGetClass)) +
+                " classIsAssignable=" +
+                std::to_string(reinterpret_cast<std::uintptr_t>(classIsAssignable)));
+        }
+    }
+    if (!supported) {
+        return legacy();
+    }
+    if (!batch.attempted) {
+        batch.attempted = true;
+        perf::SrpSpan scan(tickTrace, "tick.discovery.presence-scan");
+        scan.Describe("tick.discovery.presence-scan", -1);
+        void* type = mono->GetType();
+        perf::SrpSpan enumerate(tickTrace, "tick.discovery.presence-enumerate");
+        auto* array = FindPresenceInventory(type, mono->address, findAll);
+        enumerate.Stop();
+        if (array) {
+            perf::SrpSpan copy(tickTrace, "tick.discovery.presence-copy");
+            const auto objects = array->ToVector();
+            copy.Stop();
+            perf::SrpSpan index(tickTrace, "tick.discovery.presence-index");
+            const bool complete = batch.presence.Build(objects, objectGetClass);
+            index.Describe("tick.discovery.presence-index",
+                complete ? static_cast<int>(batch.presence.ClassCount()) : -1);
+            index.Stop();
+            if (complete) scan.Describe("tick.discovery.presence-scan", static_cast<int>(objects.size()));
+            scan.Stop();
+        }
+    }
+    perf::SrpSpan membership(tickTrace, "tick.discovery.presence-membership");
+    const bool absentType = batch.presence.ProvesAbsent(klass->address, assignable);
+    membership.Stop();
+    if (absentType) {
+        perf::SrpSpan absent(tickTrace, "tick.discovery.absent", reinterpret_cast<std::uintptr_t>(klass->address));
+        absent.Describe("tick.discovery.absent", 0);
+        return {};
+    }
+    // Unknown/failed inventory and present types preserve the original query,
+    // ordering, active/inactive preference and all subsequent property writes.
+    return legacy();
 }
 
 std::string ManagedStringValue(void* value) noexcept {
@@ -8834,6 +9067,8 @@ void UnityStereoRenderer::RefreshSceneIdentity(const char* where) noexcept {
            << loadedCount << " handle=" << previousHandle << "->"
            << handle << " action=" << (keepArmed ? "keep-armed" : "hold");
     Log(stream.str());
+    // Additive keep-armed flaps still create/destroy frosted panels.
+    InvalidateGripBlurDiscover("scene-identity");
     if (!keepArmed || sceneRemoved) {
         DropOutlineMaterialCache("scene-identity");
     }
@@ -9185,6 +9420,7 @@ void UnityStereoRenderer::CaptureQueuedActorOutlineMaterials() noexcept {
 }
 
 void UnityStereoRenderer::PrepareActorOutlineMaterialsForCurrentDraw() noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.outline-prepare");
     const bool captured =
         outlineCapturePending_.load(std::memory_order_acquire);
     if (!IsOwnerThread() || (!outlineDiscoverAtActorDraw_ && !captured) ||
@@ -10165,7 +10401,10 @@ void UnityStereoRenderer::DiscoverLiveCameraOverlays() noexcept {
         liveCameraOverlayNextDiscoverAt_ =
             now + std::chrono::milliseconds(250);
     }
-    const auto objects = FindManagedObjectsOfType(klass);
+    perf::SrpSpan refresh(tickTrace, "tick.overlay.refresh");
+    const auto objects = FindUiObjectsWithPresenceCheck(klass);
+    refresh.Describe("tick.overlay.refresh", static_cast<int>(objects.size()));
+    perf::SrpSpan classify(tickTrace, "tick.overlay.classify");
     using GetObject = void* (*)(void*, void*);
     using GetBool = bool (*)(void*, void*);
     using GetInt = int (*)(void*, void*);
@@ -10256,6 +10495,7 @@ void UnityStereoRenderer::DiscoverLiveCameraOverlays() noexcept {
         }
         Log(entry.str());
     }
+    classify.Stop();
     if (added > 0U || !liveCameraOverlayDiscoverLogged_ ||
         (empty && now >= liveCameraOverlayNextEmptyLogAt_)) {
         liveCameraOverlayDiscoverLogged_ = true;
@@ -10434,7 +10674,10 @@ void UnityStereoRenderer::DiscoverCmovParticles() noexcept {
     if (empty) {
         cmovParticleNextDiscoverAt_ = now + std::chrono::milliseconds(250);
     }
+    perf::SrpSpan refresh(tickTrace, "tick.cmov.refresh");
     const auto objects = FindManagedObjectsOfType(klass);
+    refresh.Describe("tick.cmov.refresh", static_cast<int>(objects.size()));
+    perf::SrpSpan classify(tickTrace, "tick.cmov.classify");
     using GetObject = void* (*)(void*, void*);
     using GetBool = bool (*)(void*, void*);
     using GetInt = int (*)(void*, void*);
@@ -10517,6 +10760,8 @@ void UnityStereoRenderer::DiscoverCmovParticles() noexcept {
               << (activeSelf ? 1 : 0) << " layer=" << layer;
         Log(entry.str());
     }
+    classify.Describe("tick.cmov.classify", static_cast<int>(cmovSeen));
+    classify.Stop();
     if (added > 0U || !cmovParticleDiscoverLogged_ ||
         (empty && now >= cmovParticleNextEmptyLogAt_)) {
         cmovParticleDiscoverLogged_ = true;
@@ -11120,6 +11365,7 @@ const char* UnityStereoRenderer::ClassifyCamera(void* camera) const noexcept {
 
 bool UnityStereoRenderer::BeginActorShadowSourceAnchor(
     const char* passName) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-anchor-begin");
     // Pass-activity census, ahead of every gate below. The .89 run showed
     // the campus pass only executes per-frame in some scenes, so anything
     // keyed on its call count can silently starve; this prints which passes
@@ -11284,6 +11530,7 @@ bool UnityStereoRenderer::BeginActorShadowSourceAnchor(
 }
 
 void UnityStereoRenderer::EndActorShadowSourceAnchor() noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-anchor-end");
     if (!actorShadowAnchorActive_) {
         return;
     }
@@ -12010,6 +12257,7 @@ void UnityStereoRenderer::RecordActorLightDiagnostics(
 
 void UnityStereoRenderer::ApplyActorMatcapCompensation(
     void* renderContext, void* renderingData) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-compensation");
     // After CampusActorParameterPass.Execute. Rim-only compensate
     // (accepted `.130`) needs the projected-shadow bracket's saved
     // head pose. Authored rim (`.146`) runs when the toon-frame lock
@@ -12945,6 +13193,7 @@ bool UnityStereoRenderer::InvokeContextSetupCameraProperties(
 
 bool UnityStereoRenderer::BeginActorMatcapCamPosLock(
     void* renderContext, void* renderingData) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-lock-begin");
     if (renderContext == nullptr || renderingData == nullptr ||
         !IsOwnerThread()) {
         return false;
@@ -12998,6 +13247,7 @@ bool UnityStereoRenderer::BeginActorMatcapCamPosLock(
 
 void UnityStereoRenderer::EndActorMatcapCamPosLock(
     void* renderContext, void* renderingData) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-lock-end");
     if (renderContext == nullptr || renderingData == nullptr ||
         !IsOwnerThread()) {
         return;
@@ -13603,6 +13853,7 @@ bool UnityStereoRenderer::UploadMatcapCamPos(
 
 bool UnityStereoRenderer::BeginActorShadowViewPatch(
     void* renderingData) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-view-begin");
     // Augments an active anchor bracket only: same toggle, same shot pose.
     if (renderingData == nullptr || !actorShadowAnchorActive_ ||
         !IsOwnerThread() || actorShadowViewPatchActive_) {
@@ -13688,6 +13939,7 @@ bool UnityStereoRenderer::BeginActorShadowViewPatch(
 
 void UnityStereoRenderer::EndActorShadowViewPatch(
     void* renderingData) noexcept {
+    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-view-end");
     if (!actorShadowViewPatchActive_) {
         return;
     }
@@ -13776,6 +14028,7 @@ bool UnityStereoRenderer::ConfigureCamera(
     using SetDepth = void (*)(void*, float, void*);
     using GetClip = float (*)(void*, void*);
     using SetClip = void (*)(void*, float, void*);
+    perf::SrpSpan copy(tickTrace, "tick.eye.copy-or-mask");
     const std::string eyeName = eye == 0U ? "left" : "right";
     Log("[VR][stereo] CALL_BEGIN stage=configure.copy eye=" + eyeName);
     // A disabled source is no longer a valid temporal donor.
@@ -13811,6 +14064,8 @@ bool UnityStereoRenderer::ConfigureCamera(
     } else {
         Log("[VR][stereo] CALL_OK stage=configure.copy eye=" + eyeName);
     }
+    copy.Stop();
+    perf::SrpSpan bind(tickTrace, "tick.eye.bind-target");
     Log("[VR][stereo] CALL_BEGIN stage=configure.target eye=" + eyeName);
     if (!InvokeManagedVoid<SetTarget>(api_.cameraSetTargetTexture,
                                      eyeCameras_[eye], target)) {
@@ -13820,6 +14075,8 @@ bool UnityStereoRenderer::ConfigureCamera(
         LifetimeWriteCategory::TargetTexture, "eye-bind", eyeCameras_[eye],
         target, static_cast<std::intptr_t>(eye));
     Log("[VR][stereo] CALL_OK stage=configure.target eye=" + eyeName);
+    bind.Stop();
+    perf::SrpSpan lens(tickTrace, "tick.eye.capture-lens");
     if (sceneEnabled) {
         if (eye < frame.trackingSample.eyes.size() &&
             IsFiniteFov(frame.trackingSample.eyes[eye].fov)) {
@@ -13833,9 +14090,13 @@ bool UnityStereoRenderer::ConfigureCamera(
         }
         CaptureSourceLens(sourceCamera);
     }
+    lens.Stop();
+    perf::SrpSpan data(tickTrace, "tick.eye.camera-data");
     if (sceneEnabled && !ConfigureCameraData(eye, sourceCamera, target)) {
         return false;
     }
+    data.Stop();
+    perf::SrpSpan clips(tickTrace, "tick.eye.depth-and-clips");
     if (!sceneEnabled) {
         Log("[VR][stereo] CALL_BEGIN stage=configure.mask eye=" + eyeName +
             " value=0");
@@ -13934,11 +14195,15 @@ bool UnityStereoRenderer::ConfigureCamera(
                 " clamped=" +
                 std::string(eyeNearClip < nearClip ? "1" : "0"));
         }
+        clips.Stop();
+        perf::SrpSpan pose(tickTrace, "tick.eye.pose-projection");
         if (!ApplyEyePoseAndProjection(
                 eye, frame, appliedEyeNearClip, appliedEyeFarClip)) {
             return false;
         }
     }
+    clips.Stop();
+    perf::SrpSpan enable(tickTrace, "tick.eye.enable");
     return SetCameraEnabled(eye, true);
 }
 
@@ -13961,13 +14226,20 @@ bool UnityStereoRenderer::ArmCurrentStage(
         return false;
     }
     for (std::size_t eye = 0; eye < count; ++eye) {
-        if (!EnsureCamera(eye) ||
+        perf::SrpSpan camera(tickTrace, "tick.arm.ensure-camera", eye);
+        if (!EnsureCamera(eye)) {
+            return false;
+        }
+        camera.Stop();
+        perf::SrpSpan target(tickTrace, "tick.arm.ensure-target", eye);
+        if (
             (!full && !EnsureAdmissionTarget(eye)) ||
             (full && !EnsureFullTarget(eye, targetSpec.width, targetSpec.height,
                                        targetSpec.generation))) {
             return false;
         }
     }
+    perf::SrpSpan temporal(tickTrace, "tick.arm.temporal-state");
     GakumasLocal::Config::ClampVrEyeAaSettings();
     const bool smaaT2xRequested =
         full && GakumasLocal::Config::vrEyeAaMode == 4;
@@ -14051,6 +14323,8 @@ bool UnityStereoRenderer::ArmCurrentStage(
          nextTscmaaResolvedCount % 30U == 0U);
     smaaT2xExpectedProjectionValid_.fill(false);
     smaaT2xMotionHistoryCorrectedForPair_.fill(false);
+    temporal.Stop();
+    perf::SrpSpan source(tickTrace, "tick.arm.source-depth-and-log");
     using GetDepth = float (*)(void*, void*);
     float sourceDepth = 0.0F;
     Log("[VR][stereo] CALL_BEGIN stage=configure.source-depth");
@@ -14079,7 +14353,9 @@ bool UnityStereoRenderer::ArmCurrentStage(
               << " token=" << smaaT2xPairToken_;
     }
     Log(begin.str());
+    source.Stop();
     for (std::size_t eye = 0; eye < count; ++eye) {
+        perf::SrpSpan configure(tickTrace, "tick.arm.configure-eye", eye);
         void* target = full ? fullTargets_[eye] : admissionTargets_[eye];
         if (!ConfigureCamera(eye, sourceCamera, target, full, frame,
                              sourceDepth)) {
@@ -14101,6 +14377,7 @@ bool UnityStereoRenderer::ArmCurrentStage(
             return false;
         }
     }
+    perf::SrpSpan activation(tickTrace, "tick.arm.activate");
     stageContextEpoch_ = 0;
     observedMask_ = 0;
     armedPoseRevision_ = frame.trackingSample.revision;
@@ -14139,9 +14416,13 @@ void UnityStereoRenderer::Tick(
     bool pipelineIdle) noexcept {
     BindStereoGpuPublishOwner(this);
     ApplyPendingGpuFailure();
+    perf::TraceCapture tickCapture(tickTrace,
+        GakumasLocal::Config::vrDiagnosticsStartupEnabled, GetCurrentThreadId(), "TICK_PERF",
+        [this](std::string_view line) noexcept { Log(line); });
     static thread_local perf::Accumulator tickTiming;
     perf::Scope tickScope(tickTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
         "unity.tick", [this](std::string_view line) noexcept { Log(line); });
+    perf::SrpSpan bootstrap(tickTrace, "tick.bootstrap");
     if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
         EnsureLivenessCrashProbe();
     }
@@ -14151,6 +14432,7 @@ void UnityStereoRenderer::Tick(
     while (IsOwnerThread() && ConsumeLivePauseToggle()) {
         ToggleLivePause();
     }
+    bootstrap.Stop();
     if (IsOwnerThread()) {
         // Captured before the eligibility gates below: the actor-shadow
         // anchor also serves the Grip path, where the eye ladder never
@@ -14174,9 +14456,14 @@ void UnityStereoRenderer::Tick(
         // evaluation at the authored shot pose so the head-driven source
         // camera stops hard-swapping local blend=0 lighting volumes
         // (lobby boundary row, `.228` census).
-        UpdateVolumeTriggerAnchor(sourceCamera, frame);
-        TickHandGlowSticks(
-            headsetPose_, headsetPoseValid_, frame.trackingSample);
+        {
+            perf::SrpSpan span(tickTrace, "tick.volume-anchor");
+            UpdateVolumeTriggerAnchor(sourceCamera, frame);
+        }
+        {
+            perf::SrpSpan span(tickTrace, "tick.hand-glowsticks");
+            TickHandGlowSticks(headsetPose_, headsetPoseValid_, frame.trackingSample);
+        }
         // Diagnostic counter only: the .85 run showed Tick goes quiet inside
         // Live (one probe sample in 16 s, none after pause), so the sampling
         // itself moved to the render-side anchor bracket, which the .84 run
@@ -14187,6 +14474,7 @@ void UnityStereoRenderer::Tick(
     if (!pipelineIdle || !IsOwnerThread()) {
         return;
     }
+    perf::SrpSpan readiness(tickTrace, "tick.scene-ready");
     const auto spec = ReadStereoRenderTargetSpec();
     const bool sourcePresent = spec.enabled && sourceCamera != nullptr &&
         IsUnityManagedObjectAlive(sourceCamera) &&
@@ -14200,11 +14488,14 @@ void UnityStereoRenderer::Tick(
     if (sceneContentReadyEdge) {
         RequestActorOutlineDiscover("content-ready");
     }
+    readiness.Stop();
+    perf::SrpSpan identity(tickTrace, "tick.scene-identity-census");
     RefreshSceneIdentity("tick");
     if (sceneContentReadyEdge) {
         RequestVirtualCameraCensus("content-ready");
     }
     RunVirtualCameraCensusIfDue();
+    identity.Stop();
     if (!beginLogged_) {
         beginLogged_ = true;
         Log("[VR][stereo] QUEUE_LADDER_BEGIN stages=A/B/C crashPolicy=preserve-first-fault");
@@ -14293,6 +14584,7 @@ void UnityStereoRenderer::Tick(
         RestoreUiTextureOverlays("stage-terminal");
         return;
     }
+    perf::SrpSpan sourceBoundaryTiming(tickTrace, "tick.source-boundary");
     failureStage_ = nullptr;
     if (!EnsureManagedApi()) {
         return;
@@ -14362,15 +14654,32 @@ void UnityStereoRenderer::Tick(
     lastEligibleGeneration_ = spec.generation;
     latestFrame_ = frame;
     latestTargetSpec_ = {spec.eyeWidth, spec.eyeHeight, spec.generation};
+    sourceBoundaryTiming.Stop();
+    perf::SrpSpan effects(tickTrace, "tick.source-effects");
+    perf::SrpSpan suppression(tickTrace, "tick.source-suppression");
     SyncSourceCameraSuppression(sourceCamera);
+    suppression.Stop();
+    perf::SrpSpan overlayDiscover(tickTrace, "tick.overlay.discover");
     DiscoverLiveCameraOverlays();
+    overlayDiscover.Stop();
+    perf::SrpSpan overlayHide(tickTrace, "tick.overlay.hide");
     HideLiveCameraOverlaysForEyes();
+    overlayHide.Stop();
+    perf::SrpSpan cmovDiscover(tickTrace, "tick.cmov.discover");
     DiscoverCmovParticles();
+    cmovDiscover.Stop();
+    perf::SrpSpan cmovHide(tickTrace, "tick.cmov.hide");
     HideCmovParticlesForEyes();
+    cmovHide.Stop();
+    effects.Stop();
     if (stageArmed_ || decisionPending_ || publishPending_) {
         return;
     }
+    perf::SrpSpan arm(tickTrace, "tick.arm-stage");
+    perf::SrpSpan armCall(tickTrace, "tick.arm.call");
     ArmCurrentStage(sourceCamera, frame, latestTargetSpec_);
+    armCall.Stop();
+    perf::SrpSpan armTail(tickTrace, "tick.arm.post");
     if (!portraitArmedLogged_ && !spec.landscape && stageArmed_) {
         MaybeLogPortraitArmed(sourceCamera);
     }
@@ -16104,6 +16413,8 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
             " completedContext=" + std::to_string(completedContextEpoch_));
     }
     ++renderLoopSerial_;
+    const auto sink = [this](std::string_view line) noexcept { Log(line); };
+    VR_PERF_SCOPE(readiness, "stereo.after-readiness", sink);
     const bool stereoEligible = ReadStereoRenderTargetSpec().enabled;
     const bool sourcePresent = stereoEligible &&
         !stereoInvalidatedForIneligibility_ &&
@@ -16127,6 +16438,8 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
     } else if (EyeArmHeld() && stageArmed_ && !decisionPending_) {
         QueueStageDecision(false, "scene-ineligible");
     }
+    readiness.Stop();
+    VR_PERF_SCOPE(motion, "stereo.after-motion-bind", sink);
     // Bind the two per-eye MV sources. Only the ordered graphics callback
     // may read their pixels; cached native pointers do not synchronize Unity.
     if ((smaaT2xRequestedForPair_ || tscmaaRequestedForPair_) && stageArmed_ &&
@@ -16134,7 +16447,11 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
         smaaT2xMotionSourcesReadyForPair_ =
             BindQueuedSmaaT2xMotionVectors();
     }
+    motion.Stop();
+    VR_PERF_SCOPE(decision, "stereo.after-stage-decision", sink);
     ConsumeStageDecisionAtSafePoint();
+    decision.Stop();
+    VR_PERF_SCOPE(publish, "stereo.after-publish-prepare", sink);
     TryPublishStereoAtSafePoint();
 }
 
@@ -16233,6 +16550,8 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
         // vanished, resuming instantly in scene-ineligible windows).
         const bool alwaysKeep =
             message.find("PERF_TIMING") != std::string_view::npos ||
+            message.find("SRP_PERF_") != std::string_view::npos ||
+            message.find("TICK_PERF_") != std::string_view::npos ||
             message.find("[VR][shadow]") != std::string_view::npos ||
             message.find("[VR][fov]") != std::string_view::npos ||
             message.find("FAILED") != std::string_view::npos ||
@@ -16320,6 +16639,10 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             message.find("MIRROR_LAYOUT_CHANGED") != std::string_view::npos ||
             message.find("changed incompatibly") != std::string_view::npos ||
             message.find("FRAME_DRIVE") != std::string_view::npos ||
+            message.find("FRAME_HITCH") != std::string_view::npos ||
+            message.find("DISCOVERY_INVENTORY_PATH") != std::string_view::npos ||
+            message.find("DISCOVERY_NATIVE_BINDING") != std::string_view::npos ||
+            message.find("DISCOVERY_TYPED_CLASS") != std::string_view::npos ||
             message.find("SUBMIT_FAILED") != std::string_view::npos ||
             message.find("SUBMIT_DEFERRED") != std::string_view::npos ||
             message.find("STEREO_GPU_") != std::string_view::npos ||
