@@ -47,6 +47,8 @@ namespace I18nData {
         { "vr_menu_localize_restart", "Localization is saved and takes effect after a restart. Exit the game, then start it again yourself. It will not relaunch automatically." },
         { "vr_menu_later", "Later" },
         { "vr_menu_quit_now", "Exit now" },
+        { "vr_menu_quit", "Exit game" },
+        { "vr_menu_quit_confirm", "Exit the game?" },
         { "vr_menu_language", "Menu language" },
         { "vr_menu_language_system", "Follow system" },
         { "vr_menu_language_zh_cn", "简体中文" },

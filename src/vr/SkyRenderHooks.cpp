@@ -4783,15 +4783,24 @@ void ObserveSmaaT2xRenderPass(
     if (!IsClassOrSubclass(instanceClass, api.postProcessPass->address)) {
         return;
     }
+    const bool captureDiagnostic = diagnostics && g_smaaT2xProbeSamples[eye] < 12U;
+    if (!functional && !captureDiagnostic) {
+        return;
+    }
     void* rtHandle = ReadPointer(renderPass, api.motionVectors->offset);
     void* renderTexture = RuntimeInvokeZeroArg(api.getRt, rtHandle, false);
-    void* nativePointer = RuntimeInvokeZeroArg(
-        api.getNativeTexturePtr, renderTexture, true);
+    // GetNativeTexturePtr can synchronize with Unity's render thread. Only
+    // the bounded evidence capture needs it; the ordered MV copy uses the RT.
+    void* nativePointer = nullptr;
+    if (captureDiagnostic) {
+        nativePointer = RuntimeInvokeZeroArg(
+            api.getNativeTexturePtr, renderTexture, true);
+    }
     if (functional) {
         (void)renderer.QueueSmaaT2xMotionVectorCopy(
             camera, renderContext, renderTexture, renderPassEvent);
     }
-    if (!diagnostics || g_smaaT2xProbeSamples[eye] >= 12U) {
+    if (!captureDiagnostic) {
         return;
     }
     ++g_smaaT2xProbeSamples[eye];

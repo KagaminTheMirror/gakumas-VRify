@@ -49,6 +49,48 @@ constexpr bool ConfirmedMirrorLayoutIsLandscape(
     return (packedState & 1U) != 0;
 }
 
+const char* GameQuitSourceName(GameQuitSource source) noexcept {
+    switch (source) {
+    case GameQuitSource::Menu:
+        return "menu";
+    case GameQuitSource::Localize:
+        return "localize";
+    case GameQuitSource::WindowClose:
+        return "window-close";
+    case GameQuitSource::Console:
+        return "console";
+    }
+    return "unknown";
+}
+
+void HandleMenuGameQuit(bool fromLocalize) noexcept {
+    RequestGameQuit(
+        fromLocalize ? GameQuitSource::Localize : GameQuitSource::Menu);
+}
+
+HWND FindUnityGameWindow() noexcept {
+    HWND window = FindWindowW(L"UnityWndClass", L"gakumas");
+    if (window != nullptr) {
+        DWORD processId = 0;
+        GetWindowThreadProcessId(window, &processId);
+        if (processId == GetCurrentProcessId()) return window;
+    }
+    const auto currentProcessId = GetCurrentProcessId();
+    HWND candidate = nullptr;
+    while ((candidate = FindWindowExW(
+                nullptr,
+                candidate,
+                L"UnityWndClass",
+                nullptr)) != nullptr) {
+        DWORD windowProcessId = 0;
+        GetWindowThreadProcessId(candidate, &windowProcessId);
+        if (windowProcessId == currentProcessId) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
 static_assert(ConfirmedMirrorLayoutState(false, false, 4, 1920, 1080) == 0);
 static_assert(ConfirmedMirrorLayoutState(true, true, 4, 1920, 1080) == 0);
 static_assert(ConfirmedMirrorLayoutState(true, false, 0, 1920, 1080) == 0);
@@ -262,6 +304,12 @@ bool VrRuntime::Start(VrRuntimeConfig config, HookRegistrar registrar) {
     stereoEyeHeight_.store(0, std::memory_order_release);
     stereoTargetGeneration_.store(0, std::memory_order_release);
     stopRequested_.store(false, std::memory_order_release);
+    gameQuitRequested_.store(false, std::memory_order_release);
+    gameQuitClosePosted_.store(false, std::memory_order_release);
+    gameQuit_.Reset();
+    sessionPublished_.store(false, std::memory_order_release);
+    sessionRunningSnapshot_.store(false, std::memory_order_release);
+    sessionEventSnapshot_.store(openxr::OpenXrContext::EventResult::Healthy);
     lastOpenXrResult_.store(XR_SUCCESS, std::memory_order_release);
     d3d11HooksReady_ = false;
     activePointerHand_ = 1;
@@ -299,6 +347,66 @@ bool VrRuntime::Start(VrRuntimeConfig config, HookRegistrar registrar) {
     return true;
 }
 
+void VrRuntime::RequestGameQuit(GameQuitSource source) noexcept {
+    const bool postClose =
+        source == GameQuitSource::Menu || source == GameQuitSource::Localize ||
+        source == GameQuitSource::Console;
+    if (!postClose) {
+        if (gameQuit_.Request(GameQuit::Clock::now())) {
+            gameQuitRequested_.store(true, std::memory_order_release);
+            log_.Write(std::string("[VR][runtime] GAME_QUIT source=") + GameQuitSourceName(source));
+            if (State() == VrRuntimeState::Disabled || State() == VrRuntimeState::Stopped)
+                gameQuit_.Complete(GameQuit::Result::NoSession);
+            stopChanged_.notify_all();
+            d3d11Capture_.WakeWorker();
+        }
+        return;
+    }
+    if (gameQuitClosePosted_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const HWND window = FindUnityGameWindow();
+    if (window == nullptr) {
+        gameQuitClosePosted_.store(false, std::memory_order_release);
+        log_.Write("[VR][runtime] GAME_QUIT_CLOSE hwnd=0");
+        return;
+    }
+    if (PostMessageW(window, WM_CLOSE, 0, 0) == FALSE) {
+        gameQuitClosePosted_.store(false, std::memory_order_release);
+        log_.Write(
+            "[VR][runtime] GAME_QUIT_CLOSE posted=0 error=" +
+            std::to_string(GetLastError()));
+        return;
+    }
+    log_.Write(std::string("[VR][runtime] GAME_QUIT_CLOSE queued source=") + GameQuitSourceName(source));
+}
+
+GameQuit::Snapshot VrRuntime::PollGameQuit() noexcept {
+    return gameQuit_.Poll(GameQuit::Clock::now());
+}
+
+void VrRuntime::GameQuitTimerFailed() noexcept {
+    gameQuit_.Complete(GameQuit::Result::TimerFailed);
+}
+
+void VrRuntime::PumpGameQuit() noexcept {
+    // Called only by the Unity event owner under xrLifecycleMutex_.
+    const auto quit = gameQuit_.Read();
+    if (!quit.requested || quit.CanClose()) return;
+    if (!openXr_.IsSessionRunning()) {
+        if (!quit.exitAttempted) gameQuit_.Complete(GameQuit::Result::NoSession);
+        return;
+    }
+    if (gameQuit_.BeginExitAttempt()) {
+        const bool succeeded = openXr_.RequestExit(log_);
+        log_.Write(succeeded ? "[VR][runtime] GAME_QUIT_EXIT requested" :
+            "[VR][runtime] GAME_QUIT_EXIT failed; awaiting deadline");
+        if (openXr_.LastResult() == XR_ERROR_INSTANCE_LOST ||
+            openXr_.LastResult() == XR_ERROR_SESSION_LOST)
+            gameQuit_.Complete(GameQuit::Result::RuntimeLost);
+    }
+}
+
 void VrRuntime::Stop() noexcept {
     std::unique_lock lifecycleLock(lifecycleMutex_);
     stopRequested_.store(true, std::memory_order_release);
@@ -324,7 +432,11 @@ void VrRuntime::Stop() noexcept {
     d3d11Capture_.Detach();
     ReleasePointerDrag();
     ResetThumbstickScroll("runtime-stop");
-    openXr_.Reset();
+    {
+        std::lock_guard xrLock(xrLifecycleMutex_);
+        sessionPublished_.store(false, std::memory_order_release);
+        openXr_.Reset();
+    }
     registrar_ = {};
     d3d11HooksReady_ = false;
     if (state_.load(std::memory_order_acquire) != VrRuntimeState::Disabled) {
@@ -782,6 +894,15 @@ void VrRuntime::WorkerMain() noexcept {
         Fault("unknown unhandled worker exception");
     }
 
+    // A window deadline grants Unity permission to close; it is not permission
+    // for this worker to destroy resources still used by a PlayerLoop callback.
+    if (gameQuitRequested_.load(std::memory_order_acquire)) {
+        if (!sessionPublished_.load(std::memory_order_acquire))
+            gameQuit_.Complete(GameQuit::Result::NoSession);
+        std::unique_lock waitLock(waitMutex_);
+        while (!stopRequested_.load(std::memory_order_acquire))
+            stopChanged_.wait_for(waitLock, std::chrono::milliseconds(50));
+    }
     endDispatch_.Close();
     if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
         Fault("OpenXR worker retains resources for an outstanding graphics callback");
@@ -796,7 +917,11 @@ void VrRuntime::WorkerMain() noexcept {
     cameraInputMailbox_.Invalidate();
     ReleasePointerDrag();
     ResetThumbstickScroll("worker-stop");
-    openXr_.Reset();
+    {
+        std::lock_guard xrLock(xrLifecycleMutex_);
+        sessionPublished_.store(false, std::memory_order_release);
+        openXr_.Reset();
+    }
     d3d11Capture_.Detach();
     if (State() != VrRuntimeState::Faulted && State() != VrRuntimeState::Disabled) {
         state_.store(VrRuntimeState::Stopped, std::memory_order_release);
@@ -808,12 +933,14 @@ void VrRuntime::WorkerMain() noexcept {
 void VrRuntime::WorkerMainImpl() {
     openXr_.SetAaMenuHooks(
         &PaintVrAaMenu, &ShutdownVrAaMenu, &FlushVrAaMenuConfigSave);
+    openXr_.SetGameQuitHook(&HandleMenuGameQuit);
     openXr_.SetPanelOverlayHooks(&PaintVrPanelOverlay);
     confirmedMirrorLayout_.store(0, std::memory_order_release);
     std::uint64_t capturedGeneration = 0;
     bool headsetWaitWasLogged = false;
 
-    while (!stopRequested_.load(std::memory_order_acquire)) {
+    while (!stopRequested_.load(std::memory_order_acquire) &&
+           !gameQuitRequested_.load(std::memory_order_acquire)) {
         if (!EnsureD3D11Hooks()) {
             if (State() == VrRuntimeState::Faulted) {
                 break;
@@ -823,6 +950,8 @@ void VrRuntime::WorkerMainImpl() {
         }
 
         SetState(VrRuntimeState::WaitingForRuntime);
+        std::unique_lock xrStartupLock(xrLifecycleMutex_);
+        sessionPublished_.store(false, std::memory_order_release);
         const auto initializeResult = openXr_.Initialize(config_.applicationDirectory, log_);
         lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
         if (initializeResult == openxr::OpenXrContext::InitializeResult::RetryRuntime) {
@@ -844,7 +973,8 @@ void VrRuntime::WorkerMainImpl() {
         SetState(VrRuntimeState::InstanceReady);
 
         bool systemReady = false;
-        while (!stopRequested_.load(std::memory_order_acquire)) {
+        while (!stopRequested_.load(std::memory_order_acquire) &&
+               !gameQuitRequested_.load(std::memory_order_acquire)) {
             const auto systemResult = openXr_.AcquireHeadMountedSystem(log_);
             lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
             if (systemResult == openxr::OpenXrContext::SystemResult::Ready) {
@@ -888,6 +1018,7 @@ void VrRuntime::WorkerMainImpl() {
         SetState(VrRuntimeState::WaitingForGraphics);
         d3d11::D3D11Capture::Snapshot graphics;
         while (!stopRequested_.load(std::memory_order_acquire) &&
+               !gameQuitRequested_.load(std::memory_order_acquire) &&
                !d3d11Capture_.WaitForSnapshot(
                    capturedGeneration,
                    graphics,
@@ -895,7 +1026,8 @@ void VrRuntime::WorkerMainImpl() {
             // Capture detours signal the condition variable. The timeout only
             // bounds shutdown latency when no Unity frame is being presented.
         }
-        if (stopRequested_.load(std::memory_order_acquire)) {
+        if (stopRequested_.load(std::memory_order_acquire) ||
+            gameQuitRequested_.load(std::memory_order_acquire)) {
             break;
         }
 
@@ -928,10 +1060,8 @@ void VrRuntime::WorkerMainImpl() {
             break;
         }
 
-        // Bind the captured device before CreateD3D11Session. Unity PlayerLoop
-        // can DrainEvents and BeginSession while this call is still setting up
-        // spaces/swapchains; RefreshMirrorSource must not see a null device and
-        // treat that as a graphics-device change.
+        // Publish only after all spaces, swapchains and frame state are ready.
+        // Unity cannot drain READY or begin a session during construction.
         sessionGraphics_ = std::move(graphics);
         const auto sessionResult = openXr_.CreateD3D11Session(
             sessionGraphics_.device,
@@ -978,20 +1108,33 @@ void VrRuntime::WorkerMainImpl() {
         stereoEyeWidth_.store(openXr_.StereoEyeWidth(), std::memory_order_release);
         stereoEyeHeight_.store(openXr_.StereoEyeHeight(), std::memory_order_release);
         stereoTargetGeneration_.fetch_add(1, std::memory_order_acq_rel);
-        std::uint64_t observedRunGeneration = 0;
+        sessionRunningSnapshot_.store(false, std::memory_order_release);
+        sessionRestartExit_.store(false, std::memory_order_release);
+        sessionEventSnapshot_.store(openxr::OpenXrContext::EventResult::Healthy);
+        sessionPublished_.store(true, std::memory_order_release);
+        xrStartupLock.unlock();
+        observedRunGeneration_ = 0;
         everPoseReady_ = false;
         bool restartGraphicsSession = false;
         bool graphicsRestartExitRequested = false;
 
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            if (restartGraphicsRequested_.exchange(false, std::memory_order_acq_rel)) {
+            if (gameQuitRequested_.load(std::memory_order_acquire)) {
+                restartGraphicsSession = false;
+                sessionRestartExit_.store(false, std::memory_order_release);
+                // Only Unity pumps the published session, even before its first
+                // frame. Keep the worker alive without touching live XR state.
+                std::unique_lock waitLock(waitMutex_);
+                stopChanged_.wait_for(waitLock, std::chrono::milliseconds(16),
+                    [this] { return stopRequested_.load(); });
+                continue;
+            }
+            if (restartGraphicsRequested_.exchange(false, std::memory_order_acq_rel) &&
+                !gameQuitRequested_.load(std::memory_order_acquire)) {
                 restartGraphicsSession = true;
             }
             openxr::OpenXrContext::EventResult eventResult =
-                openxr::OpenXrContext::EventResult::Healthy;
-            if (!unityDriving_.load(std::memory_order_acquire)) {
-                eventResult = openXr_.DrainEvents(log_);
-            }
+                sessionEventSnapshot_.load(std::memory_order_acquire);
             PumpGripTraceOutput();
             if (eventResult == openxr::OpenXrContext::EventResult::SessionExiting) {
                 confirmedMirrorLayout_.store(0, std::memory_order_release);
@@ -1014,18 +1157,11 @@ void VrRuntime::WorkerMainImpl() {
             }
 
             if (restartGraphicsSession) {
-                if (!openXr_.IsSessionRunning()) {
+                if (!sessionRunningSnapshot_.load(std::memory_order_acquire)) {
                     break;
                 }
                 if (!graphicsRestartExitRequested) {
-                    if (!openXr_.RequestExit(log_)) {
-                        lastOpenXrResult_.store(
-                            openXr_.LastResult(), std::memory_order_release);
-                        Fault(
-                            "unable to stop the running OpenXR session for "
-                            "graphics rebuild");
-                        break;
-                    }
+                    sessionRestartExit_.store(true, std::memory_order_release);
                     graphicsRestartExitRequested = true;
                     log_.Write(
                         "[VR][display] GRAPHICS_REBUILD_EXIT_REQUESTED");
@@ -1038,38 +1174,11 @@ void VrRuntime::WorkerMainImpl() {
                 continue;
             }
 
-            const std::uint64_t runGeneration = openXr_.SessionRunGeneration();
-            if (runGeneration != observedRunGeneration) {
+            if (!sessionRunningSnapshot_.load(std::memory_order_acquire)) {
                 confirmedMirrorLayout_.store(0, std::memory_order_release);
-                poseMailbox_.Invalidate(
-                    runGeneration,
-                    static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
-                stereoRenderMailbox_.Invalidate();
-                ReleasePointerDrag();
-                ResetThumbstickScroll("session-generation");
-                observedRunGeneration = runGeneration;
-                observedRunGeneration_ = runGeneration;
-                currentRunPoseReady_ = false;
-                currentRunDisplayReady_ = false;
-                currentRunInputReady_ = false;
-                activePointerHand_ = 1;
-                inputMirrorLayoutGeneration_ = 0;
-                inputLayoutReady_ = false;
-                inputLayoutMismatchLogged_ = false;
-                inputLayoutPendingLogged_ = false;
-                ticketPrepared_ = false;
-                ticketBegun_ = false;
-                ticketSubmitted_ = false;
-                prepareTicket_ = {};
-                input::ClearUnityPointerLease();
-                SetState(VrRuntimeState::SessionRunning);
-                log_.Write(
-                    "[VR][pose] FRAME_LOOP_STARTED generation=" +
-                    std::to_string(runGeneration));
-            }
-
-            if (!openXr_.IsSessionRunning()) {
-                confirmedMirrorLayout_.store(0, std::memory_order_release);
+                if (gameQuitRequested_.load(std::memory_order_acquire)) {
+                    break;
+                }
                 SetState(VrRuntimeState::SessionReady);
                 if (WaitOrStop(std::min(
                         config_.graphicsPollInterval,
@@ -1139,11 +1248,15 @@ void VrRuntime::WorkerMainImpl() {
         }
         if (restartGraphicsSession &&
             !stopRequested_.load(std::memory_order_acquire) &&
+            !gameQuitRequested_.load(std::memory_order_acquire) &&
             State() != VrRuntimeState::Faulted) {
             if (!endDispatch_.WaitForIdle(std::chrono::seconds(2))) {
                 Fault("OpenXR rebuild is waiting for an outstanding graphics callback");
                 break;
             }
+            std::lock_guard xrResetLock(xrLifecycleMutex_);
+            if (gameQuitRequested_.load(std::memory_order_acquire)) break;
+            sessionPublished_.store(false, std::memory_order_release);
             if (openXr_.IsSessionRunning()) {
                 Fault(
                     "OpenXR session remained running after graphics rebuild "
@@ -1391,9 +1504,44 @@ void VrRuntime::NoteSubmittedOutputs(
 bool VrRuntime::ProcessUnityEvents() noexcept {
     VR_PERF_SCOPE(whole, "runtime.process-events", [this](std::string_view line) noexcept { log_.Write(line); });
 
+    std::unique_lock xrLock(xrLifecycleMutex_, std::try_to_lock);
+    if (!xrLock.owns_lock() || !sessionPublished_.load(std::memory_order_acquire))
+        return false;
+    const auto previousEvent = sessionEventSnapshot_.load(std::memory_order_acquire);
+    if (previousEvent != openxr::OpenXrContext::EventResult::Healthy) return false;
+    const bool quitting = gameQuitRequested_.load(std::memory_order_acquire);
+    if (quitting) {
+        PumpGameQuit();
+        if (gameQuit_.Read().CanClose()) return false;
+    } else if (sessionRestartExit_.exchange(false, std::memory_order_acq_rel)) {
+        if (!openXr_.RequestExit(log_)) {
+            sessionEventSnapshot_.store(openxr::OpenXrContext::EventResult::Failed);
+            Fault("unable to stop the running OpenXR session for graphics rebuild");
+            return false;
+        }
+    }
     if (openXr_.HasInstance()) {
-        const auto eventResult = openXr_.DrainEvents(log_);
+        const auto eventResult = openXr_.DrainEvents(log_, quitting);
+        sessionRunningSnapshot_.store(openXr_.IsSessionRunning(), std::memory_order_release);
+        sessionEventSnapshot_.store(eventResult, std::memory_order_release);
         lastOpenXrResult_.store(openXr_.LastResult(), std::memory_order_release);
+        if (quitting) {
+            using Event = openxr::OpenXrContext::EventResult;
+            if (eventResult == Event::QuitEnded) {
+                gameQuit_.Complete(GameQuit::Result::Ended);
+                return false;
+            }
+            if (eventResult == Event::SessionLost || eventResult == Event::InstanceLost) {
+                gameQuit_.Complete(GameQuit::Result::RuntimeLost);
+                log_.Write("[VR][runtime] GAME_QUIT runtime-lost");
+                return false;
+            }
+            if (eventResult != Event::Healthy) {
+                // An End failure or EXITING without a confirmed End must not
+                // become a fabricated success. The window deadline still runs.
+                return false;
+            }
+        }
         if (eventResult == openxr::OpenXrContext::EventResult::SessionExiting) {
             openXr_.Coordinator().FreezeNewWaits();
             ticketPrepared_ = false;
@@ -1409,6 +1557,35 @@ bool VrRuntime::ProcessUnityEvents() noexcept {
             return false;
         }
     }
+    const std::uint64_t runGeneration = openXr_.SessionRunGeneration();
+    if (runGeneration != observedRunGeneration_) {
+        confirmedMirrorLayout_.store(0, std::memory_order_release);
+        poseMailbox_.Invalidate(
+            runGeneration,
+            static_cast<std::int32_t>(openXr_.ActiveReferenceSpaceType()));
+        stereoRenderMailbox_.Invalidate();
+        ReleasePointerDrag();
+        ResetThumbstickScroll("session-generation");
+        observedRunGeneration_ = runGeneration;
+        currentRunPoseReady_ = false;
+        currentRunDisplayReady_ = false;
+        currentRunInputReady_ = false;
+        activePointerHand_ = 1;
+        inputMirrorLayoutGeneration_ = 0;
+        inputLayoutReady_ = false;
+        inputLayoutMismatchLogged_ = false;
+        inputLayoutPendingLogged_ = false;
+        ticketPrepared_ = false;
+        ticketBegun_ = false;
+        ticketSubmitted_ = false;
+        prepareTicket_ = {};
+        input::ClearUnityPointerLease();
+        SetState(VrRuntimeState::SessionRunning);
+        log_.Write(
+            "[VR][pose] FRAME_LOOP_STARTED generation=" +
+            std::to_string(runGeneration));
+    }
+
     return true;
 }
 
@@ -1426,6 +1603,7 @@ void VrRuntime::OnUnityWaitPhase() noexcept {
         State() == VrRuntimeState::Disabled) {
         return;
     }
+    if (!sessionPublished_.load(std::memory_order_acquire)) return;
     // Session events may destroy spaces/swapchains. Defer them during End;
     // the graphics gate always pumps them once the callback is idle.
     if (endDispatch_.WaitForIdle(std::chrono::milliseconds(0)) && !ProcessUnityEvents()) {
@@ -1729,9 +1907,11 @@ bool VrRuntime::EnsureD3D11Hooks() {
 
 bool VrRuntime::WaitOrStop(std::chrono::milliseconds timeout) {
     std::unique_lock lock(waitMutex_);
-    return stopChanged_.wait_for(lock, timeout, [&] {
-        return stopRequested_.load(std::memory_order_acquire);
+    stopChanged_.wait_for(lock, timeout, [&] {
+        return stopRequested_.load(std::memory_order_acquire) ||
+            gameQuitRequested_.load(std::memory_order_acquire);
     });
+    return stopRequested_.load(std::memory_order_acquire);
 }
 
 void VrRuntime::SetState(VrRuntimeState state) {

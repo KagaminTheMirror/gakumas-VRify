@@ -71,7 +71,7 @@ gakumas-local/localizationConfig.json
 gakumas-vr/config.json
 ```
 
-The installer merges existing settings and keeps VR configuration separate from Localify. The release package contains only the two DLLs, three JSON configuration files, and a `version.txt` in each of `gakumas-local/` and `gakumas-vr/`. The Localify marker contains the pinned upstream PLUGIN_VERSION (currently `v3.4.1`); the VR marker contains GAKUMAS_VR_VERSION (currently `v1.1.1`). Each file contains only its version, without BOM or newline. The five-file development installer does not copy these release markers. License sources are listed in `THIRD_PARTY_NOTICES.md`; licenses, build information and checksum files are not included in the release ZIP. Game assets and translation datasets are not part of this source repository.
+The installer merges existing settings and keeps VR configuration separate from Localify. The release package contains only the two DLLs, three JSON configuration files, and a `version.txt` in each of `gakumas-local/` and `gakumas-vr/`. The Localify marker contains the pinned upstream PLUGIN_VERSION (currently `v3.4.1`); the VR marker contains GAKUMAS_VR_VERSION (currently `v1.1.2`). Each file contains only its version, without BOM or newline. The five-file development installer does not copy these release markers. License sources are listed in `THIRD_PARTY_NOTICES.md`; licenses, build information and checksum files are not included in the release ZIP. Game assets and translation datasets are not part of this source repository.
 
 Ordinary installs disable VR diagnostic file logging. To collect a diagnostic log:
 

@@ -51,6 +51,8 @@ public:
 
     enum class EventResult {
         Healthy,
+        QuitEnded,
+        QuitEndFailed,
         SessionExiting,
         SessionLost,
         InstanceLost,
@@ -142,6 +144,7 @@ public:
         bool requestClose = false;
         bool requestRenderScale = false;
         bool requestQuit = false;
+        bool requestQuitLocalize = false;
         float renderScale = 0.0F;
     };
 
@@ -156,6 +159,7 @@ public:
         VrLog& log);
     using AaMenuShutdownFn = void (*)() noexcept;
     using AaMenuFlushFn = void (*)(VrLog& log);
+    using GameQuitFn = void (*)(bool fromLocalize) noexcept;
 
     // Panel-adjust overlay: one texture shared by two quads (adjust bar strip
     // on top, head-locked hint/toast strip below). Painted by VrAaMenu's
@@ -245,7 +249,7 @@ public:
         bool stereoLandscapeOnly,
         float stereoRenderScale,
         VrLog& log);
-    [[nodiscard]] EventResult DrainEvents(VrLog& log);
+    [[nodiscard]] EventResult DrainEvents(VrLog& log, bool quitting = false);
     [[nodiscard]] FrameResult RunFrame(
         StereoFrame& frame,
         ID3D11Texture2D* sourceFrame,
@@ -322,6 +326,7 @@ public:
         AaMenuPaintFn paint,
         AaMenuShutdownFn shutdown,
         AaMenuFlushFn flush) noexcept;
+    void SetGameQuitHook(GameQuitFn quit) noexcept;
     void SetPanelOverlayHooks(PanelOverlayPaintFn paint) noexcept;
 
 private:
@@ -617,6 +622,7 @@ private:
     AaMenuPaintFn aaMenuPainter_ = nullptr;
     AaMenuShutdownFn aaMenuShutdown_ = nullptr;
     AaMenuFlushFn aaMenuFlush_ = nullptr;
+    GameQuitFn gameQuit_ = nullptr;
     std::atomic<bool> mirrorInputStateInitialized_{false};
     std::atomic<bool> lastMirrorInputEnabled_{true};
     bool mirrorCopySuspended_ = false;

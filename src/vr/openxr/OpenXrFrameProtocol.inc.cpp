@@ -445,8 +445,8 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
                 graphics.copy += 1;
                 if (stereoSubmissionCount_ <= 4U ||
                     stereoSubmissionCount_ % 300U == 0U) {
-                    std::ostringstream projectionTiming;
-                    projectionTiming << "[VR][stereo] PROJECTION_TIMING samples="
+                    std::ostringstream projectionLog;
+                    projectionLog << "[VR][stereo] PROJECTION_TIMING samples="
                            << stereoSubmissionCount_
                            << " frameId=" << ticket.frameId
                            << " generation=" << stereoFrame->generation
@@ -465,7 +465,7 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
                                   frame.predictedDisplayTime -
                                   stereoFrame->trackingSample.predictedDisplayTime) /
                                   1'000'000.0;
-                    log.Write(projectionTiming.str());
+                    log.Write(projectionLog.str());
                 }
             }
         } else if (stereoSceneEligible) {

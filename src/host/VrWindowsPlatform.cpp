@@ -546,6 +546,31 @@ namespace GakumasLocal::WinHooks {
         std::function<void(int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD)> mKeyBoardCallBack = nullptr;
 
         WNDPROC g_pfnOldWndProc = NULL;
+        // Owned exclusively by the Unity window thread. A thread timer obtains
+        // a system-assigned ID, so it cannot replace one of Unity's HWND timers.
+        HWND g_quitWindow = nullptr;
+        UINT_PTR g_quitTimer = 0;
+        WPARAM g_quitWParam = 0;
+        LPARAM g_quitLParam = 0;
+        bool g_quitForwarded = false;
+
+        void ForwardGameClose() {
+            if (g_quitForwarded || g_quitWindow == nullptr) return;
+            if (g_quitTimer != 0) KillTimer(nullptr, g_quitTimer);
+            g_quitTimer = 0;
+            g_quitForwarded = true;
+            auto& runtime = gakumas::vr::VrRuntime::Instance();
+            const auto result = runtime.PollGameQuit();
+            runtime.WriteVrLog(std::string("[VR][runtime] GAME_QUIT_FORWARD reason=") +
+                gakumas::vr::GameQuitResultName(result.result));
+            CallWindowProc(g_pfnOldWndProc, g_quitWindow, WM_CLOSE, g_quitWParam, g_quitLParam);
+        }
+
+        void CALLBACK GameQuitTimer(HWND, UINT, UINT_PTR timer, DWORD) {
+            if (timer != g_quitTimer || g_quitWindow == nullptr) return;
+            if (gakumas::vr::VrRuntime::Instance().PollGameQuit().CanClose()) ForwardGameClose();
+        }
+
         LRESULT CALLBACK WndProcCallback(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             DWORD SHIFT_key = 0;
             DWORD CTRL_key = 0;
@@ -655,6 +680,31 @@ namespace GakumasLocal::WinHooks {
                 // SCCamera::onKillFocus();
                 return FALSE;
             }; break;
+            case WM_CLOSE: {
+                if (g_quitForwarded || g_quitWindow != nullptr) return 0;
+                g_quitWindow = hWnd;
+                g_quitWParam = wParam;
+                g_quitLParam = lParam;
+                gakumas::vr::RequestGameQuit(
+                    gakumas::vr::GameQuitSource::WindowClose);
+                auto& runtime = gakumas::vr::VrRuntime::Instance();
+                if (!runtime.PollGameQuit().CanClose()) {
+                    g_quitTimer = SetTimer(nullptr, 0, 20, GameQuitTimer);
+                    if (g_quitTimer != 0) return 0;
+                    runtime.WriteVrLog("[VR][runtime] GAME_QUIT_TIMER failed error=" +
+                        std::to_string(GetLastError()));
+                    runtime.GameQuitTimerFailed();
+                }
+                ForwardGameClose();
+                return 0;
+            }
+            case WM_NCDESTROY: {
+                if (hWnd == g_quitWindow) {
+                    if (g_quitTimer != 0) KillTimer(nullptr, g_quitTimer);
+                    g_quitTimer = 0;
+                    g_quitWindow = nullptr;
+                }
+            }; break;
             case WM_NCHITTEST:
             {
                 if (GakumasLocal::Config::dmmUnlockSize) {
@@ -731,6 +781,11 @@ namespace GakumasLocal::WinHooks {
             }
 
             HWND hWnd = FindWindowW(L"UnityWndClass", L"gakumas");
+            if (hWnd != nullptr) {
+                DWORD processId = 0;
+                GetWindowThreadProcessId(hWnd, &processId);
+                if (processId != GetCurrentProcessId()) hWnd = nullptr;
+            }
             if (!hWnd) {
                 const auto currentProcessId = GetCurrentProcessId();
                 HWND candidate = nullptr;
@@ -775,4 +830,10 @@ namespace GakumasLocal::WinHooks {
 
     }
 
+}
+
+// Existing native harness cannot run Unity bootstrap. Exercise the real window
+// hook on its own UnityWndClass window through an explicit test seam.
+extern "C" __declspec(dllexport) void GakumasVrInstallQuitHookForTest() noexcept {
+    GakumasLocal::WinHooks::Keyboard::InstallWndProcHook();
 }

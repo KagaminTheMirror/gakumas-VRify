@@ -38,9 +38,34 @@ std::string g_useAPITextureAssetsURL = "https://texture.gakumas.cn/api/gkms_text
 
 namespace
 {
+	BOOL WINAPI GameQuitConsoleHandler(DWORD controlType)
+	{
+		switch (controlType) {
+		case CTRL_C_EVENT:
+		case CTRL_BREAK_EVENT:
+			gakumas::vr::RequestGameQuit(gakumas::vr::GameQuitSource::Console);
+			return TRUE;
+		case CTRL_CLOSE_EVENT:
+		case CTRL_LOGOFF_EVENT:
+		case CTRL_SHUTDOWN_EVENT:
+			gakumas::vr::RequestGameQuit(gakumas::vr::GameQuitSource::Console);
+			// Returning (even TRUE) lets Windows terminate this process immediately.
+			// Keep this dedicated control thread alive while the Unity window thread
+			// runs the existing 2-second XR quit gate and normal game teardown.
+			// Do not poll CanClose here: XR completion only admits WM_CLOSE; it does
+			// not mean Unity has finished exiting. Windows may impose a shorter cap.
+			Sleep(4500);
+			return TRUE;
+		default:
+			break;
+		}
+		return FALSE;
+	}
+
 	void create_debug_console()
 	{
 		AllocConsole();
+		SetConsoleCtrlHandler(GameQuitConsoleHandler, TRUE);
 
 		// open stdout stream
 		auto _ = freopen("CONOUT$", "w+t", stdout);
@@ -220,6 +245,16 @@ extern "C" __declspec(dllexport) void GakumasVrPumpApplicationFrameForTest() noe
 extern "C" __declspec(dllexport) void GakumasVrStopRuntimeForTest() noexcept
 {
 	gakumas::vr::StopVrRuntime();
+}
+
+extern "C" __declspec(dllexport) void GakumasVrRequestQuitForTest(int source) noexcept
+{
+    if (source == 3) {
+        GameQuitConsoleHandler(CTRL_CLOSE_EVENT);
+        return;
+    }
+    gakumas::vr::RequestGameQuit(source == 1 ? gakumas::vr::GameQuitSource::Menu :
+        gakumas::vr::GameQuitSource::Localize);
 }
 
 extern "C" __declspec(dllexport) int GakumasVrPrepareApplicationFrameForTest() noexcept

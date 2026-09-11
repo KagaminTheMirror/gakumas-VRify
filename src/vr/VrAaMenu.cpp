@@ -814,8 +814,10 @@ bool PaintVrAaMenu(
     ImGui::SetWindowFontScale(1.0F);
     const float restoreWidth = ActionWidth(ts("vr_menu_restore_defaults"));
     const float closeWidth = ActionWidth(ts("vr_aa_close"));
+    const float quitWidth = ActionWidth(ts("vr_menu_quit"));
     ImGui::SetCursorPos(ImVec2(
-        ImGui::GetContentRegionMax().x - restoreWidth - closeWidth - 12.0F,
+        ImGui::GetContentRegionMax().x - restoreWidth - closeWidth - quitWidth -
+            24.0F,
         headerY));
     if (ImGui::Button(ts("vr_menu_restore_defaults"), ImVec2(restoreWidth, 54.0F))) {
         ImGui::OpenPopup("##vr_restore_confirm");
@@ -823,6 +825,10 @@ bool PaintVrAaMenu(
     ImGui::SameLine();
     if (ImGui::Button(ts("vr_aa_close"), ImVec2(closeWidth, 54.0F))) {
         output.requestClose = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(ts("vr_menu_quit"), ImVec2(quitWidth, 54.0F))) {
+        ImGui::OpenPopup("##vr_quit_confirm");
     }
 
     ImGui::SetCursorPosY(headerY + 54.0F + 8.0F);
@@ -1425,6 +1431,29 @@ bool PaintVrAaMenu(
         if (ImGui::Button(ts("vr_menu_quit_now"), ImVec2(quitWidth, 54.0F))) {
             log.Write("[VR][menu] localize restart quit");
             output.requestQuit = true;
+            output.requestQuitLocalize = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(620.0F, 0.0F), ImGuiCond_Always);
+    if (ImGui::BeginPopupModal(
+            "##vr_quit_confirm",
+            nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoMove)) {
+        ImGui::TextWrapped("%s", ts("vr_menu_quit_confirm"));
+        ImGui::Spacing();
+        const float confirmWidth = ActionWidth(ts("ok"));
+        const float cancelWidth = ActionWidth(ts("cancel"));
+        if (ImGui::Button(ts("ok"), ImVec2(confirmWidth, 54.0F))) {
+            log.Write("[VR][menu] game quit confirmed");
+            output.requestQuit = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ts("cancel"), ImVec2(cancelWidth, 54.0F))) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

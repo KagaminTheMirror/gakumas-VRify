@@ -3,6 +3,7 @@
 #include "input/PointerGesture.hpp"
 
 #include "HookRegistrar.hpp"
+#include "GameQuit.hpp"
 #include "VrCameraInputMailbox.hpp"
 #include "VrLog.hpp"
 #include "d3d11/D3D11Capture.hpp"
@@ -39,6 +40,13 @@ enum class VrRuntimeState {
     Stopped,
 };
 
+enum class GameQuitSource {
+    Menu,
+    Localize,
+    WindowClose,
+    Console,
+};
+
 struct VrRuntimeConfig {
     // Safe default: core/config integration must opt into the runtime explicitly.
     bool enabled = false;
@@ -72,6 +80,11 @@ public:
     // means the worker was started; PoseReady is reported asynchronously.
     bool Start(VrRuntimeConfig config, HookRegistrar registrar);
     void Stop() noexcept;
+    // Menu/localize enqueue WM_CLOSE; the window starts the bounded handshake.
+    // No Stop(), worker join, or process termination on this path.
+    void RequestGameQuit(GameQuitSource source) noexcept;
+    [[nodiscard]] GameQuit::Snapshot PollGameQuit() noexcept;
+    void GameQuitTimerFailed() noexcept;
 
     [[nodiscard]] VrRuntimeState State() const noexcept;
     [[nodiscard]] XrResult LastOpenXrResult() const noexcept;
@@ -127,6 +140,7 @@ private:
     void PublishStereoTargetSpecChange();
     bool EnsureD3D11Hooks();
     bool WaitOrStop(std::chrono::milliseconds timeout);
+    void PumpGameQuit() noexcept;
     void SetState(VrRuntimeState state);
     void Fault(std::string_view reason);
     static std::filesystem::path ResolveApplicationDirectory();
@@ -136,6 +150,17 @@ private:
     HookRegistrar registrar_;
     std::thread worker_;
     std::atomic<bool> stopRequested_{false};
+    std::atomic<bool> gameQuitRequested_{false};
+    std::atomic<bool> gameQuitClosePosted_{false};
+    GameQuit gameQuit_;
+    // Session publication, events and teardown share this lock. Never hold it
+    // across xrWaitFrame or a graphics callback wait.
+    std::mutex xrLifecycleMutex_;
+    std::atomic<bool> sessionPublished_{false};
+    std::atomic<bool> sessionRunningSnapshot_{false};
+    std::atomic<bool> sessionRestartExit_{false};
+    std::atomic<openxr::OpenXrContext::EventResult> sessionEventSnapshot_{
+        openxr::OpenXrContext::EventResult::Healthy};
     std::atomic<VrRuntimeState> state_{VrRuntimeState::Disabled};
     std::atomic<XrResult> lastOpenXrResult_{XR_SUCCESS};
     std::mutex waitMutex_;
@@ -212,6 +237,10 @@ inline bool StartVrRuntime(VrRuntimeConfig config, HookRegistrar registrar) {
 
 inline void StopVrRuntime() noexcept {
     VrRuntime::Instance().Stop();
+}
+
+inline void RequestGameQuit(GameQuitSource source) noexcept {
+    VrRuntime::Instance().RequestGameQuit(source);
 }
 
 inline bool WriteVrLog(std::string_view message) noexcept {

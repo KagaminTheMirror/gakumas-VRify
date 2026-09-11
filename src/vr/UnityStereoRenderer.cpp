@@ -3597,6 +3597,7 @@ void UnityStereoRenderer::PublishGripTransparency() noexcept {
 // Defined later in this translation unit.
 std::string ManagedObjectName(void* object) noexcept;
 std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept;
+std::vector<void*> FindGripPlateGraphics(UnityResolve::Class* klass) noexcept;
 
 // One short batch, not a cross-frame/scene cache. A positive lookup discards
 // the index before its caller can mutate UI or invoke game callbacks.
@@ -4980,7 +4981,7 @@ void UnityStereoRenderer::ApplyGripPlateHide() noexcept {
     // "Background" RawImage, and the ADV wrappers' opaque black "Viewport"
     // Image under ViewportRoot (.236 hardware: hiding Background alone left
     // the vertical dialogue ADV black).
-    for (void* graphic : FindManagedObjectsOfType(graphicClass)) {
+    for (void* graphic : FindGripPlateGraphics(graphicClass)) {
         if (graphic == nullptr || !IsUnityManagedObjectAlive(graphic)) {
             continue;
         }
@@ -7824,6 +7825,53 @@ std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept
         }
     }
     return objects;
+}
+
+// Plate matching and restore are independent per Graphic, not first-match or
+// InstanceID ordered. Keep every other typed discovery on its original path.
+std::vector<void*> FindGripPlateGraphics(UnityResolve::Class* klass) noexcept {
+    if (!klass || !GakumasLocal::Config::vrRuntimeStartupEnabled)
+        return FindManagedObjectsOfType(klass);
+    static auto* find = ResolveStrictMethod(
+        "UnityEngine.CoreModule.dll", "UnityEngine", "Object", "FindObjectsByType",
+        true, "UnityEngine.Object[]", {"System.Type", "UnityEngine.FindObjectsInactive",
+            "UnityEngine.FindObjectsSortMode"});
+    const auto report = [](const char* path) {
+        if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) return;
+        static thread_local std::string last;
+        if (last == path) return;
+        last = path;
+        WriteVrLog("[VR][perf] GRAPHIC_QUERY_PATH " + last);
+    };
+    if (find) {
+        void* type = klass->GetType();
+        int inactive = 0; // live dump: Exclude; disabled components on active objects remain included.
+        int sort = 0; // live dump: None.
+        void* args[]{type, &inactive, &sort};
+        void* result = nullptr;
+        void* exception = nullptr;
+        perf::SrpSpan query(tickTrace, "tick.grip.graphic-unsorted",
+            reinterpret_cast<std::uintptr_t>(klass->address));
+        query.Describe("tick.grip.graphic-unsorted", -1);
+        const bool ok = type && RuntimeInvokeRaw(find->address, nullptr, args, &result, &exception) &&
+            !exception && result;
+        if (ok) {
+            auto objects = static_cast<UnityResolve::UnityType::Array<void*>*>(result)->ToVector();
+            query.Describe("tick.grip.graphic-unsorted", static_cast<int>(objects.size()));
+            query.Stop();
+            if (!objects.empty()) {
+                report("path=public-unsorted inactive=exclude scope=grip-plates");
+                return objects;
+            }
+        }
+        query.Stop();
+        report(ok ? "path=legacy reason=empty-preserve-all-fallback" : "path=legacy reason=invoke-failed");
+    } else {
+        report("path=legacy reason=exact-api-unavailable");
+    }
+    // Preserve active-first/all-on-empty semantics, including legacy fallback
+    // to assets/inactive objects. Never turn a failed query into false absence.
+    return FindManagedObjectsOfType(klass);
 }
 
 // Only the batch-local MonoBehaviour presence inventory uses this unsorted path.
@@ -16549,6 +16597,7 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
         // "impossible" pattern of counters rising while their log lines
         // vanished, resuming instantly in scene-ineligible windows).
         const bool alwaysKeep =
+            message.find("GAME_QUIT") != std::string_view::npos ||
             message.find("PERF_TIMING") != std::string_view::npos ||
             message.find("SRP_PERF_") != std::string_view::npos ||
             message.find("TICK_PERF_") != std::string_view::npos ||
@@ -16643,6 +16692,7 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             message.find("DISCOVERY_INVENTORY_PATH") != std::string_view::npos ||
             message.find("DISCOVERY_NATIVE_BINDING") != std::string_view::npos ||
             message.find("DISCOVERY_TYPED_CLASS") != std::string_view::npos ||
+            message.find("GRAPHIC_QUERY_PATH") != std::string_view::npos ||
             message.find("SUBMIT_FAILED") != std::string_view::npos ||
             message.find("SUBMIT_DEFERRED") != std::string_view::npos ||
             message.find("STEREO_GPU_") != std::string_view::npos ||

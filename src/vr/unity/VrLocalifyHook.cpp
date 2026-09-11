@@ -3511,10 +3511,12 @@ namespace GakumasLocal::HookMain {
         gakumas::vr::perf::SrpSpan after(srpPerformance, "mod.pass-after");
 #ifdef GKMS_WINDOWS
         if (Config::vrDiagnosticsStartupEnabled) {
+            gakumas::vr::perf::SrpSpan trace(srpPerformance, "mod.pass-after.grip-trace");
             gakumas::vr::GripTracePass(self, renderPass, context,
                 ReadEyeRenderPassEvent(renderPass), true);
         }
         try {
+            gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.pass-after.temporal-observe");
             gakumas::vr::ObserveSmaaT2xRenderPass(
                 renderPass,
                 context,

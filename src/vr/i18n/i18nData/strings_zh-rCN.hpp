@@ -47,6 +47,8 @@ namespace I18nData {
         { "vr_menu_localize_restart", "本地化设置已保存，重新启动后才会生效。请退出游戏，然后再次手动启动。游戏不会自动重开。" },
         { "vr_menu_later", "稍后" },
         { "vr_menu_quit_now", "立即退出" },
+        { "vr_menu_quit", "退出游戏" },
+        { "vr_menu_quit_confirm", "确定退出游戏？" },
         { "vr_menu_language", "菜单语言" },
         { "vr_menu_language_system", "跟随系统" },
         { "vr_menu_language_zh_cn", "简体中文" },

@@ -3442,9 +3442,8 @@ bool OpenXrContext::RenderMenuFrame(
         }
         log.Write("[VR][ui] STEREO_AA_MENU visible=0 gesture=menu-close");
     }
-    if (output.requestQuit) {
-        log.Write("[VR][menu] process exit requested");
-        TerminateProcess(GetCurrentProcess(), 0);
+    if (output.requestQuit && gameQuit_ != nullptr) {
+        gameQuit_(output.requestQuitLocalize);
     }
     if (!painted) {
         ++menuPaintFailures_;
@@ -3819,7 +3818,7 @@ void OpenXrContext::OverlayPointerCursors(
     }
 }
 
-OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
+OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log, bool quitting) {
     if (instance_ == XR_NULL_HANDLE || dispatch_.PollEvent() == nullptr) {
         lastResult_ = XR_ERROR_HANDLE_INVALID;
         return EventResult::Failed;
@@ -3891,6 +3890,7 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                     std::to_string(static_cast<int>(stateChanged.state)));
 
                 if (stateChanged.state == XR_SESSION_STATE_READY && !sessionRunning_) {
+                    if (quitting) return EventResult::QuitEnded;
                     if (dispatch_.BeginSession() == nullptr) {
                         lastResult_ = XR_ERROR_FUNCTION_UNSUPPORTED;
                         log.Write("[VR][runtime] xrBeginSession is unavailable");
@@ -3920,6 +3920,10 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                 }
 
                 if (stateChanged.state == XR_SESSION_STATE_STOPPING && sessionRunning_) {
+                    if (quitting) {
+                        coordinator_.FreezeNewWaits();
+                        log.Write("[VR][runtime] GAME_QUIT_STOPPING");
+                    }
                     if (dispatch_.EndSession() == nullptr) {
                         lastResult_ = XR_ERROR_FUNCTION_UNSUPPORTED;
                         log.Write("[VR][runtime] xrEndSession is unavailable");
@@ -3939,6 +3943,12 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                         // arrives for a graphics rebuild. Treat call-order
                         // failure as an orderly exit so the worker can rebuild
                         // instead of faulting the whole runtime.
+                        if (quitting) {
+                            log.Write("[VR][runtime] GAME_QUIT_END failed");
+                            const auto classified = ClassifyEventResult(lastResult_);
+                            return classified == EventResult::Failed ?
+                                EventResult::QuitEndFailed : classified;
+                        }
                         if (lastResult_ == XR_ERROR_CALL_ORDER_INVALID) {
                             lastResult_ = XR_SUCCESS;
                             return EventResult::SessionExiting;
@@ -3946,6 +3956,10 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log) {
                         return ClassifyEventResult(lastResult_);
                     }
                     log.Write("[VR][runtime] xrEndSession succeeded");
+                    if (quitting) {
+                        log.Write("[VR][runtime] GAME_QUIT_END succeeded");
+                        return EventResult::QuitEnded;
+                    }
                 }
 
                 if (stateChanged.state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -4434,6 +4448,10 @@ void OpenXrContext::SetAaMenuHooks(
     aaMenuPainter_ = paint;
     aaMenuShutdown_ = shutdown;
     aaMenuFlush_ = flush;
+}
+
+void OpenXrContext::SetGameQuitHook(GameQuitFn quit) noexcept {
+    gameQuit_ = quit;
 }
 
 void OpenXrContext::SetPanelOverlayHooks(PanelOverlayPaintFn paint) noexcept {

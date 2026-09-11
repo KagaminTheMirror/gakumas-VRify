@@ -47,6 +47,8 @@ namespace I18nData {
         { "vr_menu_localize_restart", "ローカライズ設定を保存しました。反映するには、ゲームを終了してから、もう一度手動で起動してください。自動では再起動しません。" },
         { "vr_menu_later", "あとで" },
         { "vr_menu_quit_now", "すぐに終了" },
+        { "vr_menu_quit", "ゲームを終了" },
+        { "vr_menu_quit_confirm", "ゲームを終了しますか？" },
         { "vr_menu_language", "メニュー言語" },
         { "vr_menu_language_system", "システムに従う" },
         { "vr_menu_language_zh_cn", "简体中文" },
