@@ -563,6 +563,7 @@ namespace GakumasLocal::WinHooks {
             const auto result = runtime.PollGameQuit();
             runtime.WriteVrLog(std::string("[VR][runtime] GAME_QUIT_FORWARD reason=") +
                 gakumas::vr::GameQuitResultName(result.result));
+            gakumas::vr::StopVrRuntime();
             CallWindowProc(g_pfnOldWndProc, g_quitWindow, WM_CLOSE, g_quitWParam, g_quitLParam);
         }
 
