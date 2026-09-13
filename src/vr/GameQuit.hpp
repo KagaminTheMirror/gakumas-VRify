@@ -6,6 +6,8 @@
 namespace gakumas::vr {
 
 // No XR or window calls under this lock. The clock is supplied by the caller.
+// The deadline bounds the XR exit handshake, not synchronous runtime cleanup
+// or host process shutdown. CanClose() admits that cleanup before WM_CLOSE.
 class GameQuit final {
 public:
     using Clock = std::chrono::steady_clock;

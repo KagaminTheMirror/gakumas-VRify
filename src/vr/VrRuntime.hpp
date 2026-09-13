@@ -80,8 +80,10 @@ public:
     // means the worker was started; PoseReady is reported asynchronously.
     bool Start(VrRuntimeConfig config, HookRegistrar registrar);
     void Stop() noexcept;
-    // Menu/localize enqueue WM_CLOSE; the window starts the bounded handshake.
-    // No Stop(), worker join, or process termination on this path.
+    // Menu/localize enqueue WM_CLOSE; the window starts the XR exit handshake.
+    // RequestGameQuit() does not stop or join the worker. The two-second
+    // deadline bounds only the handshake; the window then synchronously stops
+    // and joins the worker before forwarding WM_CLOSE to Unity.
     void RequestGameQuit(GameQuitSource source) noexcept;
     [[nodiscard]] GameQuit::Snapshot PollGameQuit() noexcept;
     void GameQuitTimerFailed() noexcept;
