@@ -38,6 +38,8 @@ using Il2CppGCHandle = void*;
 
 constexpr std::uint32_t kDiscoverInterval = 120;
 constexpr std::uint32_t kMaxListLines = 24;
+// Official Crowd size class scales only local XY. Put the requested 1.15x on
+// the hand-matrix 3x3 so rod and star stay uniformly scaled.
 constexpr float kHandScaleMultiplier = 1.15F;
 // ~1.5 frames at 40 Hz Live: enough to hide swing stepping without a rubber
 // band. First sample and large jumps snap. Advance once per hand revision.
@@ -297,6 +299,9 @@ struct GlowState {
     void* colorTableInstance = nullptr;
     UnityColor stickyColor{0.0F, 0.0F, 0.0F, 0.0F};
     int stickySlot = -1;
+    int stickySubmesh = -1;
+    int liveShapeCount = 1;
+    bool mobShapeCensusLogged = false;
     std::vector<MobSource> mobSources{};
     bool useColorProjection = false;
     void* penlightController = nullptr;
@@ -3208,7 +3213,11 @@ void LogPalettePick(const char* rule, int uniqueIndex) noexcept {
     line << "[VR][stereo] HAND_GLOW pick n=" << g_state.colorTable.size()
          << " unique=" << g_state.uniqueColors.size()
          << " " << token
-         << " both=" << g_state.stickySlot;
+         << " both=" << g_state.stickySlot
+         << " shape=" << g_state.stickySubmesh
+         << " type="
+         << (g_state.stickySubmesh >= 0 ? g_state.stickySubmesh + 1 : 0)
+         << " shapes=" << (g_state.liveShapeCount > 0 ? g_state.liveShapeCount : 1);
     if (uniqueIndex >= 0 &&
         uniqueIndex < static_cast<int>(g_state.uniqueColors.size())) {
         const auto& unique =
@@ -3227,9 +3236,27 @@ void LogPalettePick(const char* rule, int uniqueIndex) noexcept {
     LogHandGlow(line.str());
 }
 
+int LiveShapeCount() noexcept {
+    return g_state.liveShapeCount > 0 ? g_state.liveShapeCount : 1;
+}
+
+void ChooseStickyShape() noexcept {
+    const int count = LiveShapeCount();
+    if (g_state.stickySubmesh >= 0 && g_state.stickySubmesh < count) {
+        return;
+    }
+    if (count <= 1) {
+        g_state.stickySubmesh = 0;
+        return;
+    }
+    g_state.stickySubmesh = static_cast<int>(
+        GetTickCount64() % static_cast<unsigned long long>(count));
+}
+
 void ChooseSticky(bool log, const char* forcedRule) noexcept {
     if (g_state.uniqueColors.empty()) {
         g_state.stickySlot = -1;
+        g_state.stickySubmesh = -1;
         g_state.paletteReady = false;
         if (log) {
             LogHandGlow("[VR][stereo] HAND_GLOW pick unique=0 rule=none");
@@ -3237,10 +3264,18 @@ void ChooseSticky(bool log, const char* forcedRule) noexcept {
         return;
     }
     const int previousSlot = g_state.stickySlot;
-    int uniqueIndex = g_state.stickySlot >= 0
-        ? FindUniqueIndex(g_state.stickyColor)
-        : -1;
+    const int previousShape = g_state.stickySubmesh;
+    int uniqueIndex = -1;
     const char* rule = "keep";
+    // Official audience keeps ColorTableIndex while Timeline rewrites RGB.
+    if (previousSlot >= 0 &&
+        static_cast<std::size_t>(previousSlot) < g_state.colorTable.size()) {
+        uniqueIndex = FindUniqueIndex(
+            g_state.colorTable[static_cast<std::size_t>(previousSlot)]);
+    }
+    if (uniqueIndex < 0 && previousSlot >= 0) {
+        uniqueIndex = FindUniqueIndex(g_state.stickyColor);
+    }
     if (uniqueIndex < 0) {
         if (g_state.uniqueColors.size() == 1U) {
             uniqueIndex = 0;
@@ -3256,12 +3291,58 @@ void ChooseSticky(bool log, const char* forcedRule) noexcept {
     }
     const auto& unique =
         g_state.uniqueColors[static_cast<std::size_t>(uniqueIndex)];
-    g_state.stickySlot = unique.firstSlot;
-    g_state.stickyColor = unique.color;
+    if (std::strcmp(rule, "keep") == 0 && previousSlot >= 0 &&
+        static_cast<std::size_t>(previousSlot) < g_state.colorTable.size()) {
+        g_state.stickySlot = previousSlot;
+        g_state.stickyColor =
+            g_state.colorTable[static_cast<std::size_t>(previousSlot)];
+    } else {
+        g_state.stickySlot = unique.firstSlot;
+        g_state.stickyColor = unique.color;
+    }
+    ChooseStickyShape();
     g_state.paletteReady = true;
-    if (log || g_state.stickySlot != previousSlot) {
+    if (log || g_state.stickySlot != previousSlot ||
+        g_state.stickySubmesh != previousShape) {
         LogPalettePick(rule, uniqueIndex);
     }
+}
+
+void CycleSticky() noexcept {
+    if (g_state.uniqueColors.empty()) {
+        g_state.stickySlot = -1;
+        g_state.stickySubmesh = -1;
+        g_state.paletteReady = false;
+        LogPalettePick("none", -1);
+        return;
+    }
+    const int uniqueCount = static_cast<int>(g_state.uniqueColors.size());
+    const int shapeCount = LiveShapeCount();
+    if (uniqueCount * shapeCount < 2) {
+        ChooseSticky(true, "only");
+        return;
+    }
+    int current = FindUniqueIndex(g_state.stickyColor);
+    if (current < 0) {
+        current = 0;
+    }
+    int shape = g_state.stickySubmesh;
+    if (shape < 0 || shape >= shapeCount) {
+        shape = 0;
+    }
+    int nextUnique = current + 1;
+    int nextShape = shape;
+    if (nextUnique >= uniqueCount) {
+        nextUnique = 0;
+        nextShape = (shape + 1) % shapeCount;
+    }
+    const auto& unique =
+        g_state.uniqueColors[static_cast<std::size_t>(nextUnique)];
+    g_state.stickySlot = unique.firstSlot;
+    g_state.stickyColor = unique.color;
+    g_state.stickySubmesh = nextShape;
+    g_state.paletteReady = true;
+    LogPalettePick("cycle", nextUnique);
 }
 
 int SlotForHand(std::size_t) noexcept {
@@ -3278,21 +3359,7 @@ void RequestCycleHandGlowColor() noexcept {
         ClearAudienceColors("cycle-scene-not-ready");
         return;
     }
-    if (g_state.uniqueColors.size() < 2U) {
-        ChooseSticky(true, g_state.uniqueColors.empty() ? "none" : "only");
-        return;
-    }
-    int current = FindUniqueIndex(g_state.stickyColor);
-    if (current < 0) {
-        current = 0;
-    }
-    const int next =
-        (current + 1) % static_cast<int>(g_state.uniqueColors.size());
-    const auto& unique = g_state.uniqueColors[static_cast<std::size_t>(next)];
-    g_state.stickySlot = unique.firstSlot;
-    g_state.stickyColor = unique.color;
-    g_state.paletteReady = true;
-    LogPalettePick("cycle", next);
+    CycleSticky();
 }
 
 void* MaterialForColorIndex(int colorIndex) noexcept {
@@ -3341,6 +3408,9 @@ void ClearAudienceColors(const char* reason) noexcept {
     g_state.colorSourceManagedOnly = false;
     g_state.lastColorReadMs = 0;
     g_state.stickySlot = -1;
+    g_state.stickySubmesh = -1;
+    g_state.liveShapeCount = 1;
+    g_state.mobShapeCensusLogged = false;
     g_state.stickyColor = UnityColor(0.0F, 0.0F, 0.0F, 0.0F);
     g_state.paletteReady = false;
 }
@@ -3410,6 +3480,11 @@ bool RefreshCurrentCrowdColors(void* crowdSystem) noexcept {
     g_state.colorTableClass = klass;
     g_state.colorSourceManagedOnly =
         klass == FindCampusClass("Campus.AudiencePenlight", "DefaultAudiencePenlight");
+    if (changed) {
+        g_state.stickySlot = -1;
+        g_state.stickySubmesh = -1;
+        g_state.stickyColor = UnityColor(0.0F, 0.0F, 0.0F, 0.0F);
+    }
     ComputePalette();
     ChooseSticky(changed, nullptr);
     if (changed) {
@@ -3418,8 +3493,30 @@ bool RefreshCurrentCrowdColors(void* crowdSystem) noexcept {
              << crowdSystem << " audience=" << audience
              << " type=" << ManagedClassName(audience);
         auto* getter = FindNamedInstance(klass, "get_ColorTable", 0U);
-        line << " getter=" << getter->function
-             << " methodInfo=" << getter->address;
+        if (getter != nullptr) {
+            line << " getter=" << getter->function
+                 << " methodInfo=" << getter->address;
+        } else {
+            line << " getter=0";
+        }
+        auto* mixer = FindCampusClass(
+            "Campus.AudiencePenlight",
+            "AudiencePenlightTimelineMixerBehaviour");
+        auto* prepare = FindNamedInstance(mixer, "PrepareFrame", 2U);
+        line << " mixer-prepare=";
+        if (prepare != nullptr) {
+            line << prepare->function << " methodInfo=" << prepare->address;
+            if (prepare->args.size() >= 2U &&
+                prepare->args[0] != nullptr &&
+                prepare->args[0]->pType != nullptr &&
+                prepare->args[1] != nullptr &&
+                prepare->args[1]->pType != nullptr) {
+                line << " args=" << prepare->args[0]->pType->name << ","
+                     << prepare->args[1]->pType->name;
+            }
+        } else {
+            line << "0";
+        }
         LogHandGlow(line.str());
     }
     return true;
@@ -3552,6 +3649,9 @@ void ClearOfficialAssets() noexcept {
     g_state.colorTableInstance = nullptr;
     g_state.stickyColor = UnityColor(0.0F, 0.0F, 0.0F, 0.0F);
     g_state.stickySlot = -1;
+    g_state.stickySubmesh = -1;
+    g_state.liveShapeCount = 1;
+    g_state.mobShapeCensusLogged = false;
     g_state.paletteReady = false;
     g_state.penlightController = nullptr;
     g_state.registeredSetting = nullptr;
@@ -3597,6 +3697,76 @@ void* ApplyDrawableAssets(
     }
     static_cast<void>(SetLayer(gameObject, g_state.sourceLayer));
     return renderer;
+}
+
+void AuditMobPenlightMeshes() noexcept {
+    if (g_state.mobShapeCensusLogged || !EnsureApi()) {
+        return;
+    }
+    g_state.mobShapeCensusLogged = true;
+    auto* controllerClass = FindCampusClass(
+        "Campus.MobAudience", "MobAudiencePenlightController");
+    if (controllerClass == nullptr) {
+        LogHandGlow("[VR][stereo] HAND_GLOW mob-shape census controllers=0");
+        return;
+    }
+    const auto controllers = FindAllOfClass(controllerClass);
+    int liveControllers = 0;
+    int listed = 0;
+    for (void* controller : controllers) {
+        if (controller == nullptr || !IsUnityManagedObjectAlive(controller)) {
+            continue;
+        }
+        ++liveControllers;
+        void* settings = ReadNamedRef(controller, "penlightSettings");
+        if (settings == nullptr) {
+            continue;
+        }
+        auto settingItems =
+            reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(settings)
+                ->ToVector();
+        for (void* setting : settingItems) {
+            if (setting == nullptr || listed >= 8) {
+                continue;
+            }
+            void* renderers = ReadNamedRef(setting, "PenlightRenderers");
+            if (renderers == nullptr) {
+                continue;
+            }
+            auto rendererItems =
+                reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(
+                    renderers)
+                    ->ToVector();
+            for (void* renderer : rendererItems) {
+                if (renderer == nullptr ||
+                    !IsUnityManagedObjectAlive(renderer) || listed >= 8) {
+                    continue;
+                }
+                void* sourceObject = GetGameObject(renderer);
+                void* filter = GetComponent(
+                    sourceObject, g_state.api.meshFilterClass);
+                void* mesh = GetSharedMesh(filter);
+                void* material = GetSharedMaterial(renderer);
+                UnityVector3 meshSize{};
+                if (mesh != nullptr && IsUnityManagedObjectAlive(mesh)) {
+                    static_cast<void>(GetMeshSize(mesh, &meshSize));
+                }
+                auto line = ClassicLine();
+                line << "[VR][stereo] HAND_GLOW mob-shape mesh="
+                     << ManagedObjectName(mesh)
+                     << " size=" << meshSize.x << "," << meshSize.y << ","
+                     << meshSize.z
+                     << " shader="
+                     << ManagedObjectName(GetShader(material));
+                LogHandGlow(line.str());
+                ++listed;
+            }
+        }
+    }
+    auto summary = ClassicLine();
+    summary << "[VR][stereo] HAND_GLOW mob-shape census controllers="
+            << liveControllers << " listed=" << listed;
+    LogHandGlow(summary.str());
 }
 
 bool CrowdAuditAlreadySeen(void* crowdSystem, void* penlightSystem) noexcept {
@@ -3727,6 +3897,7 @@ void AuditCrowdRenderSystem(void* crowdSystem, int eventType) noexcept {
             index < instanceBuffers.size() ? instanceBuffers[index] : nullptr);
         LogHandGlow(line.str());
     }
+    AuditMobPenlightMeshes();
 }
 
 bool CrowdGraphicsBufferValid(void* buffer) noexcept {
@@ -3880,6 +4051,19 @@ UnityMatrix4x4 IdentityCrowdMatrix() noexcept {
     return matrix;
 }
 
+void ApplyUniformHandScale(UnityMatrix4x4* matrix) noexcept {
+    auto* values = reinterpret_cast<float*>(matrix);
+    values[0] *= kHandScaleMultiplier;
+    values[1] *= kHandScaleMultiplier;
+    values[2] *= kHandScaleMultiplier;
+    values[4] *= kHandScaleMultiplier;
+    values[5] *= kHandScaleMultiplier;
+    values[6] *= kHandScaleMultiplier;
+    values[8] *= kHandScaleMultiplier;
+    values[9] *= kHandScaleMultiplier;
+    values[10] *= kHandScaleMultiplier;
+}
+
 UnityMatrix4x4 CrowdPoseMatrix(const pose::Pose& pose) noexcept {
     const auto& orientation = pose.orientation;
     const float lengthSquared = orientation.x * orientation.x +
@@ -3888,6 +4072,7 @@ UnityMatrix4x4 CrowdPoseMatrix(const pose::Pose& pose) noexcept {
     if (!std::isfinite(lengthSquared) || lengthSquared < 1.0e-8F) {
         UnityMatrix4x4 matrix = IdentityCrowdMatrix();
         auto* values = reinterpret_cast<float*>(&matrix);
+        ApplyUniformHandScale(&matrix);
         values[12] = pose.position.x;
         values[13] = pose.position.y;
         values[14] = pose.position.z;
@@ -3928,6 +4113,7 @@ UnityMatrix4x4 CrowdPoseMatrix(const pose::Pose& pose) noexcept {
     values[13] = pose.position.y;
     values[14] = pose.position.z;
     values[15] = 1.0F;
+    ApplyUniformHandScale(&matrix);
     return matrix;
 }
 
@@ -4244,17 +4430,6 @@ void DrawControllerSticksThroughCrowd(
         LogCrowdDrawFailure("api-or-private-resource");
         return;
     }
-    if (!RefreshCurrentCrowdColors(crowdSystem)) {
-        LogCrowdDrawFailure("color-table");
-        return;
-    }
-    float intensity = 0.0F;
-    if (!ReadCrowdSystemIntensity(crowdSystem, &intensity) ||
-        intensity <= 0.0F) {
-        LogCrowdDrawFailure("live-intensity");
-        return;
-    }
-
     void* penlightSystem =
         ReadNamedRef(crowdSystem, "_penlightMeshRenderSystem");
     void* meshData = ReadNamedRef(penlightSystem, "_meshData");
@@ -4273,6 +4448,29 @@ void DrawControllerSticksThroughCrowd(
         LogCrowdDrawFailure("live-submesh");
         return;
     }
+    g_state.liveShapeCount = static_cast<int>(subMeshItems.size());
+
+    if (!RefreshCurrentCrowdColors(crowdSystem)) {
+        LogCrowdDrawFailure("color-table");
+        return;
+    }
+    float intensity = 0.0F;
+    if (!ReadCrowdSystemIntensity(crowdSystem, &intensity) ||
+        intensity <= 0.0F) {
+        LogCrowdDrawFailure("live-intensity");
+        return;
+    }
+    if (g_state.stickySubmesh < 0 ||
+        g_state.stickySubmesh >= g_state.liveShapeCount) {
+        ChooseSticky(true, nullptr);
+    }
+    if (g_state.stickySubmesh < 0 ||
+        g_state.stickySubmesh >= g_state.liveShapeCount) {
+        LogCrowdDrawFailure("sticky-shape");
+        return;
+    }
+    const std::size_t selected =
+        static_cast<std::size_t>(g_state.stickySubmesh);
 
     auto& resources = g_state.crowdDrawResources;
     auto* personWords = reinterpret_cast<
@@ -4311,6 +4509,8 @@ void DrawControllerSticksThroughCrowd(
         std::clamp(intensity * 0.25F, 0.0F, 1.0F) * 1023.0F);
     const std::uint32_t colorSlot =
         static_cast<std::uint32_t>((std::max)(0, g_state.stickySlot)) & 7U;
+    const std::uint32_t penlightType =
+        static_cast<std::uint32_t>(selected + 1U) & 7U;
     int compactIndex = 0;
     for (std::size_t hand = 0; hand < g_state.crowdHandPoses.size(); ++hand) {
         if (!g_state.crowdHandPoseValid[hand]) {
@@ -4319,7 +4519,9 @@ void DrawControllerSticksThroughCrowd(
         const auto& pose = g_state.crowdHandPoses[hand];
         const unsigned int personOffset =
             static_cast<unsigned int>(compactIndex * 4);
-        personWords->At(personOffset + 0U) = intensityBits << 5U;
+        // Official CrowdCompute.UpdatePerson packs type in flags bits 20..22.
+        personWords->At(personOffset + 0U) =
+            (intensityBits << 5U) | (penlightType << 20U);
         personWords->At(personOffset + 1U) = 0U;
         personWords->At(personOffset + 2U) = 1000U << 16U;
         // High/low uint16 decode to the identity XZ root basis
@@ -4328,47 +4530,41 @@ void DrawControllerSticksThroughCrowd(
         matrices->At(static_cast<unsigned int>(compactIndex)) =
             CrowdPoseMatrix(pose);
         // person[0..14], hand matrix[15..18], fan selector 0[19..21],
-        // exact ColorTable slot[22..24], size class 1[25..27].
+        // exact ColorTable slot[22..24], size class 0[25..27]. Uniform 1.15x
+        // lives on the hand-matrix 3x3, not the XY-only size class.
         instanceWords->At(static_cast<unsigned int>(compactIndex)) =
             static_cast<std::uint32_t>(compactIndex) |
             (static_cast<std::uint32_t>(compactIndex) << 15U) |
-            (colorSlot << 22U) | (1U << 25U);
+            (colorSlot << 22U);
         ++compactIndex;
     }
 
-    std::vector<void*> drawMaterials{};
-    drawMaterials.reserve(subMeshItems.size());
-    for (std::size_t submesh = 0; submesh < subMeshItems.size(); ++submesh) {
-        void* sourceMaterial =
-            ReadNamedRef(subMeshItems[submesh], "material");
-        void* material = GetPrivateCrowdMaterial(sourceMaterial);
-        if (material == nullptr) {
-            LogCrowdDrawFailure("live-material");
-            return;
-        }
-        std::uint32_t indexCount = 0U;
-        std::uint32_t indexStart = 0U;
-        std::uint32_t baseVertex = 0U;
-        if (!ReadCrowdMeshDrawArgs(
-                renderMesh,
-                static_cast<int>(submesh),
-                &indexCount,
-                &indexStart,
-                &baseVertex) ||
-            indexCount == 0U) {
-            LogCrowdDrawFailure("mesh-args");
-            return;
-        }
-        const unsigned int argsOffset =
-            static_cast<unsigned int>(submesh * 5U);
-        argsWords->At(argsOffset + 0U) = indexCount;
-        argsWords->At(argsOffset + 1U) =
-            static_cast<std::uint32_t>(compactIndex);
-        argsWords->At(argsOffset + 2U) = indexStart;
-        argsWords->At(argsOffset + 3U) = baseVertex;
-        argsWords->At(argsOffset + 4U) = 0U;
-        drawMaterials.push_back(material);
+    // Official Render draws one submesh per person: _TargetPenlightType =
+    // submeshIndex+1. Hands used to clone/draw every submesh, stacking shapes.
+    void* sourceMaterial = ReadNamedRef(subMeshItems[selected], "material");
+    void* material = GetPrivateCrowdMaterial(sourceMaterial);
+    if (material == nullptr) {
+        LogCrowdDrawFailure("live-material");
+        return;
     }
+    std::uint32_t indexCount = 0U;
+    std::uint32_t indexStart = 0U;
+    std::uint32_t baseVertex = 0U;
+    if (!ReadCrowdMeshDrawArgs(
+            renderMesh,
+            static_cast<int>(selected),
+            &indexCount,
+            &indexStart,
+            &baseVertex) ||
+        indexCount == 0U) {
+        LogCrowdDrawFailure("mesh-args");
+        return;
+    }
+    argsWords->At(0U) = indexCount;
+    argsWords->At(1U) = static_cast<std::uint32_t>(compactIndex);
+    argsWords->At(2U) = indexStart;
+    argsWords->At(3U) = baseVertex;
+    argsWords->At(4U) = 0U;
 
     auto& api = g_state.crowdDrawApi;
     const UnityVector4 boundingMin(0.0F, 0.0F, 0.0F, 0.0F);
@@ -4398,20 +4594,16 @@ void DrawControllerSticksThroughCrowd(
     using DrawFn = void (*)(
         void*, void*, int, void*, int, void*, int, void*, void*);
     const int shaderPass = eventType == 0 ? 2 : 1;
-    bool drew = true;
-    for (std::size_t submesh = 0; submesh < drawMaterials.size(); ++submesh) {
-        drew = InvokeManagedVoid<DrawFn>(
-                   api.commandDrawMeshInstancedIndirect,
-                   commandBuffer,
-                   renderMesh,
-                   static_cast<int>(submesh),
-                   drawMaterials[submesh],
-                   shaderPass,
-                   resources.argsBuffer,
-                   static_cast<int>(submesh * 20U),
-                   resources.propertyBlock) &&
-            drew;
-    }
+    const bool drew = InvokeManagedVoid<DrawFn>(
+        api.commandDrawMeshInstancedIndirect,
+        commandBuffer,
+        renderMesh,
+        static_cast<int>(selected),
+        material,
+        shaderPass,
+        resources.argsBuffer,
+        0,
+        resources.propertyBlock);
     if (!drew) {
         LogCrowdDrawFailure("draw-call");
         return;
@@ -4442,6 +4634,8 @@ void DrawControllerSticksThroughCrowd(
               << " selectedType=" << ManagedClassName(g_state.colorTableInstance)
               << " sameSource=" << (audience == g_state.colorTableInstance)
               << " slot=" << colorSlot
+              << " shape=" << selected
+              << " type=" << penlightType
               << " unique=" << g_state.uniqueColors.size()
               << " intensity=" << intensity;
         // Persist the resolved live entry alongside the values. This is a
@@ -4466,16 +4660,19 @@ void DrawControllerSticksThroughCrowd(
              << " event=" << (eventType == 0 ? "PreDepth" : "GBuffer")
              << " system=" << crowdSystem
              << " mesh=" << ManagedObjectName(renderMesh)
-             << " material=" << ManagedObjectName(drawMaterials.front())
-             << " shader=" << ManagedObjectName(GetShader(drawMaterials.front()))
-             << " submeshes=" << drawMaterials.size()
+             << " material=" << ManagedObjectName(material)
+             << " shader=" << ManagedObjectName(GetShader(material))
+             << " submeshes=" << subMeshItems.size()
+             << " shape=" << selected
+             << " penlightType=" << penlightType
              << " pass=" << shaderPass
              << " instances=" << compactIndex
              << " colorSlot=" << colorSlot
              << " intensity=" << intensity
              << " poseRevision=" << g_state.crowdAppliedHandRevision
              << " position=hand-matrix-f32"
-             << " sizeClass=1";
+             << " sizeClass=0"
+             << " matrixScale=" << kHandScaleMultiplier;
         LogHandGlow(line.str());
     }
 }

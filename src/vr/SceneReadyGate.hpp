@@ -46,6 +46,9 @@ void SampleSceneReady(
     bool sourcePresent) noexcept;
 void NoteSceneReadyIdentityChanged(const char* where) noexcept;
 void NoteSceneReadySourceCameraChanged() noexcept;
+// Only after the renderer proves old-scene unload and a loaded destination.
+// Require a fresh source/left/right proof even without a loading UI epoch.
+void BeginSceneReadyRecoveryValidation() noexcept;
 void NoteSceneReadyCameraBoundary(const char* role, bool begin) noexcept;
 
 [[nodiscard]] bool SceneReadyAllowsStereoPublish() noexcept;

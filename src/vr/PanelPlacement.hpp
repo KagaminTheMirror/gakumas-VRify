@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pose/PoseMath.hpp"
+#include "pose/PoseSmoother.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,53 @@
 // the head. The quad orientation is always derived from the offset so the
 // panel faces the viewer roll-free.
 namespace gakumas::vr::panel {
+
+// Overlay-only follow in STAGE/LOCAL; never filter the projection camera.
+// Display timestamps make the response independent of the headset refresh rate.
+struct FollowSmoother {
+    pose::PoseSmoother filter{};
+    double lastSeconds = 0.0;
+    void Reset() noexcept { filter.Reset(); lastSeconds = 0.0; }
+    pose::Pose Update(const pose::Pose& target, double seconds) noexcept {
+        const double elapsed = seconds - lastSeconds;
+        if (elapsed <= 0.0 || elapsed > 0.25) filter.Reset();
+        lastSeconds = seconds;
+        // A soft dead zone holds still against natural head tremor. Outside
+        // the zone only the excess follows, avoiding a jump at the boundary.
+        pose::Pose gated = target;
+        if (filter.initialized) {
+            const auto& current = filter.pose;
+            const float dx = target.position.x - current.position.x;
+            const float dy = target.position.y - current.position.y;
+            const float dz = target.position.z - current.position.z;
+            const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+            constexpr float deadMetres = 0.025F;
+            const float fraction = distance > deadMetres ? 1.0F - deadMetres / distance : 0.0F;
+            gated.position = {current.position.x + dx*fraction,
+                current.position.y + dy*fraction, current.position.z + dz*fraction};
+            const auto& a = current.orientation;
+            const auto& b = target.orientation;
+            const float dot = std::clamp(std::abs(a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w), 0.0F, 1.0F);
+            const float angle = 2.0F * std::acos(dot);
+            constexpr float deadRadians = 2.0F * 3.14159265F / 180.0F;
+            gated.orientation = pose::Nlerp(a, b,
+                angle > deadRadians ? 1.0F - deadRadians / angle : 0.0F);
+            // Preserve immediate recovery after tracking/recenter jumps.
+            if (distance >= 1.0F || dot < 0.5F) gated = target;
+        }
+        pose::Pose result = target;
+        filter.Filter(gated, static_cast<float>(elapsed), 0.10F, 1.0F, 0.5F, result);
+        return result;
+    }
+};
+
+[[nodiscard]] inline pose::Pose PoseInBaseSpace(
+    const pose::Pose& head, const pose::Pose& relative) noexcept {
+    const auto offset = pose::Rotate(head.orientation, relative.position);
+    return {{head.position.x + offset.x, head.position.y + offset.y,
+             head.position.z + offset.z},
+            pose::Multiply(head.orientation, relative.orientation)};
+}
 
 // stereo.221 hardware: 1.5 m dead ahead reads as a slight upward glance and
 // tires the eyes; a bit more distance drops the angular height. This pair

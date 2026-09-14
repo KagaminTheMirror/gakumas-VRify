@@ -6443,9 +6443,11 @@ namespace GakumasLocal::HookMain {
         static bool fieldMissLogged = false;
         if (humanBodyBoneMap_field == nullptr && !fieldMissLogged) {
             fieldMissLogged = true;
-            static_cast<void>(gakumas::vr::WriteVrLog(
-                "[VR][camera] FREECAM_BONES_FIELD_MISSING "
-                "_humanBodyBoneMap not found; skipping readiness gate"));
+            if (AreVrUnityCameraDiagnosticsEnabled()) {
+                static_cast<void>(gakumas::vr::WriteVrLog(
+                    "[VR][camera] FREECAM_BONES_FIELD_MISSING "
+                    "_humanBodyBoneMap not found; skipping readiness gate"));
+            }
         }
         const bool bonesReady = humanBodyBoneMap_field
             ? Il2cppUtils::ClassGetFieldValue<void*>(
@@ -6486,23 +6488,25 @@ namespace GakumasLocal::HookMain {
 
             // 1 Hz probe: proves on hardware whether this hook runs in a
             // scene at all and which indices exist vs the follow target.
-            static std::int64_t lastProbeNanoseconds = 0;
-            if (nowNs - lastProbeNanoseconds > 1'000'000'000LL) {
-                lastProbeNanoseconds = nowNs;
-                int seen[kVrCameraSeenActorCapacity];
-                const std::size_t seenCount =
-                    CollectFreshVrCameraActorIndices(nowNs, seen);
-                std::ostringstream stream;
-                stream << "[VR][camera] FREECAM_ANCHOR_PROBE follow="
-                       << GKCamera::followCharaIndex
-                       << " anchorFresh=" << (IsVrCameraAnchorFresh(nowNs) ? 1 : 0)
-                       << " seen=";
-                for (std::size_t i = 0; i < seenCount; ++i) {
-                    if (i > 0) stream << ',';
-                    stream << seen[i];
+            if (AreVrUnityCameraDiagnosticsEnabled()) {
+                static std::int64_t lastProbeNanoseconds = 0;
+                if (nowNs - lastProbeNanoseconds > 1'000'000'000LL) {
+                    lastProbeNanoseconds = nowNs;
+                    int seen[kVrCameraSeenActorCapacity];
+                    const std::size_t seenCount =
+                        CollectFreshVrCameraActorIndices(nowNs, seen);
+                    std::ostringstream stream;
+                    stream << "[VR][camera] FREECAM_ANCHOR_PROBE follow="
+                           << GKCamera::followCharaIndex
+                           << " anchorFresh=" << (IsVrCameraAnchorFresh(nowNs) ? 1 : 0)
+                           << " seen=";
+                    for (std::size_t i = 0; i < seenCount; ++i) {
+                        if (i > 0) stream << ',';
+                        stream << seen[i];
+                    }
+                    if (seenCount == 0) stream << '-';
+                    static_cast<void>(gakumas::vr::WriteVrLog(stream.str()));
                 }
-                if (seenCount == 0) stream << '-';
-                static_cast<void>(gakumas::vr::WriteVrLog(stream.str()));
             }
         }
 
@@ -6519,7 +6523,7 @@ namespace GakumasLocal::HookMain {
             // InitializeBones fills it, so gate the query on that field.
             if (!bonesReady) {
                 cacheTrans = nullptr;
-                if (vrBoneAnchorWanted) {
+                if (vrBoneAnchorWanted && AreVrUnityCameraDiagnosticsEnabled()) {
                     static std::int64_t lastNotReadyNanoseconds = 0;
                     const std::int64_t nowNs =
                         gakumas::vr::pose::MonotonicNowNanoseconds();
@@ -6588,7 +6592,7 @@ namespace GakumasLocal::HookMain {
             }
             else {
                 cacheTrans = nullptr;
-                if (vrBoneAnchorWanted) {
+                if (vrBoneAnchorWanted && AreVrUnityCameraDiagnosticsEnabled()) {
                     // Matched index but no bone: distinct failure signature
                     // (rate-limited) so a Live where the hook runs yet the
                     // bone lookup fails is distinguishable from a dead index.

@@ -1611,9 +1611,8 @@ void OpenXrContext::SyncPointerInput(
             rayDirection,
             pointer.u,
             pointer.v);
-        const pose::Pose menuPose{{0.0F, 0.0F, kMenuPlaneZ}, {}};
         pointer.menuHovering = panel::RayQuadUv(
-            menuPose,
+            menuPoseView_,
             kMenuWidthMetres,
             kMenuHeightMetres,
             rayOrigin,
@@ -2135,6 +2134,25 @@ void OpenXrContext::UpdatePanelPlacementFrame(XrTime displayTime, VrLog& log) {
         panelPoseUsesBase_ = false;
     }
 
+    // Smooth the submitted world-space overlays, then re-express the same
+    // poses for ray hits. A VIEW-locked layer would bypass this at composition.
+    menuPoseView_ = {{0.0F, 0.0F, kMenuPlaneZ}, {}};
+    menuPoseUsesBase_ = headPoseBaseValid_;
+    if (headPoseBaseValid_) {
+        const double seconds = static_cast<double>(displayTime) * 1.0e-9;
+        const auto target = panelPoseUsesBase_ ? panelPoseBase_
+            : panel::PoseInBaseSpace(headPoseBase_, panelPoseView_);
+        panelPoseBase_ = panelFollow_.Update(target, seconds);
+        panelPoseView_ = panel::PoseInViewSpace(headPoseBase_, panelPoseBase_);
+        panelPoseUsesBase_ = true;
+        menuPoseBase_ = menuFollow_.Update(
+            panel::PoseInBaseSpace(headPoseBase_, menuPoseView_), seconds);
+        menuPoseView_ = panel::PoseInViewSpace(headPoseBase_, menuPoseBase_);
+    } else {
+        panelFollow_.Reset();
+        menuFollow_.Reset();
+    }
+
     barQuadWidth_ = panelQuadWidth_ * kPanelBarWidthRatio;
     barQuadHeight_ = barQuadWidth_ *
         static_cast<float>(kPanelOverlayBarHeight) /
@@ -2174,7 +2192,7 @@ void OpenXrContext::UpdatePanelAdjustInteractions(
         }
     }
 
-    const bool editBase = panelPoseUsesBase_ && headPoseBaseValid_;
+    const bool editBase = panelPlacement_.pinned && panelPinnedAnchorValid_ && headPoseBaseValid_;
     // Pinned edits keep the captured orientation in sync with the offset so
     // the panel keeps facing the user exactly as displayed while editing.
     const auto syncPinnedFromBase = [&]() {
@@ -4177,6 +4195,9 @@ void OpenXrContext::ResetInputSession() noexcept {
     panelBarPointerHand_ = 1;
     panelPinnedAnchorValid_ = false;
     headPoseBaseValid_ = false;
+    panelFollow_.Reset();
+    menuFollow_.Reset();
+    menuPoseUsesBase_ = false;
     panelToastKind_ = 0;
     panelToastUntil_ = 0;
     photoResultPendingUntil_ = 0;

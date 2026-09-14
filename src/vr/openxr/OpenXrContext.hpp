@@ -446,6 +446,8 @@ private:
         int panelToastKind = 0;
         std::array<bool, 2> gripHeld{};
         bool panelPoseUsesBase = false;
+        bool menuPoseUsesBase = false;
+        pose::Pose menuPose{};
         pose::Pose panelPoseView{};
         pose::Pose panelPoseBase{};
         pose::Pose barPoseView{};
@@ -582,6 +584,11 @@ private:
     // Per-frame derived state (UpdatePanelPlacementFrame).
     pose::Pose headPoseBase_{};
     bool headPoseBaseValid_ = false;
+    panel::FollowSmoother panelFollow_{};
+    panel::FollowSmoother menuFollow_{};
+    bool menuPoseUsesBase_ = false;
+    pose::Pose menuPoseBase_{};
+    pose::Pose menuPoseView_{{0.0F, 0.0F, -1.05F}, {}};
     pose::Pose panelPoseView_{
         {0.0F, 0.0F, -panel::kDefaultPanelDistanceMetres}, {}};
     pose::Pose panelPoseBase_{};

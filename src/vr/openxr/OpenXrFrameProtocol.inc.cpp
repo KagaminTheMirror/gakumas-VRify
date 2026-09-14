@@ -14,6 +14,8 @@ void OpenXrContext::FreezeGpuSubmitSnapshot(FrameWork& work) noexcept {
     gpu.panelToastKind = panelToastKind_;
     gpu.gripHeld = gripHeld_;
     gpu.panelPoseUsesBase = panelPoseUsesBase_;
+    gpu.menuPoseUsesBase = menuPoseUsesBase_;
+    gpu.menuPose = menuPoseUsesBase_ ? menuPoseBase_ : menuPoseView_;
     gpu.panelPoseView = panelPoseView_;
     gpu.panelPoseBase = panelPoseBase_;
     gpu.barPoseView = barPoseView_;
@@ -262,6 +264,10 @@ OpenXrContext::FrameResult OpenXrContext::WaitAndPrepare(
     const bool waitHeadValid = tracking.valid && tracking.viewCount == 2U &&
         pose::TryCenterStereoPose(
             {tracking.eyes[0].pose, tracking.eyes[1].pose}, waitHeadCenter);
+    if (frame.referenceSpaceChanged) {
+        panelFollow_.Reset();
+        menuFollow_.Reset();
+    }
     UpdatePanelPlacementFrame(frameState.predictedDisplayTime, log);
     SyncPointerInput(
         frame.pointers,
@@ -602,13 +608,13 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
     layers.hint.pose = ToXrPose(gpu.hintPoseView);
     layers.hint.size.width = static_cast<float>(hintWidthPx) * kHintMetresPerPixel;
     layers.hint.size.height = static_cast<float>(hintHeightPx) * kHintMetresPerPixel;
-    layers.menu.space = viewSpace_;
+    layers.menu.space = gpu.menuPoseUsesBase
+        ? (stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_) : viewSpace_;
     layers.menu.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     layers.menu.subImage.swapchain = menuSwapchain_;
     layers.menu.subImage.imageRect.extent.width = static_cast<int32_t>(menuWidth_);
     layers.menu.subImage.imageRect.extent.height = static_cast<int32_t>(menuHeight_);
-    layers.menu.pose.orientation.w = 1.0F;
-    layers.menu.pose.position.z = kMenuPlaneZ;
+    layers.menu.pose = ToXrPose(gpu.menuPose);
     layers.menu.size.width = kMenuWidthMetres;
     layers.menu.size.height = kMenuHeightMetres;
     layers.projection.space = stageSpace_ != XR_NULL_HANDLE ? stageSpace_ : localSpace_;

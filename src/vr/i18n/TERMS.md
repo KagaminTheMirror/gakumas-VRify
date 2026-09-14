@@ -17,7 +17,7 @@
 | free camera                        | 自由相机                    | 自由相機                    | フリーカメラ                  | 模组自由机位模式                                      |
 | FOLLOW                             | 跟随                      | 跟隨                      | フォロー                    | 锚在骨骼上的环绕跟随                                    |
 | first person                       | 第一人称                    | 第一人稱                    | 一人称                     |                                               |
-| render scale                       | 渲染尺度                    | 渲染尺度                    | レンダースケール                | 双眼缓冲的分辨率倍率                                    |
+| render scale                       | 渲染尺度                    | 算繪比例                    | レンダースケール                | 双眼缓冲的分辨率倍率                                    |
 | stereo / both eyes                 | 双眼                      | 雙眼                      | 両眼                      | 左右眼成对                                         |
 | eye buffers                        | 双眼缓冲                    | 雙眼緩衝                    | 両眼バッファ                  | 左右眼的渲染目标                                      |
 | Grip（键）                            | Grip                    | Grip                    | Grip                    | 控制器 Grip 键                                    |
@@ -35,7 +35,7 @@
 | anti-aliasing inherit              | 跟随游戏默认设置                | 跟隨遊戲預設                  | ゲームの初期設定に従う            | 眼睛抗锯齿跟源相机走                                    |
 | TAA / SMAA / SMAA T2x / TSCMAA     | （原文）                    | （原文）                    | （原文）                    | 模式名即专名                                        |
 | TAA Quality 档位                     | Very Low … Very High    | Very Low … Very High    | Very Low … Very High    | URP 枚举名                                       |
-| Jitter Scale / Frame Influence     | （原文）                    | （原文）                    | （原文）                    | 菜单仅暴露 TAA 实际消费的字段；Quality 保持 Low          |
+| Jitter Scale / Frame Influence     | （原文）                    | （原文）                    | （原文）                    | 菜单暴露 TAA 品质与实际消费字段；默认 Quality 为 Low          |
 | outline                            | 角色描边                    | 角色描邊                    | キャラのアウトライン              |                                               |
 | VL paraffin                        | VL paraffin             | VL paraffin             | VL パラフィン                | VL 全屏半透明形状                                    |
 | VLTextureBlur                      | VLTextureBlur           | VLTextureBlur           | VLTextureBlur           | 全屏模糊贴图                                        |
@@ -62,3 +62,7 @@
 | authored                           | 官方                      | 官方                      | 本編                      | 游戏官方数值 / 观感                                   |
 
 
+
+菜单翻译开关：启用翻译 / 啟用翻譯 / 翻訳を有効にする / Enable translation。
+繁中 threshold 使用「臨界值」，frame / frame rate 使用「影格 / 影格率」。
+Toon 参照的玩家／头显位置是看向角色的观察起点，不是注视目标。

@@ -9060,6 +9060,7 @@ void UnityStereoRenderer::RefreshSceneIdentity(const char* where) noexcept {
             gotHandle = true;
         }
     }
+    activeSceneHandleKnown_ = gotHandle && handle != 0;
     if (!gotCount && !gotHandle) {
         return;
     }
@@ -14267,6 +14268,8 @@ bool UnityStereoRenderer::ArmCurrentStage(
     }
     const std::size_t count = ExpectedCameraCount();
     const bool full = stage_ == LadderStage::StereoFull;
+    // Bind faults to the scene whose resources/validation this arm uses.
+    attemptedSceneHandle_ = activeSceneHandleKnown_ ? activeSceneHandle_ : 0;
     verboseFrameLog_ = !full || !continuousStereo_ || publishedFrames_ < 2U ||
         (publishedFrames_ + 1U) % 300U == 0U;
     if (full && (targetSpec.width == 0U || targetSpec.height == 0U ||
@@ -14574,6 +14577,19 @@ void UnityStereoRenderer::Tick(
         DropCmovParticleCache("release-requested");
         return;
     }
+    if (stage_ == LadderStage::Failed) {
+        // Keep readiness following the selected Cinemachine output even while
+        // the eye ladder is latched. This must precede the terminal return.
+        if (latestSourceCamera_ != sourceCamera) {
+            latestSourceCamera_ = sourceCamera;
+            latestSourceUniversalData_ = nullptr;
+            NoteSceneReadySourceCameraChanged();
+        }
+        ServiceFailedScene();
+        if (!TryRecoverFailedScene(sourcePresent)) {
+            return;
+        }
+    }
     if (!sourcePresent) {
         ApplySceneIneligible();
         return;
@@ -14583,7 +14599,7 @@ void UnityStereoRenderer::Tick(
     // while the official content-complete state is false. Restore the source
     // heartbeat and park Stage C once; content-ready later re-arms it once for
     // the source/left/right proof frame.
-    if (stage_ == LadderStage::StereoFull &&
+    if ((stage_ == LadderStage::StereoFull || sceneRecoveryValidation_) &&
         !SceneReadyAllowsStereoRender()) {
         if (stageArmed_ && !decisionPending_) {
             QueueStageDecision(false, "scene-ready-park");
@@ -14633,6 +14649,9 @@ void UnityStereoRenderer::Tick(
         return;
     }
     perf::SrpSpan sourceBoundaryTiming(tickTrace, "tick.source-boundary");
+    if (!stageArmed_ && !decisionPending_ && !publishPending_) {
+        attemptedSceneHandle_ = activeSceneHandleKnown_ ? activeSceneHandle_ : 0;
+    }
     failureStage_ = nullptr;
     if (!EnsureManagedApi()) {
         return;
@@ -15591,7 +15610,7 @@ void UnityStereoRenderer::ConsumeStageDecisionAtSafePoint() noexcept {
             Log("[VR][scene-ready] SCENE_READY_PARK eyes=off source=restored");
         }
         if (!resumable) {
-            stage_ = LadderStage::Failed;
+            (void)FailStage(decisionReason_);
         }
         return;
     }
@@ -16169,6 +16188,7 @@ void UnityStereoRenderer::ApplyPendingGpuFailure() noexcept {
 }
 
 bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
+    std::lock_guard execution(gpuExecutionMutex_);
     PendingStereoGpuPublish work{};
     {
         std::lock_guard lock(pendingGpuMutex_);
@@ -16481,6 +16501,15 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
         stageContextEpoch_ = 0;
     }
     RefreshSceneIdentity("render-loop");
+    if (stage_ == LadderStage::Failed) {
+        ServiceFailedScene();
+        return;
+    }
+    if (sceneRecoveryValidation_ && publishedFrames_ != 0U) {
+        sceneRecoveryValidation_ = false;
+        Log("[VR][stereo] SCENE_FAILURE_RECOVERED scene=" +
+            std::to_string(attemptedSceneHandle_));
+    }
     if (!stereoEligible) {
         ApplySceneIneligible();
     } else if (EyeArmHeld() && stageArmed_ && !decisionPending_) {
@@ -16505,7 +16534,7 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
 
 void UnityStereoRenderer::AdvanceStage(bool passed) noexcept {
     if (!passed) {
-        stage_ = LadderStage::Failed;
+        (void)FailStage("stage-validation");
         return;
     }
     const LadderStage previous = stage_;
@@ -16557,6 +16586,226 @@ bool UnityStereoRenderer::IsOwnerThread() noexcept {
     return false;
 }
 
+void UnityStereoRenderer::EnsureFailureRecoveryApi() noexcept {
+    if (failureRecoveryApiAttempted_) return;
+    failureRecoveryApiAttempted_ = true;
+    // These Scene methods are also used by the existing virtual-camera census.
+    // Resolve exact live signatures and log them before invoking any entry.
+    const auto bind = [this](const char* ns, const char* type, const char* name,
+                             const char* result,
+                             std::initializer_list<std::string_view> args) {
+        auto* method = ResolveStrictMethod("UnityEngine.CoreModule.dll", ns,
+            type, name, true, result, args);
+        Log(std::string("[VR][stereo] SCENE_FAILURE_API ") +
+            (method != nullptr ? MethodSignature(method) : std::string(name) + " unavailable"));
+        return MethodReference(method);
+    };
+    recoverySceneIsValid_ = bind("UnityEngine.SceneManagement", "Scene",
+        "IsValidInternal", "System.Boolean", {"System.Int32"});
+    recoverySceneIsLoaded_ = bind("UnityEngine.SceneManagement", "Scene",
+        "GetIsLoadedInternal", "System.Boolean", {"System.Int32"});
+    recoveryDestroy_ = bind("UnityEngine", "Object", "Destroy",
+        "System.Void", {"UnityEngine.Object"});
+}
+
+bool UnityStereoRenderer::ReadSceneFlag(
+    const MethodRef& method, int handle, bool& value) noexcept {
+    if (handle == 0 || !method.HasInfo()) return false;
+    void* args[] = {&handle};
+    void* boxed = nullptr;
+    return RuntimeInvoke(method, nullptr, args, &boxed, nullptr) &&
+        UnboxBoolean(boxed, &value);
+}
+
+bool UnityStereoRenderer::RetireFailedSceneResources() noexcept {
+    // Serialize against the graphics callback as well as the Unity SRP loop.
+    // No pending old-scene lease can publish after this invalidation.
+    std::lock_guard execution(gpuExecutionMutex_);
+    InvalidateUnityStereoFrame();
+    pendingGpuFailure_.store(nullptr, std::memory_order_release);
+    ResetAllNativeTextureLeases();
+    smaaT2xPass_.Reset();
+    tscmaaPass_.Reset();
+    smaaT2xReady_ = tscmaaReady_ = false;
+    smaaT2xActiveForPair_ = tscmaaActiveForPair_ = false;
+    smaaT2xRequestedForPair_ = tscmaaRequestedForPair_ = false;
+    smaaT2xMotionCopyTokens_.fill(0);
+    smaaT2xMotionSourcesReadyForPair_ = false;
+    RestoreSourceCamera("scene-failure-retire");
+    DropOutlineMaterialCache("scene-failure-retire");
+    DropProFlareCache("scene-failure-retire");
+    DropUiTextureOverlayCache("scene-failure-retire");
+    DropLiveCameraOverlayCache("scene-failure-retire");
+    DropCmovParticleCache("scene-failure-retire");
+    if (!recoveryDestroy_.HasInfo()) return false;
+
+    bool ok = true;
+    const auto destroy = [this, &ok](void* object, bool texture) {
+        if (!IsUnityManagedObjectAlive(object)) return;
+        std::string exception;
+        if (texture && !RuntimeInvoke(api_.renderTextureRelease, object,
+                                       nullptr, nullptr, &exception)) {
+            ok = false;
+            Log("[VR][stereo] SCENE_FAILURE_CLEANUP_FAILED operation=release detail=" + exception);
+        }
+        void* args[] = {object};
+        if (!RuntimeInvoke(recoveryDestroy_, nullptr, args, nullptr, &exception)) {
+            ok = false;
+            Log("[VR][stereo] SCENE_FAILURE_CLEANUP_FAILED operation=destroy detail=" + exception);
+        }
+    };
+    for (std::size_t eye = 0; eye < 2; ++eye) {
+        if (IsUnityManagedObjectAlive(eyeCameras_[eye])) {
+            void* args[] = {nullptr};
+            if (!RuntimeInvoke(api_.cameraSetTargetTexture, eyeCameras_[eye],
+                               args, nullptr, nullptr)) ok = false;
+        }
+        // Destroy is deferred by Unity. Keep all roots and eye identities until
+        // a later safe point confirms native destruction; never bind the shell.
+        destroy(eyeGameObjects_[eye], false);
+        destroy(admissionTargets_[eye], true);
+        destroy(fullTargets_[eye], true);
+        destroy(smaaT2xMotionCopyTargets_[eye], true);
+    }
+    Log(std::string("[VR][stereo] SCENE_FAILURE_RETIRE scene=") +
+        std::to_string(sceneFailure_.failedScene) + " queued=" + (ok ? "1" : "0"));
+    return ok;
+}
+
+void UnityStereoRenderer::ServiceFailedScene() noexcept {
+    if (stage_ != LadderStage::Failed || contextActive_ ||
+        releaseRequested_.load(std::memory_order_acquire)) return;
+    EnsureFailureRecoveryApi();
+    if (!failureParkAttempted_) {
+        failureParkAttempted_ = true;
+        bool parked = true;
+        for (std::size_t eye = 0; eye < 2; ++eye) {
+            // Read liveness even when a failed write left the cached flag stale.
+            if (IsUnityManagedObjectAlive(eyeCameras_[eye]))
+                parked = SetCameraEnabled(eye, false) && parked;
+            if (IsUnityManagedObjectAlive(eyeGameObjects_[eye]))
+                parked = SetGameObjectActive(eye, false) && parked;
+        }
+        RestoreSourceCamera("scene-failure-park");
+        Log(std::string("[VR][stereo] SCENE_FAILURE_PARK scene=") +
+            std::to_string(sceneFailure_.failedScene) + " parked=" + (parked ? "1" : "0"));
+    }
+    if (!sceneFailure_.oldSceneExited) {
+        bool valid = true;
+        const bool known = ReadSceneFlag(recoverySceneIsValid_, sceneFailure_.failedScene, valid);
+        sceneFailure_.ObserveOldScene(known, valid);
+        if (!sceneFailure_.oldSceneExited) return;
+        Log("[VR][stereo] SCENE_FAILURE_EXIT scene=" +
+            std::to_string(sceneFailure_.failedScene) + " proof=Scene.IsValidInternal:false");
+    }
+    if (!sceneFailure_.cleanupAttempted) {
+        sceneFailure_.cleanupAttempted = true;
+        failureCleanupFailed_ = !RetireFailedSceneResources();
+        if (failureCleanupFailed_)
+            Log("[VR][stereo] SCENE_FAILURE_CLEANUP_FAILED recovery=withheld");
+        return;
+    }
+    if (failureCleanupFailed_ || sceneFailure_.cleanupComplete) return;
+    for (std::size_t eye = 0; eye < 2; ++eye) {
+        if (IsUnityManagedObjectAlive(eyeGameObjects_[eye]) ||
+            IsUnityManagedObjectAlive(eyeCameras_[eye]) ||
+            IsUnityManagedObjectAlive(admissionTargets_[eye]) ||
+            IsUnityManagedObjectAlive(fullTargets_[eye]) ||
+            IsUnityManagedObjectAlive(smaaT2xMotionCopyTargets_[eye])) return;
+    }
+    const auto retireRoots = [this](auto& handles) {
+        for (auto& handle : handles) {
+            if (handle != nullptr) retiredEyeHandles_.push_back(handle);
+            handle = nullptr;
+        }
+    };
+    retireRoots(eyeGameObjectHandles_);
+    retireRoots(eyeCameraHandles_);
+    retireRoots(eyeUniversalCameraDataHandles_);
+    retireRoots(eyeVlAdditionalCameraDataHandles_);
+    retireRoots(admissionTargetHandles_);
+    retireRoots(fullTargetHandles_);
+    retireRoots(smaaT2xMotionCopyTargetHandles_);
+    eyeGameObjects_.fill(nullptr);
+    eyeCameras_.fill(nullptr);
+    eyeUniversalCameraData_.fill(nullptr);
+    eyeVlAdditionalCameraData_.fill(nullptr);
+    eyeVolumeStacks_.fill(nullptr);
+    eyeDofComponents_.fill(nullptr);
+    eyeUrpDofComponents_.fill(nullptr);
+    eyeVlBloomComponents_.fill(nullptr);
+    eyeUrpBloomComponents_.fill(nullptr);
+    eyeChromaticAberrationComponents_.fill(nullptr);
+    eyeLensDistortionComponents_.fill(nullptr);
+    eyeMotionBlurComponents_.fill(nullptr);
+    eyeVignetteComponents_.fill(nullptr);
+    eyeTaaPersistentData_.fill(nullptr);
+    eyeMotionVectorsPersistentData_.fill(nullptr);
+    eyeDofBindLogged_.fill(false);
+    eyeUrpDofBindLogged_.fill(false);
+    eyeVlBloomBindLogged_.fill(false);
+    eyeUrpBloomBindLogged_.fill(false);
+    eyeChromaticAberrationBindLogged_.fill(false);
+    eyeLensDistortionBindLogged_.fill(false);
+    eyeMotionBlurBindLogged_.fill(false);
+    eyeVignetteBindLogged_.fill(false);
+    authoredBloom_ = {};
+    sourceToEyeProjectionValid_.fill(false);
+    admissionTargets_.fill(nullptr);
+    fullTargets_.fill(nullptr);
+    smaaT2xMotionCopyTargets_.fill(nullptr);
+    gameObjectActive_.fill(false);
+    cameraEnabled_.fill(false);
+    fullWidth_ = fullHeight_ = 0;
+    fullGeneration_ = 0;
+    smaaT2xMotionCopyWidth_ = smaaT2xMotionCopyHeight_ = 0;
+    ++smaaT2xMotionCopyEpoch_;
+    eyeMainCameraTaggedObject_ = nullptr;
+    eyeMainCameraTagApplied_ = false;
+    sceneFailure_.cleanupComplete = true;
+    Log("[VR][stereo] SCENE_FAILURE_CLEANUP_COMPLETE scene=" +
+        std::to_string(sceneFailure_.failedScene));
+}
+
+bool UnityStereoRenderer::TryRecoverFailedScene(bool sourceReady) noexcept {
+    if (!sceneFailure_.cleanupComplete || !activeSceneHandleKnown_) return false;
+    const auto ready = CurrentSceneReadyDiagnosticState();
+    bool valid = false;
+    bool loaded = false;
+    const bool sceneReady = ReadSceneFlag(recoverySceneIsValid_, activeSceneHandle_, valid) &&
+        valid && ReadSceneFlag(recoverySceneIsLoaded_, activeSceneHandle_, loaded) && loaded;
+    if (!sceneFailure_.CanRetry(activeSceneHandle_, sceneReady,
+            ready.loadingKnown && !ready.loadingActive && ready.renderAllowed,
+            sourceReady)) return false;
+    Log("[VR][stereo] SCENE_FAILURE_RETRY oldScene=" +
+        std::to_string(sceneFailure_.failedScene) + " newScene=" +
+        std::to_string(activeSceneHandle_) + " previousReason=" + lastSceneFailureReason_ +
+        " validation=A/B/C");
+    sceneFailure_.BeginRetry();
+    sceneRecoveryValidation_ = true;
+    stage_ = LadderStage::AdmissionOne;
+    stageArmed_ = decisionPending_ = publishPending_ = false;
+    decisionPassed_ = false;
+    decisionReason_ = nullptr;
+    stageContextEpoch_ = publishAfterLoopSerial_ = armedPoseRevision_ = 0;
+    observedMask_ = 0;
+    continuousStereo_ = false;
+    publishedFrames_ = 0;
+    armedFrame_ = {};
+    sourceFingerprintValid_.fill(false);
+    latestSourceCamera_ = latestSourceUniversalData_ = latestSourceTarget_ = nullptr;
+    latestSourceVolumeStack_ = nullptr;
+    additionalDataLoggedSource_ = nullptr;
+    additionalDataLoggedGeneration_ = lastEligibleGeneration_ = 0;
+    stereoInvalidatedForIneligibility_ = true;
+    sceneReadyParked_ = false;
+    ResetTemporalHistories("scene-failure-retry");
+    RequestHeavyDiscover();
+    // Revoke source/eye proof even when the destination did not use loading UI.
+    BeginSceneReadyRecoveryValidation();
+    return true;
+}
+
 void UnityStereoRenderer::Release(bool pipelineIdle) noexcept {
     (void)pipelineIdle;
     releaseRequested_.store(true, std::memory_order_release);
@@ -16568,20 +16817,31 @@ void UnityStereoRenderer::Release(bool pipelineIdle) noexcept {
 bool UnityStereoRenderer::FailStage(
     const char* stage,
     std::size_t eye) noexcept {
+    if (!sceneFailure_.Fail(attemptedSceneHandle_)) {
+        return false;
+    }
+    std::lock_guard execution(gpuExecutionMutex_);
     failureStage_ = stage != nullptr ? stage : "unknown";
+    lastSceneFailureReason_ = failureStage_;
+    lastSceneFailureEye_ = eye;
+    failureParkAttempted_ = false;
+    failureCleanupFailed_ = false;
     std::ostringstream stream;
     stream << "[VR][stereo] STAGE_FAILED ladderStage=" << StageName(stage_)
            << " boundary=" << failureStage_;
     if (eye < 2U) {
         stream << " eye=" << (eye == 0U ? "left" : "right");
     }
-    stream << " completedContext=" << completedContextEpoch_;
+    stream << " completedContext=" << completedContextEpoch_
+           << " scene=" << sceneFailure_.failedScene
+           << " recovery=after-scene-unload";
     Log(stream.str());
     publishPending_ = false;
     decisionPending_ = false;
     smaaT2xMotionCopyTokens_.fill(0);
     smaaT2xMotionSourcesReadyForPair_ = false;
     stage_ = LadderStage::Failed;
+    stageArmed_ = false;
     RestoreSourceCamera("stage-failed");
     RestoreUiTextureOverlays("stage-failed");
     InvalidateUnityStereoFrame();
@@ -16598,6 +16858,7 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
         // vanished, resuming instantly in scene-ineligible windows).
         const bool alwaysKeep =
             message.find("GAME_QUIT") != std::string_view::npos ||
+            message.find("SCENE_FAILURE") != std::string_view::npos ||
             message.find("PERF_TIMING") != std::string_view::npos ||
             message.find("SRP_PERF_") != std::string_view::npos ||
             message.find("TICK_PERF_") != std::string_view::npos ||

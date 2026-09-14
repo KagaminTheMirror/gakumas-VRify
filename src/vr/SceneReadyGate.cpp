@@ -579,6 +579,13 @@ void NoteSceneReadySourceCameraChanged() noexcept {
     EvaluateReady();
 }
 
+void BeginSceneReadyRecoveryValidation() noexcept {
+    StartEpoch("scene-failure-recovery");
+    // Unlike count/handle flaps, this caller has proved actual old-scene exit.
+    g_epochSawIdentity = true;
+    EvaluateReady();
+}
+
 void NoteSceneReadyCameraBoundary(const char* role, bool begin) noexcept {
     if (!g_transitionActive || role == nullptr) {
         return;

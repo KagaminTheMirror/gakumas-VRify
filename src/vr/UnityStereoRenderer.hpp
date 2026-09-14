@@ -1,6 +1,7 @@
 #pragma once
 
 #include "camera/FovEquivalence.hpp"
+#include "SceneFailureRecovery.hpp"
 #include "d3d11/SmaaT2xPass.hpp"
 #include "d3d11/SmaaT2xJitter.hpp"
 #include "d3d11/TscmaaPass.hpp"
@@ -798,6 +799,11 @@ private:
     void FallBackTscmaa(const char* reason) noexcept;
     void AdvanceStage(bool passed) noexcept;
     [[nodiscard]] bool FailStage(const char* stage, std::size_t eye = 2U) noexcept;
+    void EnsureFailureRecoveryApi() noexcept;
+    void ServiceFailedScene() noexcept;
+    [[nodiscard]] bool RetireFailedSceneResources() noexcept;
+    [[nodiscard]] bool TryRecoverFailedScene(bool sourceReady) noexcept;
+    [[nodiscard]] bool ReadSceneFlag(const MethodRef& method, int handle, bool& value) noexcept;
     void Log(std::string_view message) const noexcept;
 
     [[nodiscard]] static const char* StageName(LadderStage stage) noexcept;
@@ -814,6 +820,22 @@ private:
     bool apiInitialized_ = false;
     std::atomic_bool releaseRequested_{false};
     LadderStage stage_ = LadderStage::AdmissionOne;
+    SceneFailureRecovery sceneFailure_{};
+    std::string lastSceneFailureReason_;
+    std::size_t lastSceneFailureEye_ = 2U;
+    int attemptedSceneHandle_ = 0;
+    bool activeSceneHandleKnown_ = false;
+    bool failureParkAttempted_ = false;
+    bool failureCleanupFailed_ = false;
+    bool sceneRecoveryValidation_ = false;
+    bool failureRecoveryApiAttempted_ = false;
+    MethodRef recoverySceneIsValid_{};
+    MethodRef recoverySceneIsLoaded_{};
+    MethodRef recoveryDestroy_{};
+    // Keep destroyed shells rooted, as with retired full targets; native
+    // resources are destroyed before these leave the active eye arrays.
+    std::vector<Il2CppGCHandle> retiredEyeHandles_;
+    std::mutex gpuExecutionMutex_;
     bool stageArmed_ = false;
     bool contextActive_ = false;
     bool decisionPending_ = false;

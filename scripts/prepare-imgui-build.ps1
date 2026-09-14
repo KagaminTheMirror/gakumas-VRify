@@ -23,5 +23,20 @@ foreach ($entry in $replacements.GetEnumerator()) {
     if ($count -ne $expected) { throw "ImGui upstream drift: expected $expected occurrences of $($entry.Key), found $count" }
     $source = $source.Replace($entry.Key, $entry.Value)
 }
+# Local-owned wrap adapter; keep the locked source byte-identical. Validate the
+# signature before inserting so upstream changes cannot silently skip this fix.
+$wrapPattern = 'const char\* ImFont::CalcWordWrapPositionA\(float scale, const char\* text, const char\* text_end, float wrap_width\) const\r?\n\{'
+if ([regex]::Matches($source, $wrapPattern).Count -ne 1) {
+    throw 'ImGui upstream drift: expected one CalcWordWrapPositionA definition.'
+}
+$source = [regex]::Replace($source, $wrapPattern, {
+    param($match)
+    $match.Value + "`n    if (const char* cjk = gakumas::ui::CjkWordWrapPosition(*this, scale, text, text_end, wrap_width)) return cjk;"
+})
+$includeMarker = '#include "imgui_internal.h"'
+if ([regex]::Matches($source, [regex]::Escape($includeMarker)).Count -ne 1) {
+    throw 'ImGui upstream drift: expected one internal header include.'
+}
+$source = $source.Replace($includeMarker, $includeMarker + "`n" + '#include "host/ImGuiCjkWordWrap.hpp"')
 New-Item -ItemType Directory -Path $resolved -Force | Out-Null
 [IO.File]::WriteAllText((Join-Path $resolved 'imgui_draw.cpp'), $source, [Text.UTF8Encoding]::new($false))

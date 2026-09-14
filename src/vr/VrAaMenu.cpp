@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "VrMenuHoverHelp.hpp"
 
 extern std::filesystem::path VrConfigJson;
 
@@ -143,24 +144,25 @@ void ApplyMenuStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 14.0F;
     style.WindowBorderSize = 0.0F;
-    style.FrameRounding = 8.0F;
-    style.GrabRounding = 8.0F;
+    style.FrameRounding = 6.0F;
+    style.GrabRounding = 5.0F;
     style.GrabMinSize = 30.0F;
-    style.FramePadding = ImVec2(14.0F, 9.0F);
+    style.FramePadding = ImVec2(14.0F, 7.0F);
+    style.ButtonTextAlign = ImVec2(0.5F, 0.5F);
     style.ItemSpacing = ImVec2(12.0F, 10.0F);
     style.ItemInnerSpacing = ImVec2(10.0F, 8.0F);
     style.WindowPadding = ImVec2(26.0F, 22.0F);
     style.ScrollbarSize = 22.0F;
     style.PopupRounding = 10.0F;
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.09F, 0.10F, 0.13F, 1.0F);
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.075F, 0.095F, 0.12F, 1.0F);
     style.Colors[ImGuiCol_PopupBg] = ImVec4(0.13F, 0.15F, 0.19F, 1.0F);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.17F, 0.19F, 0.25F, 1.0F);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.23F, 0.27F, 0.35F, 1.0F);
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.26F, 0.31F, 0.41F, 1.0F);
-    style.Colors[ImGuiCol_Button] = ImVec4(0.20F, 0.23F, 0.30F, 1.0F);
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.26F, 0.34F, 0.50F, 1.0F);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.105F, 0.13F, 0.16F, 1.0F);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.105F, 0.13F, 0.16F, 1.0F);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.105F, 0.13F, 0.16F, 1.0F);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.15F, 0.19F, 0.23F, 1.0F);
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.19F, 0.25F, 0.29F, 1.0F);
     style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.22F, 0.45F, 0.85F, 1.0F);
-    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.45F, 0.62F, 0.95F, 1.0F);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.38F, 0.76F, 0.69F, 1.0F);
     style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.58F, 0.74F, 1.0F, 1.0F);
     style.Colors[ImGuiCol_Header] = ImVec4(0.22F, 0.30F, 0.45F, 1.0F);
     style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.27F, 0.38F, 0.58F, 1.0F);
@@ -245,7 +247,8 @@ bool EnsureContext(ID3D11Device* device, VrLog& log) {
     // (锯, 齿, 摇, ...), and a missing glyph renders as '?' in headset. Feed
     // every translated string into the builder so the atlas covers the text
     // that can appear rather than a statistical subset.
-    const std::vector<std::string> menuStrings = GakumasVrI18n::ActiveStrings();
+    std::vector<std::string> menuStrings = GakumasVrI18n::ActiveStrings();
+    menuStrings.emplace_back("\u3002\u300c\u300d\u3042\u3046\u304c\u304d\u3055\u3057\u3058\u3059\u305b\u3067\u3068\u306b\u306e\u306f\u3078\u307e\u3084\u308a\u308b\u308c\u308f\u3092\u3093\u30a4\u30ab\u30af\u30b2\u30b3\u30b7\u30bf\u30c3\u30c8\u30d5\u30dd\u30e0\u30e1\u30e9\u30ea\u30eb\u30ed\u30f3\u30fc\u4e00\u4e0a\u4e0b\u4e0d\u4e14\u4e2d\u4e3a\u4e5f\u4e8e\u4eae\u4ec5\u4ee5\u4ef6\u4f17\u4f1a\u4f4d\u4f53\u4f7f\u4f9d\u4fdd\u4fee\u5024\u503c\u504f\u505c\u5149\u514d\u5173\u518d\u51b2\u51bb\u51fa\u5206\u5207\u5212\u5230\u5237\u52d5\u533a\u5385\u53ca\u53cc\u53d8\u53ea\u53ef\u5404\u5408\u540c\u540e\u5411\u542f\u548c\u54cd\u56de\u5728\u573a\u57df\u5834\u5909\u591a\u5927\u5934\u5b98\u5b9a\u5bb9\u5bfc\u5c06\u5c11\u5c4f\u5d29\u5e26\u5e38\u5f00\u5f0f\u5f15\u5f62\u5f71\u5f8c\u5f93\u5fc5\u620f\u6210\u6216\u6240\u624b\u6269\u629e\u62e9\u6307\u6309\u6362\u63a7\u6536\u6539\u6548\u6570\u6574\u65b0\u65b9\u65e0\u65f6\u660e\u6613\u663e\u6642\u6655\u666f\u6682\u66dd\u66f4\u671d\u672c\u673a\u6765\u677f\u67e5\u6863\u68d2\u6a21\u6b21\u6b3e\u6b62\u6b63\u6b64\u6cd5\u6e38\u706f\u7136\u724c\u73b0\u751f\u7528\u7531\u753b\u754c\u7559\u767d\u7684\u76f8\u770b\u7729\u793a\u7a81\u7acb\u7af6\u7d27\u7ec6\u7ed3\u7f6e\u80fd\u819c\u81ea\u81f4\u8272\u8367\u8868\u8981\u89c2\u89d2\u8a2d\u8aac\u8ba9\u8bbe\u8be6\u8bf4\u8c03\u8d1f\u8d77\u8d8a\u8ddf\u8df3\u8eab\u8ee2\u8f6c\u8fb9\u8fc7\u8fd1\u8ffd\u9002\u9009\u900f\u9020\u904e\u9078\u907f\u90e8\u9154\u91cd\u9488\u9501\u95ed\u9608\u9634\u968f\u96fe\u9700\u9732\u9760\u9762\u9879\u989c\u9ad8\u9ed1\uff0c\uff1a\uff1b");
     ImFontConfig fontConfig;
     ImFontGlyphRangesBuilder builder;
     builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
@@ -261,10 +264,10 @@ bool EnsureContext(ID3D11Device* device, VrLog& log) {
     ImFont* font = nullptr;
     if (std::filesystem::exists("c:\\Windows\\Fonts\\msyh.ttc")) {
         font = io.Fonts->AddFontFromFileTTF(
-            "c:\\Windows\\Fonts\\msyh.ttc", 28.0F, &fontConfig);
+            "c:\\Windows\\Fonts\\msyh.ttc", 32.0F, &fontConfig);
     } else if (std::filesystem::exists("c:\\Windows\\Fonts\\segoeui.ttf")) {
         font = io.Fonts->AddFontFromFileTTF(
-            "c:\\Windows\\Fonts\\segoeui.ttf", 28.0F, &fontConfig);
+            "c:\\Windows\\Fonts\\segoeui.ttf", 32.0F, &fontConfig);
     }
     if (font == nullptr) {
         font = io.Fonts->AddFontDefault();
@@ -395,58 +398,121 @@ bool EnsureOverlayTarget(
     return true;
 }
 
+
 struct MenuRow {
     ImVec2 origin{};
-    float width = 0.0F;
+    float width = 0, height = 0;
+    bool compact = false, stacked = false, toggle = false, combo = false;
+    float controlTop = 0;
+    std::string label;
 };
+struct HelpRecord { MenuRow row; std::string text; };
+std::vector<HelpRecord> g_helpRows;
+VrMenuHoverHelp g_helpState;
+bool g_openLocalizeRestart = false;
+bool g_openTaaConfirm = false;
+float g_helpTestDelta = 0;
+std::string g_helpCaptureForTest;
+std::string g_popupCaptureForTest;
+std::string g_comboCaptureForTest;
+float g_scrollCaptureForTest = -1;
+float g_panelBarRightForTest = 0;
+float g_nextActionWidth = 0;
+float g_gridPendingHeight = 0;
+float g_gridX = 0, g_gridY = 0, g_gridWidth = 0;
+bool g_nextCombo = false;
+bool g_nextToggle = false;
+bool g_nextStacked = false;
+bool g_gridRight = false, g_nextCompact = false, g_helpDragging = false;
+int g_helpTab = -1, g_helpLanguage = -1;
 
+
+const char* NoteForLabel(const char* label) {
+    using GakumasVrI18n::ts;
+    const char* pairs[][2] = {
+        {"vr_menu_grip_transparent", "vr_menu_grip_transparent_note"},
+        {"vr_menu_localize", "vr_menu_localize_note"},
+        {"vr_menu_toon_follow_ref", "vr_menu_toon_follow_ref_note"},
+        {"vr_taa_quality", "vr_taa_quality_note"},
+        {"vr_menu_actor_shadow_anchor", "vr_menu_actor_shadow_anchor_note"},
+        {"vr_menu_actor_toon_anchor", "vr_menu_actor_shadow_anchor_note"},
+        {"vr_menu_bloom_follow_source", "vr_menu_bloom_follow_source_note"},
+        {"vr_menu_source_tiny", "vr_menu_source_tiny_note"},
+        {"vr_menu_fp_follow", "vr_menu_fp_follow_note"},
+    };
+    for (const auto& pair : pairs) if (std::string(label) == ts(pair[0])) return ts(pair[1]);
+    return "";
+}
 MenuRow BeginRow(const char* label, bool enabled, bool selected = false) {
     MenuRow row;
-    row.origin = ImGui::GetCursorScreenPos();
-    row.width = ImGui::GetContentRegionAvail().x;
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    const ImVec2 labelEnd(
-        row.origin.x + kLabelWidth, row.origin.y + kRowHeight);
-    const ImVec2 controlBegin(row.origin.x + kLabelWidth + kColumnGap, row.origin.y);
-    const ImVec2 controlEnd(row.origin.x + row.width, row.origin.y + kRowHeight);
-    draw->AddRectFilled(
-        row.origin,
-        labelEnd,
-        selected ? IM_COL32(46, 72, 110, 255) : IM_COL32(41, 46, 58, 255),
-        8.0F);
-    draw->AddRectFilled(
-        controlBegin,
-        controlEnd,
-        selected ? IM_COL32(36, 52, 78, 255) : IM_COL32(28, 32, 41, 255),
-        8.0F);
-    if (selected) {
-        draw->AddRect(
-            row.origin,
-            controlEnd,
-            IM_COL32(88, 158, 255, 255),
-            8.0F,
-            0,
-            3.0F);
+    row.combo = g_nextCombo; g_nextCombo = false;
+    row.toggle = g_nextToggle; g_nextToggle = false;
+    row.compact = g_nextCompact;
+    row.stacked = g_nextStacked; g_nextStacked = false;
+    g_nextCompact = false;
+    if (!row.compact && g_gridRight) { g_gridY += g_gridPendingHeight; g_gridRight = false; }
+    row.width = row.compact ? (g_gridWidth - 36) / 2 : g_gridWidth;
+    row.height = row.toggle ? 80.0F : (row.combo ? 72.0F : 90.0F);
+    row.origin = ImVec2(g_gridX + (g_gridRight ? row.width + 36 : 0), g_gridY);
+    row.label = label;
+    auto* draw = ImGui::GetWindowDrawList();
+    if (selected) draw->AddRectFilled(ImVec2(row.origin.x, row.origin.y + 2),
+        ImVec2(row.origin.x + 4, row.origin.y + row.height - 2), IM_COL32(97,194,176,255), 2);
+
+    if (row.toggle || row.combo) {
+        const char* note = NoteForLabel(label);
+        const float textWidth = row.combo ? (row.width - 36)*0.5F - 24
+            : row.width - 144 - (g_nextActionWidth > 0 ? g_nextActionWidth + 20 : 0);
+        const float labelHeight = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, textWidth, label).y;
+        const float noteHeight = note[0] ? ImGui::GetFont()->CalcTextSizeA(20, FLT_MAX, textWidth, note).y : 0;
+        const float blockHeight = labelHeight + (noteHeight > 0 ? 4 + noteHeight : 0);
+        row.height = std::max(row.height, blockHeight + 16);
+        const float groupHeight = std::max(52.0F, blockHeight);
+        const float top = row.origin.y + (groupHeight-blockHeight)*0.5F;
+        row.controlTop = row.origin.y + (groupHeight-46)*0.5F;
+        draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(row.origin.x+12,top),
+            enabled ? IM_COL32(230,234,243,255) : IM_COL32(155,165,177,255),label,nullptr,textWidth);
+        if (noteHeight > 0) draw->AddText(ImGui::GetFont(),20,
+            ImVec2(row.origin.x+12,top+labelHeight+4),
+            IM_COL32(224,192,136,255),note,nullptr,textWidth);
+    } else {
+        draw->AddText(ImVec2(row.origin.x+14+ImGui::GetStyle().GrabMinSize*0.5F,row.origin.y+7),
+            enabled ? IM_COL32(230,234,243,255) : IM_COL32(155,165,177,255),label);
     }
-    draw->AddText(
-        ImVec2(
-            row.origin.x + 20.0F,
-            row.origin.y + (kRowHeight - ImGui::GetFontSize()) * 0.5F),
-        enabled ? IM_COL32(230, 234, 243, 255) : IM_COL32(126, 132, 146, 255),
-        label);
-    ImGui::SetCursorScreenPos(ImVec2(
-        controlBegin.x + 14.0F,
-        row.origin.y + (kRowHeight - kControlHeight) * 0.5F));
-    ImGui::PushItemWidth(row.width - kLabelWidth - kColumnGap - 28.0F);
+    ImGui::SetCursorScreenPos(ImVec2(row.origin.x + ((row.compact || row.stacked) ? 12 : 384),
+        row.origin.y + ((row.compact || row.stacked) ? 36 : 0)));
+    ImGui::PushItemWidth(row.width - ((row.compact || row.stacked) ? 24 : 398));
+    g_helpRows.push_back({row, ""});
     return row;
 }
-
 void EndRow(const MenuRow& row) {
     ImGui::PopItemWidth();
-    ImGui::SetCursorScreenPos(
-        ImVec2(row.origin.x, row.origin.y + kRowHeight + kRowSpacing));
+    if (row.compact && !g_gridRight) { g_gridRight = true; g_gridPendingHeight = row.height; }
+    else { g_gridY += g_gridRight ? std::max(row.height, g_gridPendingHeight) : row.height; g_gridRight = false; }
+    g_nextActionWidth = 0;
+    ImGui::SetCursorScreenPos(ImVec2(g_gridX, g_gridY));
 }
+void DrawHelpDock() {
+    std::string hovered;
+    for (const auto& entry : g_helpRows) {
+        if (ImGui::GetIO().MousePos.y < 678 && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseHoveringRect(entry.row.origin,
+            ImVec2(entry.row.origin.x + entry.row.width, entry.row.origin.y + entry.row.height - 2), false)) {
+            hovered = entry.row.label;
+        }
+    }
+    g_helpState.Advance(g_helpTestDelta > 0 ? g_helpTestDelta : ImGui::GetIO().DeltaTime, hovered, g_helpDragging);
+    std::string body = GakumasVrI18n::ts("vr_menu_idle_help");
+    for (const auto& entry : g_helpRows) if (entry.row.label == g_helpState.shown) {
+        body = entry.text;
+    }
+    if (!g_helpCaptureForTest.empty()) body = GakumasVrI18n::ts(g_helpCaptureForTest);
+    auto* d = ImGui::GetWindowDrawList();
+    d->AddRectFilled(ImVec2(26,690), ImVec2(1254,828), IM_COL32(25,35,44,255),8);
 
+    d->PushClipRect(ImVec2(44,707),ImVec2(1236,822),true);
+    d->AddText(ImGui::GetFont(),32,ImVec2(44,709),IM_COL32(216,225,233,255),body.c_str(),nullptr,1180);
+    d->PopClipRect();
+}
 struct StickInput {
     bool active = false;
     float x = 0.0F;
@@ -464,11 +530,20 @@ void ComboRow(
         return;
     }
     ImGui::PushID(label);
+    g_nextCombo = true; g_nextCompact = false; g_nextStacked = false;
     const MenuRow row = BeginRow(label, enabled);
+    ImGui::SetCursorScreenPos(ImVec2(row.origin.x + (row.width+36)*0.5F + 12, row.controlTop));
+    ImGui::PopItemWidth();
+    ImGui::PushItemWidth((row.width-36)*0.5F-24);
     if (!enabled) {
         ImGui::BeginDisabled();
     }
     *value = std::clamp(*value, 0, count - 1);
+    if (!g_comboCaptureForTest.empty() &&
+        std::string(label) == GakumasVrI18n::ts(g_comboCaptureForTest)) {
+        ImGui::OpenPopupEx(ImHashStr("##ComboPopup", 0, ImGui::GetID("##value")), ImGuiPopupFlags_None);
+        g_comboCaptureForTest.clear();
+    }
     if (ImGui::BeginCombo("##value", items[*value], ImGuiComboFlags_HeightLarge)) {
         for (int index = 0; index < count; ++index) {
             if (ImGui::Selectable(items[index], index == *value, 0,
@@ -508,23 +583,41 @@ void ToggleRow(
     ImGui::PushID(label);
     // Toggles are not a sticky selection. Passing *value as selected made
     // On look identical to a focused slider (blue row + border).
+    g_nextToggle = true;
+    g_nextStacked = true;
+    const float labelWidth = ImGui::CalcTextSize(label).x;
+    const float minActionWidth = actionLabel ? std::max(120.0F, ImGui::CalcTextSize(actionLabel).x + 48) : 0;
+    // Keep the switch in its own column even when a translation is long.
+    // BeginRow wraps the title and grows both paired cells to the taller one.
+    g_nextCompact = true;
+    const float available = (g_nextCompact ? (g_gridWidth - 36) / 2 : g_gridWidth) - 24;
+    g_nextActionWidth = actionLabel ? std::max(minActionWidth,
+        std::min((available - 20)*0.5F - 32, available - 20 - labelWidth - 120)) : 0;
     const MenuRow row = BeginRow(label, enabled);
     if (!enabled) {
         ImGui::BeginDisabled();
     }
-    const bool active = *value;
-    const float actionWidth =
-        actionLabel != nullptr ? std::max(110.0F, ImGui::CalcTextSize(actionLabel).x + 36.0F)
-                               : 0.0F;
-    const float toggleWidth = ImGui::CalcItemWidth() -
-        (actionLabel != nullptr ? actionWidth + 12.0F : 0.0F);
-    if (ImGui::Button(
-            active ? onText : offText,
-            ImVec2(std::max(80.0F, toggleWidth), kControlHeight))) {
-        *value = !active;
-    }
+    const float actionWidth = g_nextActionWidth;
+
+    const float toggleWidth = ImGui::CalcItemWidth() - (actionLabel ? actionWidth + 20 : 0);
+    const ImVec2 p(row.origin.x + 12, row.controlTop - 3);
+    // Include the setting label and all space down to the control bottom.
+    // The action half and its separating gap remain separate targets.
+    ImGui::SetCursorScreenPos(ImVec2(p.x, row.origin.y));
+    if (ImGui::InvisibleButton("##toggle", ImVec2(toggleWidth, row.height - 2))) *value = !*value;
+    const bool hover = enabled && ImGui::IsItemHovered();
+    const bool on = *value;
+    const ImU32 ink = enabled ? IM_COL32(221,232,238,255) : IM_COL32(119,130,141,255);
+    auto* d = ImGui::GetWindowDrawList();
+    const float switchX = p.x + toggleWidth - 96;
+    const float switchY = p.y + 5;
+    d->AddRectFilled(ImVec2(switchX,switchY),ImVec2(switchX+96,switchY+42),
+        enabled && on ? IM_COL32(57,145,132,255) : IM_COL32(71,84,96,255),21);
+    d->AddCircleFilled(ImVec2(switchX+(on?75:21),switchY+21),16,ink);
+    if (hover) d->AddRect(ImVec2(switchX-3,switchY-3),ImVec2(switchX+99,switchY+45),
+        IM_COL32(126,214,198,255),24,0,2);
     if (actionLabel != nullptr) {
-        ImGui::SameLine(0.0F, 12.0F);
+        ImGui::SetCursorScreenPos(ImVec2(p.x + toggleWidth + 20.0F, p.y + 3));
         if (ImGui::Button(actionLabel, ImVec2(actionWidth, kControlHeight)) &&
             actionClicked != nullptr) {
             *actionClicked = true;
@@ -579,52 +672,64 @@ void SliderRow(
     if (!enabled) {
         ImGui::BeginDisabled();
     }
-    const float actionWidth =
-        actionLabel != nullptr ? std::max(110.0F, ImGui::CalcTextSize(actionLabel).x + 36.0F)
-                               : 0.0F;
-    const float sliderWidth = ImGui::CalcItemWidth() -
-        (actionLabel != nullptr ? actionWidth + 12.0F : 0.0F);
-    ImGui::PushItemWidth(std::max(80.0F, sliderWidth));
-    if (selected) {
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.22F, 0.32F, 0.48F, 1.0F));
-        ImGui::PushStyleColor(
-            ImGuiCol_SliderGrab, ImVec4(0.70F, 0.85F, 1.0F, 1.0F));
-        ImGui::PushStyleColor(
-            ImGuiCol_SliderGrabActive, ImVec4(0.85F, 0.93F, 1.0F, 1.0F));
+
+    const float actionWidth = actionLabel ? std::max(120.0F, ImGui::CalcTextSize(actionLabel).x + 36) : 0;
+    const float right = row.origin.x + row.width - 12;
+    bool actionHover = false;
+    if (actionLabel) {
+        ImGui::SetCursorScreenPos(ImVec2(right - actionWidth, row.origin.y));
+        if (ImGui::Button(actionLabel, ImVec2(actionWidth, kControlHeight)) && actionClicked) *actionClicked = true;
+        actionHover = ImGui::IsItemHovered();
     }
+    // Native SliderFloat owns input/rounding. Its frame, value and thumb are
+    // invisible; the same value is presented as an explicit rail and handle.
+    const ImVec2 track(row.origin.x + 12, row.origin.y + 46);
+    const float width = row.width - 24;
+    ImGui::SetCursorScreenPos(track);
+    ImGui::PushItemWidth(width);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0,0));
+    for (ImGuiCol c : {ImGuiCol_FrameBg, ImGuiCol_FrameBgHovered, ImGuiCol_FrameBgActive,
+            ImGuiCol_SliderGrab, ImGuiCol_SliderGrabActive, ImGuiCol_Text})
+        ImGui::PushStyleColor(c, ImVec4(0,0,0,0));
     const float valueBefore = *value;
     ImGui::SliderFloat("##value", value, minimum, maximum, format);
     const bool sliderClicked = ImGui::IsItemClicked();
     const bool sliderActive = ImGui::IsItemActive();
-    if (selected) {
-        ImGui::PopStyleColor(3);
-    }
-    const ImVec2 rowMax(row.origin.x + row.width, row.origin.y + kRowHeight);
-    const bool rowClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        ImGui::IsMouseHoveringRect(row.origin, rowMax, false);
+    const bool sliderHovered = ImGui::IsItemHovered();
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar();
+    ImGui::PopItemWidth();
+    const bool rowClicked = !actionHover && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        ImGui::IsMouseHoveringRect(row.origin, ImVec2(row.origin.x + row.width, row.origin.y + row.height), false);
     if (enabled && (rowClicked || sliderClicked || sliderActive)) {
         g_selectedSlider = id;
-        if (rowClicked || sliderClicked) {
-            g_sliderRowClicked = true;
-        }
+        if (rowClicked || sliderClicked) g_sliderRowClicked = true;
     }
-    if (selected && enabled) {
-        openxr::NudgeAaMenuSlider(
-            *value, minimum, maximum, ImGui::GetIO().DeltaTime, sticks);
-    }
-    ObserveAutoSlider(
-        persist,
-        sliderActive ||
-            (selected && enabled && openxr::AaMenuSliderStickActive(sticks)),
-        *value != valueBefore);
-    ImGui::PopItemWidth();
-    if (actionLabel != nullptr) {
-        ImGui::SameLine(0.0F, 12.0F);
-        if (ImGui::Button(actionLabel, ImVec2(actionWidth, kControlHeight)) &&
-            actionClicked != nullptr) {
-            *actionClicked = true;
-        }
-    }
+    const bool focused = enabled && g_selectedSlider == id;
+    const bool stickActive = focused && openxr::AaMenuSliderStickActive(sticks);
+    if (focused) openxr::NudgeAaMenuSlider(*value, minimum, maximum, ImGui::GetIO().DeltaTime, sticks);
+    g_helpDragging |= sliderActive || stickActive;
+    ObserveAutoSlider(persist, sliderActive || stickActive, *value != valueBefore);
+
+    auto* d = ImGui::GetWindowDrawList();
+    const float grab = std::min(ImGui::GetStyle().GrabMinSize, width - 4);
+    const float left = track.x + 2 + grab * 0.5F;
+    const float end = track.x + width - 2 - grab * 0.5F;
+    const float fraction = std::clamp((*value - minimum) / (maximum - minimum), 0.0F, 1.0F);
+    const ImVec2 centre(left + (end - left) * fraction, track.y + 16);
+    d->AddLine(ImVec2(left,centre.y), ImVec2(end,centre.y), IM_COL32(74,89,101,255),8);
+    d->AddLine(ImVec2(left,centre.y), centre, IM_COL32(71,147,138,255),8);
+    d->AddCircleFilled(centre,12, focused ? IM_COL32(218,245,242,255) : IM_COL32(97,194,176,255));
+    if (focused || sliderHovered) d->AddCircle(centre,16,
+        focused ? IM_COL32(126,220,207,255) : IM_COL32(141,161,171,255),0,2);
+    if (focused && !selected) d->AddRectFilled(ImVec2(row.origin.x,row.origin.y+2),
+        ImVec2(row.origin.x+4,row.origin.y+row.height-2),IM_COL32(97,194,176,255),2);
+    char valueText[64];
+    ImFormatString(valueText, sizeof(valueText), format, *value);
+    const float valueRight = right - (actionLabel ? actionWidth + 24 : 0);
+    d->AddText(ImVec2(valueRight - ImGui::CalcTextSize(valueText).x,
+        row.origin.y + (kControlHeight - ImGui::GetFontSize()) * 0.5F),
+        IM_COL32(230,234,243,255),valueText);
     if (!enabled) {
         ImGui::EndDisabled();
     }
@@ -633,18 +738,11 @@ void SliderRow(
 }
 
 void HelpLine(const char* text) {
-    if (text == nullptr || text[0] == '\0') {
-        return;
-    }
-    ImGui::SetWindowFontScale(0.50F);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.58F, 0.62F, 0.70F, 1.0F));
-    ImGui::PushTextWrapPos(
-        ImGui::GetCursorPos().x + ImGui::GetContentRegionAvail().x);
-    ImGui::TextWrapped("%s", text);
-    ImGui::PopTextWrapPos();
-    ImGui::PopStyleColor();
-    ImGui::SetWindowFontScale(1.0F);
-    ImGui::Dummy(ImVec2(0.0F, 2.0F));
+    if (g_helpRows.empty() || text == nullptr) return;
+    auto& entry = g_helpRows.back();
+    entry.text = text;
+
+
 }
 
 float ActionWidth(const char* text) {
@@ -705,7 +803,7 @@ void TickAutoSliderPersist(float deltaSeconds, VrLog& log) {
 
 void PersistLocalizeAndPromptRestart(VrLog& log) {
     PersistMenuConfig(log, "localize");
-    ImGui::OpenPopup("##vr_localize_restart");
+    g_openLocalizeRestart = true;
     log.Write(
         std::string("[VR][menu] localizeText=") +
         (GakumasLocal::Config::vrLocalizeText ? "1" : "0") +
@@ -713,17 +811,17 @@ void PersistLocalizeAndPromptRestart(VrLog& log) {
 }
 
 bool TabButton(const char* text, bool active) {
-    ImGui::PushStyleColor(
-        ImGuiCol_Button,
-        active ? ImVec4(0.22F, 0.45F, 0.85F, 1.0F)
-               : ImVec4(0.18F, 0.20F, 0.26F, 1.0F));
-    ImGui::PushStyleColor(
-        ImGuiCol_ButtonHovered,
-        active ? ImVec4(0.28F, 0.53F, 0.94F, 1.0F)
-               : ImVec4(0.25F, 0.29F, 0.38F, 1.0F));
-    const bool clicked = ImGui::Button(
-        text, ImVec2(std::max(150.0F, ImGui::CalcTextSize(text).x + 56.0F), 54.0F));
-    ImGui::PopStyleColor(2);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.075F, 0.095F, 0.12F, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.11F, 0.15F, 0.18F, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, active ? ImVec4(0.53F, 0.87F, 0.80F, 1)
+        : ImVec4(0.66F, 0.71F, 0.77F, 1));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float width = std::max(150.0F, ImGui::CalcTextSize(text).x + 56.0F);
+    const bool clicked = ImGui::Button(text, ImVec2(width, 54.0F));
+    if (active) ImGui::GetWindowDrawList()->AddRectFilled(
+        ImVec2(p.x + 28, p.y + 49), ImVec2(p.x + width - 28, p.y + 53),
+        IM_COL32(97, 194, 176, 255), 2);
+    ImGui::PopStyleColor(3);
     return clicked;
 }
 
@@ -833,6 +931,7 @@ bool PaintVrAaMenu(
 
     ImGui::SetCursorPosY(headerY + 54.0F + 8.0F);
 
+    const float tabsY = ImGui::GetCursorScreenPos().y;
     if (g_tab < 0 || g_tab > 3) {
         g_tab = 0;
     }
@@ -852,14 +951,27 @@ bool PaintVrAaMenu(
         g_tab = 3;
     }
     if (g_savedFlashSeconds > 0.0F) {
-        ImGui::SameLine();
-        ImGui::TextUnformatted(ts("vr_aa_saved"));
+        const char* saved = ts("vr_aa_saved");
+        ImGui::GetWindowDrawList()->AddText(ImVec2(io.DisplaySize.x - 26 - ImGui::CalcTextSize(saved).x,
+            tabsY + (54 - ImGui::GetFontSize()) * 0.5F), IM_COL32(126,214,198,255), saved);
         g_savedFlashSeconds = std::max(0.0F, g_savedFlashSeconds - io.DeltaTime);
     }
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
+    if (g_helpTab != g_tab || g_helpLanguage != Config::vrMenuLanguage) {
+        g_helpState.Reset(); g_helpTab = g_tab; g_helpLanguage = Config::vrMenuLanguage;
+    }
+    ImGui::BeginChild("##settings_body", ImVec2(0, 500), false);
+    if (g_scrollCaptureForTest >= 0) {
+        ImGui::SetScrollY(g_scrollCaptureForTest);
+        g_scrollCaptureForTest = -1;
+    }
+    g_gridX = ImGui::GetCursorScreenPos().x;
+    g_gridY = ImGui::GetCursorScreenPos().y;
+    g_gridWidth = ImGui::GetContentRegionAvail().x;
+    g_gridRight = false; g_helpDragging = false; g_helpRows.clear();
     const char* aaModeItems[] = {
         ts("vr_aa_mode_inherit"),
         ts("vr_aa_mode_taa"),
@@ -1140,6 +1252,10 @@ bool PaintVrAaMenu(
                     std::to_string(Config::vrFpDirectionFollow));
             }
         }
+        if (g_popupCaptureForTest == "##vr_fp_follow_confirm") {
+            ImGui::OpenPopup(g_popupCaptureForTest.c_str());
+            g_popupCaptureForTest.clear();
+        }
         ImGui::SetNextWindowSize(ImVec2(620.0F, 0.0F), ImGuiCond_Always);
         if (ImGui::BeginPopupModal(
                 "##vr_fp_follow_confirm",
@@ -1301,12 +1417,11 @@ bool PaintVrAaMenu(
                 stick);
             HelpLine(ts("vr_taa_quality_help"));
             if (taaQualityBefore != Config::vrEyeTaaQuality) {
-                // High+ switches the URP pass to YCoCg on this title's
-                // R11G11B10 history and can break LED cube / sign colors.
-                if (Config::vrEyeTaaQuality >= 3 && taaQualityBefore < 3) {
+                // Hardware feedback confirms LED/sign color issues at Medium+.
+                if (Config::vrEyeTaaQuality >= 2 && taaQualityBefore < 2) {
                     g_taaQualityPendingValue = Config::vrEyeTaaQuality;
                     Config::vrEyeTaaQuality = taaQualityBefore;
-                    ImGui::OpenPopup("##vr_taa_quality_confirm");
+                    g_openTaaConfirm = true;
                 } else {
                     PersistMenuConfig(log, "taa-quality");
                     log.Write(
@@ -1339,6 +1454,19 @@ bool PaintVrAaMenu(
         }
     }
 
+    ImGui::SetCursorScreenPos(ImVec2(g_gridX, g_gridY + (g_gridRight ? g_gridPendingHeight : 0)));
+    ImGui::Dummy(ImVec2(1,1));
+    ImGui::EndChild();
+    if (!g_popupCaptureForTest.empty()) {
+        ImGui::OpenPopup(g_popupCaptureForTest.c_str());
+        g_popupCaptureForTest.clear();
+    }
+    DrawHelpDock();
+    // Open and render modal IDs in the same parent window, outside the scroll child.
+    if (g_openTaaConfirm) {
+        ImGui::OpenPopup("##vr_taa_quality_confirm");
+        g_openTaaConfirm = false;
+    }
     ImGui::SetNextWindowSize(ImVec2(620.0F, 0.0F), ImGuiCond_Always);
     if (ImGui::BeginPopupModal(
             "##vr_taa_quality_confirm",
@@ -1414,6 +1542,10 @@ bool PaintVrAaMenu(
     }
 
     ImGui::SetNextWindowSize(ImVec2(620.0F, 0.0F), ImGuiCond_Always);
+    if (g_openLocalizeRestart) {
+        ImGui::OpenPopup("##vr_localize_restart");
+        g_openLocalizeRestart = false;
+    }
     if (ImGui::BeginPopupModal(
             "##vr_localize_restart",
             nullptr,
@@ -1603,7 +1735,18 @@ bool PaintVrPanelOverlay(
         ImGui::Begin("##vr_panel_bar", nullptr, kStripFlags);
         // Big glyphs: the buttons are the whole bar, so the label should
         // fill the cell instead of floating in it.
-        ImGui::SetWindowFontScale(2.1F);
+        // Keep all four translated buttons inside the fixed-width OpenXR strip.
+        // Measure both pin states so toggling it does not change the font size.
+        for (float scale = 2.1F; ; scale -= 0.05F) {
+            ImGui::SetWindowFontScale(scale);
+            float required = std::max(300.0F, std::max(
+                ImGui::CalcTextSize(ts("vr_panel_pin_on")).x,
+                ImGui::CalcTextSize(ts("vr_panel_pin_off")).x) + 40.0F);
+            for (const char* key : {"vr_panel_height", "vr_panel_distance", "vr_panel_size"})
+                required += std::max(190.0F, ImGui::CalcTextSize(ts(key)).x + 40.0F);
+            required += ImGui::GetStyle().ItemSpacing.x * 3;
+            if (required <= ImGui::GetContentRegionAvail().x || scale <= 1.0F) break;
+        }
         const float buttonHeight = barHeight - 24.0F;
         const auto barButton = [&](const char* text, bool active, float minWidth) {
             ImGui::PushStyleColor(
@@ -1640,6 +1783,7 @@ bool PaintVrPanelOverlay(
         if (barButton(ts("vr_panel_size"), input.activeItem == 3, 190.0F)) {
             output.clickedItem = 3;
         }
+        g_panelBarRightForTest = ImGui::GetItemRectMax().x;
         ImGui::SetWindowFontScale(1.0F);
         if (input.hovering) {
             ImDrawList* overlayDraw = ImGui::GetForegroundDrawList();
@@ -1764,6 +1908,39 @@ void ShutdownVrAaMenu() noexcept {
     ShutdownImpl();
 }
 
+void SetVrMenuHelpDeltaForTest(float dt) { g_helpTestDelta = dt; }
+void SetVrMenuHelpCaptureForTest(const char* key) { g_helpCaptureForTest = key; }
+void SetVrMenuScrollCaptureForTest(float scroll) { g_scrollCaptureForTest = scroll; }
+void SetVrMenuComboCaptureForTest(const char* key) { g_comboCaptureForTest = key; }
+float VrPanelBarRightForTest() { return g_panelBarRightForTest; }
+bool VrMenuToggleColumnsFitForTest() {
+    for (const auto& entry : g_helpRows)
+        if (entry.row.toggle && (!entry.row.compact || entry.row.width > (g_gridWidth - 36) / 2))
+            return false;
+    return true;
+}
+bool VrMenuPopupRectForTest(float* rect) {
+    ui::ScopedImGuiContext scope(g_context);
+    if (g_context->OpenPopupStack.empty() || !g_context->OpenPopupStack.back().Window) return false;
+    const auto* window = g_context->OpenPopupStack.back().Window;
+    rect[0] = window->Pos.x; rect[1] = window->Pos.y;
+    rect[2] = window->Size.x; rect[3] = window->Size.y;
+    return true;
+}
+void SetVrMenuPopupCaptureForTest(const char* id) {
+    ui::ScopedImGuiContext scope(g_context);
+    ImGui::ClosePopupsOverWindow(nullptr, false);
+    g_popupCaptureForTest = id;
+}
+float VrMenuTextHeightForTest(const char* text, float width, float size) {
+    ui::ScopedImGuiContext scope(g_context);
+    return g_context->IO.Fonts->Fonts[0]->CalcTextSizeA(size, FLT_MAX, width, text).y;
+}
+const char* VrMenuHelpTitleForTest() { return g_helpState.shown.c_str(); }
+bool VrMenuModalOpenForTest() {
+    ui::ScopedImGuiContext scope(g_context);
+    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+}
 void SetVrAaMenuTabForTest(int tab) noexcept {
     g_tab = std::clamp(tab, 0, 3);
 }
