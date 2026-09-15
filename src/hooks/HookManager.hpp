@@ -1,8 +1,11 @@
 #pragma once
 
 #include <minhook.h>
+#include <cstddef>
 
 namespace GakumasVR::Hooks {
+    struct Request { void* target; void* detour; void** original; const char* name; };
+    bool CreateAndEnableBatch(const Request* requests, std::size_t count);
     // MinHook has process-global state inside this DLL. Keep every call that
     // changes that state behind this owner so Localify and VR cannot initialize
     // or tear it down independently.

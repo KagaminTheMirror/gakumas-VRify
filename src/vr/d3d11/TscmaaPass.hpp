@@ -59,22 +59,6 @@ public:
         std::uint32_t mismatchMask = MotionVectorMismatchNone;
     };
 
-    struct MotionVectorValueDiagnostics {
-        UINT sampleCount = 0;
-        UINT finiteSampleCount = 0;
-        UINT nonFiniteSampleCount = 0;
-        float minimumX = 0.0F;
-        float maximumX = 0.0F;
-        float minimumY = 0.0F;
-        float maximumY = 0.0F;
-        float meanMagnitude = 0.0F;
-        float maximumMagnitude = 0.0F;
-        float minimumZ = 0.0F;
-        float maximumZ = 0.0F;
-        float minimumW = 0.0F;
-        float maximumW = 0.0F;
-    };
-
     struct EyeResourceDiagnostics {
         std::uintptr_t motion = 0;
         std::uintptr_t spatial = 0;
@@ -90,21 +74,6 @@ public:
         std::uintptr_t workingEdges = 0;
         std::uintptr_t workingShapeCandidates = 0;
         std::uintptr_t workingDeferredItems = 0;
-    };
-
-    // GPU-counted temporal work for one resolved pair. Sums are 1/1000 fixed
-    // point: meanWeight = weightMilliSum / (1000 * blendedPixels), meanDelta
-    // likewise. Filled only when ResolveStereo receives a stats pointer.
-    struct TemporalEyeStats {
-        std::uint32_t edgeCandidatePixels = 0;
-        std::uint32_t blendedPixels = 0;
-        std::uint32_t weightMilliSum = 0;
-        std::uint32_t deltaMilliSum = 0;
-    };
-
-    struct TemporalStats {
-        std::array<TemporalEyeStats, 2> eyes{};
-        bool valid = false;
     };
 
     TscmaaPass() = default;
@@ -125,26 +94,18 @@ public:
         ID3D11Texture2D* source,
         std::uint64_t pairToken) noexcept;
     [[nodiscard]] bool HasFreshMotionVectors(std::uint64_t pairToken) const noexcept;
-    [[nodiscard]] bool ReadMotionVectorValues(
-        ID3D11DeviceContext* immediateContext,
-        std::size_t eye,
-        MotionVectorValueDiagnostics& diagnostics) const noexcept;
 
     // UI quality is 0=low, 1=medium, 2=high and maps to official CMAA2
     // presets 1/2/3 (edge thresholds .10/.07/.05). History weight is the
     // accepted stereo.209 uncapped contract: 0.7 through the inclusive 2px
-    // deadzone, then official x30 UV attenuation only. Returned textures
-    // remain owned by this pass. A non-null stats pointer additionally
-    // dispatches the diagnostic counter shader and blocks on a 32-byte
-    // readback, so it must stay on the sparse diagnostics cadence.
+    // deadzone, then official x30 UV attenuation only. Returned textures remain owned by this pass.
     [[nodiscard]] bool ResolveStereo(
         ID3D11DeviceContext* immediateContext,
         const std::array<ID3D11Texture2D*, 2>& colors,
         bool srgb,
         int quality,
         std::uint64_t pairToken,
-        std::array<ID3D11Texture2D*, 2>& outputs,
-        TemporalStats* stats = nullptr) noexcept;
+        std::array<ID3D11Texture2D*, 2>& outputs) noexcept;
 
     // CPU mirror of the shader's history-weight function, intentionally public
     // so offline/WARP contracts can pin pixel-domain x/y behavior and cutoffs.
@@ -233,8 +194,7 @@ private:
         ID3D11Texture2D* source) noexcept;
     [[nodiscard]] bool RecordEye(
         std::size_t eye,
-        int quality,
-        bool collectStats) noexcept;
+        int quality) noexcept;
     void BindFullscreenState() noexcept;
     void SetViewport(UINT width, UINT height) noexcept;
     void UnbindGraphicsResources() noexcept;
@@ -250,7 +210,6 @@ private:
     ID3D11VertexShader* fullscreenVs_ = nullptr;
     ID3D11PixelShader* copyPs_ = nullptr;
     ID3D11PixelShader* temporalPs_ = nullptr;
-    ID3D11ComputeShader* temporalStatsCs_ = nullptr;
     ID3D11RasterizerState* rasterizerState_ = nullptr;
     ID3D11DepthStencilState* depthStencilState_ = nullptr;
     ID3D11SamplerState* linearSampler_ = nullptr;
@@ -267,8 +226,6 @@ private:
     BufferTarget workingDeferredItems_{};
     BufferTarget workingControl_{};
     BufferTarget workingIndirect_{};
-    BufferTarget temporalStats_{};
-    ID3D11Buffer* temporalStatsStaging_ = nullptr;
 
     std::array<ColorTarget, 2> spatial_{};
     std::array<std::array<ColorTarget, 2>, 2> resolved_{};

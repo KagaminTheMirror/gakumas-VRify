@@ -9,7 +9,7 @@
 namespace gakumas::vr::perf {
 
 // One accumulator per call site AND thread. No locks, GPU queries, allocation,
-// or logging on the hot path; the sink runs at most once per second per site.
+// or logging on the hot path; the sink runs at most once per ten seconds per site.
 // These are inclusive CPU wall times, not GPU execution times. Nested scopes
 // overlap and must not be added together. A stalled call reports after return.
 struct Accumulator {
@@ -32,7 +32,7 @@ struct Accumulator {
         if (ms >= 16.0) ++over16;
         if (ms >= 50.0) ++over50;
         const double windowMs = std::chrono::duration<double, std::milli>(end - window).count();
-        if (windowMs < 1000.0) return;
+        if (windowMs < 10000.0) return;
         char line[512]{};
         const int length = std::snprintf(line, sizeof(line),
             "[VR][perf] PERF_TIMING stage=%s samples=%llu windowMs=%.3f hz=%.2f avgMs=%.3f maxMs=%.3f over16=%llu over50=%llu a=%llu b=%llu",

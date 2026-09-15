@@ -12,8 +12,4 @@ void InstallUnityAnalogScrollHook() noexcept;
 [[nodiscard]] bool QueueUnityAnalogScrollDelta(float x, float y) noexcept;
 void ResetUnityAnalogScroll() noexcept;
 
-// Installs read-only managed IL2CPP hooks. This function is an optional probe
-// and must only be called under Config::vrDiagnosticsStartupEnabled.
-void InstallScrollInputDiagnosticHooks() noexcept;
-
 } // namespace gakumas::vr::input

@@ -498,7 +498,7 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
             }
             VR_PERF_SCOPE(mirror, "xr.render-mirror", [&](std::string_view line) noexcept { log.Write(line); });
             mirrorReady = RenderMirrorFrame(
-                sourceFrame, sourceFrameGeneration, frame.pointers, log);
+                sourceFrame, frame.pointers, log);
             mirrorResult = lastResult_;
             if (mirrorReady) {
                 frame.sourceFrameGeneration = sourceFrameGeneration;
@@ -726,31 +726,21 @@ OpenXrContext::FrameResult OpenXrContext::EndPrepared(
     static thread_local perf::Accumulator endTiming;
     const bool timing = GakumasLocal::Config::vrDiagnosticsStartupEnabled;
     const auto timingSink = [&log](std::string_view line) noexcept { log.Write(line); };
-    static thread_local perf::Accumulator markerBeginTiming;
-    perf::Scope markerBeginScope(markerBeginTiming, timing, "xr.hitch-marker-begin", timingSink);
-    auto gpuMarker = endGpuMarker_.Begin(timing, sessionDevice_, sessionContext_);
-    markerBeginScope.Stop();
     perf::Scope endScope(endTiming, timing, "xr.end-frame", timingSink,
         sessionState_, endInfo.layerCount);
     perf::HitchCall endHitch(timing);
     const XrResult endResult = dispatch_.EndFrame()(session_, &endInfo);
     endHitch.Stop();
     endScope.Stop();
-    static thread_local perf::Accumulator markerFinishTiming;
-    perf::Scope markerFinishScope(markerFinishTiming, timing, "xr.hitch-marker-finish", timingSink);
-    endGpuMarker_.Finish(sessionContext_, gpuMarker);
-    markerFinishScope.Stop();
     const bool success = XR_SUCCEEDED(endResult);
     (void)coordinator_.CompleteEnd(ticket.frameId, success);
     LogFrame(log, "END_RETURNED", ticket, work->layers.displayTime);
     if (timing) {
-        char gpuDetails[256]{};
-        perf::EndGpuMarker::Describe(gpuMarker, gpuDetails);
         if (!hitchReadyLogged_) {
             hitchReadyLogged_ = true;
-            log.Write(std::string("[VR][perf] FRAME_HITCH_READY thresholdMs=20 mode=nonflush-event ") + gpuDetails);
+            log.Write("[VR][perf] FRAME_HITCH_READY thresholdMs=20 mode=cpu-wall");
         }
-        endHitch.Report("end", ticket.frameId, endResult, timingSink, gpuDetails);
+        endHitch.Report("end", ticket.frameId, endResult, timingSink);
     }
     if (XR_FAILED(endResult)) {
         lastResult_ = endResult;

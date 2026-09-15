@@ -1,10 +1,9 @@
+#include "DiagnosticHealth.hpp"
 #include "UnityStereoRenderer.hpp"
 
 #include "StereoGpuPublish.hpp"
 #include "LivePause.hpp"
-#include "LivenessCrashProbe.hpp"
 #include "GripBlurSource.hpp"
-#include "GripTransparencyTrace.hpp"
 #include "SceneReadyGate.hpp"
 #include "VrHandGlowSticks.hpp"
 #include "SkyRenderHooks.hpp"
@@ -13,12 +12,10 @@
 #include "frame/FrameLoopDriver.hpp"
 #include "camera/FovEquivalence.hpp"
 #include "camera/ProjectionIntrinsics.hpp"
-#include "d3d11/TextureFingerprint.hpp"
 #include "../GakumasLocalify/Il2cppUtils.hpp"
 #include "config/VrifyConfig.hpp"
 #include "PerformanceTiming.hpp"
 #include "PerformanceProbe.hpp"
-#include "SrpPerformanceTrace.hpp"
 #include "DiscoveryPresenceIndex.hpp"
 #include "DiscoveryNativeQuery.hpp"
 #include "../deps/UnityResolve/UnityResolve.hpp"
@@ -53,7 +50,6 @@ using UnityMatrix4x4 = UnityResolve::UnityType::Matrix4x4;
 
 // Only Tick's diagnostic-gated capture starts this tree. Helpers contribute
 // children on the owner thread; calls outside a sampled Tick remain inactive.
-thread_local perf::SrpTrace tickTrace;
 
 // The authored far-background mountain shell and VL cloud cards extend well
 // beyond the source camera's 1000 m far plane. Grip's narrow frustum mostly
@@ -785,33 +781,7 @@ bool MethodArgTypeContains(
     return method->args[index]->pType->name.find(needle) != std::string::npos;
 }
 
-void DumpSetupCameraCandidates(
-    UnityResolve::Class* klass, const char* typeName) noexcept {
-    if (klass == nullptr || typeName == nullptr) {
-        return;
-    }
-    std::uint32_t logged = 0;
-    for (auto* method : klass->methods) {
-        if (method == nullptr ||
-            method->name.find("SetupCamera") == std::string::npos) {
-            continue;
-        }
-        if (logged >= 16U) {
-            break;
-        }
-        ++logged;
-        WriteVrLog(
-            std::string("[VR][shadow] MATCAP_SETUP_CANDIDATE type=") +
-            typeName + ' ' + MethodSignature(method) +
-            " fn=" + (method->function != nullptr ? "1" : "0") +
-            " info=" + (method->address != nullptr ? "1" : "0"));
-    }
-    if (logged == 0U) {
-        WriteVrLog(
-            std::string("[VR][shadow] MATCAP_SETUP_CANDIDATE type=") +
-            typeName + " none");
-    }
-}
+
 
 UnityResolve::Method* PickSetupCameraProperties(
     UnityResolve::Class* klass,
@@ -1470,26 +1440,6 @@ bool UnityStereoRenderer::EnsureManagedApi() noexcept {
                  {"System.IntPtr", "UnityEngine.Matrix4x4&"}},
             });
     }
-    UnityResolve::Method* cameraGetProjectionMatrixInjected = nullptr;
-    UnityResolve::Method* cameraGetNonJitteredProjectionMatrixInjected = nullptr;
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        cameraGetProjectionMatrixInjected = ResolveStrictMethodAny(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "Camera",
-            "get_projectionMatrix_Injected",
-            {
-                {false, "System.Void", {"UnityEngine.Matrix4x4&"}},
-                {true, "System.Void",
-                 {"System.IntPtr", "UnityEngine.Matrix4x4&"}},
-            });
-        cameraGetNonJitteredProjectionMatrixInjected = ResolveStrictMethodAny(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "Camera",
-            "get_nonJitteredProjectionMatrix_Injected",
-            {
-                {false, "System.Void", {"UnityEngine.Matrix4x4&"}},
-                {true, "System.Void",
-                 {"System.IntPtr", "UnityEngine.Matrix4x4&"}},
-            });
-    }
     auto* cameraGetDepth = ResolveStrictMethod(
         "UnityEngine.CoreModule.dll", "UnityEngine", "Camera",
         "get_depth", false, "System.Single", {});
@@ -2133,18 +2083,6 @@ bool UnityStereoRenderer::EnsureManagedApi() noexcept {
         cameraGetLensShiftInjected->static_function;
     api_.lensShiftSetterUsesNativeSelf =
         cameraSetLensShiftInjected->static_function;
-    if (cameraGetProjectionMatrixInjected != nullptr) {
-        api_.cameraGetProjectionMatrixInjected =
-            MethodReference(cameraGetProjectionMatrixInjected);
-        api_.projectionGetterUsesNativeSelf =
-            cameraGetProjectionMatrixInjected->static_function;
-    }
-    if (cameraGetNonJitteredProjectionMatrixInjected != nullptr) {
-        api_.cameraGetNonJitteredProjectionMatrixInjected =
-            MethodReference(cameraGetNonJitteredProjectionMatrixInjected);
-        api_.nonJitteredProjectionGetterUsesNativeSelf =
-            cameraGetNonJitteredProjectionMatrixInjected->static_function;
-    }
     api_.cameraSetProjectionMatrixInjected =
         MethodReference(cameraSetProjectionMatrixInjected);
     api_.projectionUsesNativeSelf =
@@ -3112,9 +3050,6 @@ bool UnityStereoRenderer::CreateRenderTarget(
             std::string(eye == 0U ? "left" : "right") + " " +
             DescriptorState(effectiveDescriptor));
     }
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::RenderTarget, family, *target, *handle,
-        static_cast<std::intptr_t>(eye));
     return true;
 }
 
@@ -3150,9 +3085,6 @@ bool UnityStereoRenderer::RetireFullTargets(
                     api_.cameraSetTargetTexture, eyeCameras_[eye], nullptr)) {
                 return FailStage("resources.full-target-unbind", eye);
             }
-            RecordLifetimeWrite(
-                LifetimeWriteCategory::TargetTexture, "eye-unbind",
-                eyeCameras_[eye], nullptr, static_cast<std::intptr_t>(eye));
         }
         std::string exception;
         if (!RuntimeInvoke(api_.renderTextureRelease, fullTargets_[eye], nullptr,
@@ -3161,9 +3093,6 @@ bool UnityStereoRenderer::RetireFullTargets(
                 exception + '"');
             return FailStage("resources.full-target-release", eye);
         }
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::RenderTarget, "release", fullTargets_[eye],
-            fullTargetHandles_[eye], static_cast<std::intptr_t>(eye));
         if (fullTargetHandles_[eye] != nullptr) {
             retiredFullTargetHandles_.push_back(fullTargetHandles_[eye]);
         }
@@ -3174,7 +3103,6 @@ bool UnityStereoRenderer::RetireFullTargets(
     fullHeight_ = 0;
     fullGeneration_ = 0;
     continuousStereo_ = false;
-    sourceFingerprintValid_.fill(false);
     ResetNativeTextureLease(colorNativeLeases_[0]);
     ResetNativeTextureLease(colorNativeLeases_[1]);
     Log("[VR][stereo] NATIVE_POINTER_CACHE_INVALIDATE role=color reason=full-target-retired");
@@ -3208,7 +3136,6 @@ bool UnityStereoRenderer::EnsureFullTarget(
                 fullGeneration_ = generation;
                 InvalidateUnityStereoFrame();
                 continuousStereo_ = false;
-                sourceFingerprintValid_.fill(false);
                 ResetNativeTextureLease(colorNativeLeases_[0]);
                 ResetNativeTextureLease(colorNativeLeases_[1]);
                 Log("[VR][stereo] NATIVE_POINTER_CACHE_INVALIDATE role=color reason=generation-rebound");
@@ -3245,9 +3172,6 @@ bool UnityStereoRenderer::SetGameObjectActive(
         return false;
     }
     gameObjectActive_[eye] = active;
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::EyeGameObject, "set-active",
-        eyeGameObjects_[eye], nullptr, active ? 1 : 0);
     Log("[VR][stereo] CALL_OK stage=game-object-set-active eye=" +
         std::string(eye == 0U ? "left" : "right") +
         " value=" + (active ? "1" : "0"));
@@ -3269,9 +3193,6 @@ bool UnityStereoRenderer::SetCameraEnabled(
         return false;
     }
     cameraEnabled_[eye] = enabled;
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::EyeCamera, "set-enabled", eyeCameras_[eye],
-        nullptr, enabled ? 1 : 0);
     Log("[VR][stereo] CALL_OK stage=camera-set-enabled eye=" +
         std::string(eye == 0U ? "left" : "right") +
         " value=" + (enabled ? "1" : "0"));
@@ -3299,9 +3220,6 @@ bool UnityStereoRenderer::WriteSourceCameraEnabled(
     if (!InvokeManagedVoid<SetEnabled>(api_.behaviourSetEnabled, camera, enabled)) {
         return false;
     }
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::SourceCamera, "set-enabled", camera, nullptr,
-        enabled ? 1 : 0);
     return true;
 }
 
@@ -3364,9 +3282,6 @@ void UnityStereoRenderer::ApplySourceTinyMode(void* sourceCamera) noexcept {
         Log("[VR][stereo] SOURCE_TINY failed=write");
         return;
     }
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::TargetTexture, "source-tiny-bind",
-        sourceCamera, tinySourceTarget_);
     if (!tinyModeActive_) {
         tinyModeActive_ = true;
         tinySourceCamera_ = sourceCamera;
@@ -3408,9 +3323,6 @@ void UnityStereoRenderer::LiftSourceTinyMode(const char* reason) noexcept {
                                              tinySavedTarget_)) {
                 Log("[VR][stereo] SOURCE_TINY_LIFTED failed=write");
             } else {
-                RecordLifetimeWrite(
-                    LifetimeWriteCategory::TargetTexture, "source-tiny-lift",
-                    tinySourceCamera_, tinySavedTarget_);
             }
         }
     }
@@ -3497,15 +3409,12 @@ void UnityStereoRenderer::SuppressSourceCamera(void* sourceCamera) noexcept {
         sourceSuppressLogged_ = true;
         Log("[VR][stereo] SOURCE_CAMERA_SUPPRESSED camera=0x" +
             std::to_string(reinterpret_cast<std::uintptr_t>(sourceCamera)));
-        ResetSkyTaaSamples();
     }
     SyncEyeAsMainCameraTag();
 }
 
 void UnityStereoRenderer::SyncSourceCameraSuppression(void* sourceCamera) noexcept {
-    perf::SrpSpan photoProtection(tickTrace, "tick.suppression.photo-protection");
     RefreshLiveSourcePhotoProtection();
-    photoProtection.Stop();
     if (LiveSourcePhotoProtectionActive()) {
         // Preserve the official full-size capture surface during the Produce
         // automatic-photo task. Reuse the established
@@ -3550,7 +3459,6 @@ void UnityStereoRenderer::SyncSourceCameraSuppression(void* sourceCamera) noexce
 }
 
 void UnityStereoRenderer::PublishGripTransparency() noexcept {
-    perf::SrpSpan transparency(tickTrace, "tick.suppression.grip-transparency");
     // Reads the suppression state the apply/lift paths maintain; never
     // writes source-camera or target state itself. Config off, tiny lifted,
     // or source restored all publish "opaque" on the next pass. The UI
@@ -3570,12 +3478,10 @@ void UnityStereoRenderer::PublishGripTransparency() noexcept {
         // ~2 s of per-frame branch sequence instead (.254: measures the
         // fb/native alternation pattern per screen).
         gripExecFixupLogBudget_.store(
-            GakumasLocal::Config::vrDiagnosticsStartupEnabled ? 120 : 4,
+            4,
             std::memory_order_relaxed);
         if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
             // Plate census: immediate pass plus a settled pass ~3 s later.
-            gripPlateCensusRuns_ = 2;
-            gripPlateCensusDelay_ = 0;
         }
     }
     gripTransparencyArmed_.store(armed, std::memory_order_release);
@@ -3614,7 +3520,6 @@ struct UiDiscoveryBatch {
 std::vector<void*> FindUiObjectsWithPresenceCheck(UnityResolve::Class* klass) noexcept;
 
 void UnityStereoRenderer::SyncGripUiPassClear(bool armed) noexcept {
-    perf::SrpSpan passClear(tickTrace, "tick.grip.sync-pass-clear");
     if (!armed) {
         if (gripIntermediateLastPublished_ != 0U) {
             // Release the Present-hook clear targets the moment
@@ -3624,7 +3529,6 @@ void UnityStereoRenderer::SyncGripUiPassClear(bool armed) noexcept {
             Log("[VR][stereo] GRIP_TRANSPARENCY_RT_PUBLISH count=0 "
                 "reason=disarm");
         }
-        gripPlateCensusRuns_ = 0;
         if (!gripPlateHides_.empty()) {
             RestoreGripPlateHide("disarm");
         }
@@ -3651,22 +3555,9 @@ void UnityStereoRenderer::SyncGripUiPassClear(bool armed) noexcept {
     // get published, and the plate hides / official mutes re-assert.
     gripUiPassRescanCountdown_ = 30;
     ApplyGripUiPassClear();
-    MaybeRunGripPlateCensus();
 }
 
-void UnityStereoRenderer::MaybeRunGripPlateCensus() noexcept {
-    if (gripPlateCensusRuns_ <= 0) {
-        return;
-    }
-    if (gripPlateCensusDelay_ > 0) {
-        --gripPlateCensusDelay_;
-        return;
-    }
-    --gripPlateCensusRuns_;
-    // ~3 s between passes: the second one catches late-loaded screen UI.
-    gripPlateCensusDelay_ = 6;
-    RunGripPlateCensus(gripPlateCensusRuns_ == 1 ? "arm" : "settled");
-}
+
 
 namespace {
 
@@ -3684,620 +3575,11 @@ bool Il2cppClassDerivesFrom(void* klass, void* baseKlass) noexcept {
 
 } // namespace
 
-void UnityStereoRenderer::RunGripPlateCensus(const char* phase) noexcept {
-    auto* graphicClass = Il2cppUtils::GetClass(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "Graphic");
-    auto* imageClass = Il2cppUtils::GetClass(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "Image");
-    auto* rawImageClass = Il2cppUtils::GetClass(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "RawImage");
-    if (graphicClass == nullptr) {
-        return;
-    }
-    static const std::int32_t colorOffset = FindNamedFieldOffset(
-        graphicClass, {"m_Color"}, {"UnityEngine.Color", "Color"});
-    static MethodRef imageGetSprite = MethodReference(ResolveStrictMethodAny(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "Image", "get_sprite",
-        {
-            {false, "UnityEngine.Sprite", {}},
-            {false, "Sprite", {}},
-        }));
-    static MethodRef rawImageGetTexture =
-        MethodReference(ResolveStrictMethodAny(
-            "UnityEngine.UI.dll", "UnityEngine.UI", "RawImage", "get_texture",
-            {
-                {false, "UnityEngine.Texture", {}},
-                {false, "Texture", {}},
-            }));
-    static MethodRef gameObjectActiveInHierarchy =
-        MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "GameObject",
-            "get_activeInHierarchy", false, "System.Boolean", {}));
-    // .243: full-stretch detection. The lobby census drowned in widget
-    // noise (hits=165, caps exhausted by pager dots and buttons) and the
-    // real board never got logged. Anchors (0,0)-(1,1) mark full-screen
-    // boards; Vector2 returns are 8 bytes → RAX on win64, ABI-safe.
-    static MethodRef rectGetAnchorMin = MethodReference(ResolveStrictMethodAny(
-        "UnityEngine.CoreModule.dll", "UnityEngine", "RectTransform",
-        "get_anchorMin",
-        {
-            {false, "UnityEngine.Vector2", {}},
-            {false, "Vector2", {}},
-        }));
-    static MethodRef rectGetAnchorMax = MethodReference(ResolveStrictMethodAny(
-        "UnityEngine.CoreModule.dll", "UnityEngine", "RectTransform",
-        "get_anchorMax",
-        {
-            {false, "UnityEngine.Vector2", {}},
-            {false, "Vector2", {}},
-        }));
-    if (colorOffset < 0 || !api_.behaviourGetEnabled.Ready() ||
-        !api_.componentGetGameObject.Ready()) {
-        Log("[VR][stereo] GRIP_TRANSPARENCY_PLATE_API miss colorOffset=" +
-            std::to_string(colorOffset));
-        return;
-    }
-    using GetPtr = void* (*)(void*, void*);
-    using GetBool = bool (*)(void*, void*);
-    struct PlateColor {
-        float r = 0.0F;
-        float g = 0.0F;
-        float b = 0.0F;
-        float a = 0.0F;
-    };
-    std::size_t scanned = 0;
-    std::size_t hits = 0;
-    std::size_t logged = 0;
-    std::size_t advLogged = 0;
-    std::size_t boardLogged = 0;
-    constexpr std::size_t kLogCap = 24;
-    // .237: the gray cinematic board and the still-black vertical dialogue
-    // proved the color-gated census misses mid-tone plates. Everything
-    // under an Adv wrapper/engine gets logged regardless of color.
-    constexpr std::size_t kAdvLogCap = 40;
-    constexpr std::size_t kBoardLogCap = 16;
-    for (void* graphic : FindManagedObjectsOfType(graphicClass)) {
-        if (graphic == nullptr || !IsUnityManagedObjectAlive(graphic)) {
-            continue;
-        }
-        ++scanned;
-        PlateColor color{};
-        if (!ReadManagedField(graphic, colorOffset, &color)) {
-            continue;
-        }
-        void* klass =
-            UnityResolve::Invoke<void*>("il2cpp_object_get_class", graphic);
-        const char* className = klass != nullptr
-            ? UnityResolve::Invoke<const char*>(
-                  "il2cpp_class_get_name", klass)
-            : nullptr;
-        // White text is the biggest false-positive class; plates are
-        // Image/RawImage-derived boards.
-        if (className != nullptr &&
-            std::strstr(className, "Text") != nullptr) {
-            continue;
-        }
-        bool enabled = false;
-        if (!InvokeManagedResult<bool, GetBool>(
-                api_.behaviourGetEnabled, &enabled, graphic) ||
-            !enabled) {
-            continue;
-        }
-        void* gameObject = nullptr;
-        if (!InvokeManagedResult<void*, GetPtr>(
-                api_.componentGetGameObject, &gameObject, graphic) ||
-            gameObject == nullptr) {
-            continue;
-        }
-        bool activeInHierarchy = true;
-        if (gameObjectActiveInHierarchy.Ready()) {
-            InvokeManagedResult<bool, GetBool>(
-                gameObjectActiveInHierarchy, &activeInHierarchy, gameObject);
-        }
-        if (!activeInHierarchy) {
-            continue;
-        }
-        // Parent path (up to 6 hops, reaches the Adv roots): Object.name on
-        // a Transform yields the GameObject name.
-        std::string path = ManagedObjectName(graphic);
-        if (api_.componentGetTransform.Ready() &&
-            api_.transformGetParent.Ready()) {
-            void* transform = nullptr;
-            InvokeManagedResult<void*, GetPtr>(
-                api_.componentGetTransform, &transform, graphic);
-            for (int hop = 0; hop < 6 && transform != nullptr; ++hop) {
-                void* parent = nullptr;
-                if (!InvokeManagedResult<void*, GetPtr>(
-                        api_.transformGetParent, &parent, transform) ||
-                    parent == nullptr) {
-                    break;
-                }
-                path = ManagedObjectName(parent) + "/" + path;
-                transform = parent;
-            }
-        }
-        // Home joins the color-blind subtree census (.240: the lobby white
-        // survives direct-fb forcing, so it is content inside the home UI
-        // that every color gate missed — same lesson as BackgroundBase).
-        const bool advScoped = path.find("Adv") != std::string::npos ||
-            path.find("ADVEngine") != std::string::npos ||
-            (path.find("Home") != std::string::npos && color.a >= 0.3F);
-        // .243: full-stretch boards get their own priority lane; the caps
-        // above are routinely exhausted by widget noise before any real
-        // backdrop board is reached. .244: anchors are PARENT-relative, so
-        // a gauge fill stretched inside its small container false-hits —
-        // require the graphic AND its parent chain to stretch, up to a
-        // Canvas-named ancestor (fixed-size widget containers break the
-        // chain and get filtered).
-        bool fullStretch = false;
-        if (rectGetAnchorMin.Ready() && rectGetAnchorMax.Ready() &&
-            api_.componentGetTransform.Ready() &&
-            api_.transformGetParent.Ready()) {
-            struct Vec2 {
-                float x;
-                float y;
-            };
-            using GetVec2 = Vec2 (*)(void*, void*);
-            const auto isStretched = [&](void* rectTransform) -> bool {
-                Vec2 anchorMin{1.0F, 1.0F};
-                Vec2 anchorMax{0.0F, 0.0F};
-                return InvokeManagedResult<Vec2, GetVec2>(
-                           rectGetAnchorMin, &anchorMin, rectTransform) &&
-                    InvokeManagedResult<Vec2, GetVec2>(
-                        rectGetAnchorMax, &anchorMax, rectTransform) &&
-                    anchorMin.x <= 0.01F && anchorMin.y <= 0.01F &&
-                    anchorMax.x >= 0.99F && anchorMax.y >= 0.99F;
-            };
-            void* rectTransform = nullptr;
-            InvokeManagedResult<void*, GetPtr>(
-                api_.componentGetTransform, &rectTransform, graphic);
-            if (rectTransform != nullptr && isStretched(rectTransform)) {
-                // .245: button effects nest 5+ stretched containers deep,
-                // so the walk must actually REACH a Canvas ancestor with
-                // every level stretched — otherwise it is a widget.
-                bool chainStretched = true;
-                bool reachedCanvas = false;
-                void* current = rectTransform;
-                for (int hop = 0; hop < 10 && chainStretched; ++hop) {
-                    void* parent = nullptr;
-                    if (!InvokeManagedResult<void*, GetPtr>(
-                            api_.transformGetParent, &parent, current) ||
-                        parent == nullptr) {
-                        break;
-                    }
-                    const std::string parentName = ManagedObjectName(parent);
-                    if (parentName.find("Canvas") != std::string::npos) {
-                        reachedCanvas = true;
-                        break;
-                    }
-                    if (!isStretched(parent)) {
-                        chainStretched = false;
-                    }
-                    current = parent;
-                }
-                fullStretch = chainStretched && reachedCanvas;
-            }
-        }
-        const bool boardHit =
-            fullStretch && color.a >= 0.3F && boardLogged < kBoardLogCap;
-        // .236: the lobby's white wash never showed at the .235 a>0.85
-        // threshold — translucent white boards stacked over the cleared
-        // black base read as white. Census down to a>=0.3, tone marked
-        // -translucent below 0.85.
-        const bool nearBlack =
-            color.r < 0.2F && color.g < 0.2F && color.b < 0.2F;
-        const bool nearWhite =
-            color.r > 0.85F && color.g > 0.85F && color.b > 0.85F;
-        const bool plateHit =
-            color.a >= 0.3F && (nearBlack || nearWhite);
-        if (!plateHit && !boardHit &&
-            !(advScoped && advLogged < kAdvLogCap)) {
-            continue;
-        }
-        // Sprite / texture identity: the "universal plate" hypothesis says
-        // these boards share an asset.
-        std::string assetName = "-";
-        if (imageClass != nullptr && imageGetSprite.Ready() &&
-            Il2cppClassDerivesFrom(klass, imageClass->address)) {
-            void* sprite = nullptr;
-            if (InvokeManagedResult<void*, GetPtr>(
-                    imageGetSprite, &sprite, graphic) &&
-                sprite != nullptr) {
-                assetName = ManagedObjectName(sprite);
-            }
-        } else if (
-            rawImageClass != nullptr && rawImageGetTexture.Ready() &&
-            Il2cppClassDerivesFrom(klass, rawImageClass->address)) {
-            void* texture = nullptr;
-            if (InvokeManagedResult<void*, GetPtr>(
-                    rawImageGetTexture, &texture, graphic) &&
-                texture != nullptr) {
-                assetName = ManagedObjectName(texture);
-            }
-        }
-        if (boardHit) {
-            ++boardLogged;
-            std::ostringstream stream;
-            stream << "[VR][stereo] GRIP_TRANSPARENCY_BOARD phase=" << phase
-                   << " class=" << (className != nullptr ? className : "?")
-                   << " color=" << color.r << ',' << color.g << ',' << color.b
-                   << ',' << color.a << " asset=\"" << assetName
-                   << "\" path=\"" << path << "\"";
-            Log(stream.str());
-        }
-        if (advScoped && advLogged < kAdvLogCap) {
-            ++advLogged;
-            std::ostringstream stream;
-            stream << "[VR][stereo] GRIP_TRANSPARENCY_ADV phase=" << phase
-                   << " class=" << (className != nullptr ? className : "?")
-                   << " color=" << color.r << ',' << color.g << ',' << color.b
-                   << ',' << color.a << " asset=\"" << assetName
-                   << "\" path=\"" << path << "\"";
-            Log(stream.str());
-        }
-        if (!plateHit) {
-            continue;
-        }
-        ++hits;
-        if (logged >= kLogCap) {
-            continue;
-        }
-        ++logged;
-        std::ostringstream stream;
-        stream << "[VR][stereo] GRIP_TRANSPARENCY_PLATE phase=" << phase
-               << " class=" << (className != nullptr ? className : "?")
-               << " tone=" << (nearBlack ? "black" : "white")
-               << (color.a < 0.85F ? "-translucent" : "")
-               << " color=" << color.r << ',' << color.g << ',' << color.b
-               << ',' << color.a << " asset=\"" << assetName << "\" path=\""
-               << path << "\"";
-        Log(stream.str());
-    }
-    std::ostringstream stream;
-    stream << "[VR][stereo] GRIP_TRANSPARENCY_PLATE_SUMMARY phase=" << phase
-           << " scanned=" << scanned << " hits=" << hits
-           << " logged=" << logged << " adv=" << advLogged
-           << " board=" << boardLogged;
-    Log(stream.str());
-    RunGripCameraCensus(phase);
-}
 
-void UnityStereoRenderer::RunGripCameraCensus(const char* phase) noexcept {
-    // .237: the cinematic-mode probe showed the whole backbuffer painted a
-    // uniform opaque gray-blue (0xff585549 = RGB 73,85,88) every frame with
-    // all our clears active — the painter is a camera SolidColor clear.
-    // Census every camera's clear setup to name it.
-    auto* cameraClass = Il2cppUtils::GetClass(
-        "UnityEngine.CoreModule.dll", "UnityEngine", "Camera");
-    if (cameraClass == nullptr || !api_.behaviourGetEnabled.Ready() ||
-        !api_.cameraGetTargetTexture.Ready()) {
-        return;
-    }
-    static UnityResolve::Method* clearFlagsMethod = ResolveStrictMethodAny(
-        "UnityEngine.CoreModule.dll", "UnityEngine", "Camera",
-        "get_clearFlags",
-        {
-            {false, "UnityEngine.CameraClearFlags", {}},
-            {false, "CameraClearFlags", {}},
-        });
-    static UnityResolve::Method* backgroundMethod = ResolveStrictMethodAny(
-        "UnityEngine.CoreModule.dll", "UnityEngine", "Camera",
-        "get_backgroundColor_Injected",
-        {
-            {false, "System.Void", {"UnityEngine.Color&"}},
-            {true, "System.Void", {"System.IntPtr", "UnityEngine.Color&"}},
-        });
-    static const MethodRef getClearFlags = MethodReference(clearFlagsMethod);
-    static const MethodRef getBackground = MethodReference(backgroundMethod);
-    static const bool backgroundUsesNativeSelf =
-        backgroundMethod != nullptr && backgroundMethod->static_function;
-    using GetInt = std::int32_t (*)(void*, void*);
-    using GetFloat = float (*)(void*, void*);
-    using GetPtr = void* (*)(void*, void*);
-    using GetBool = bool (*)(void*, void*);
-    using ColorAccess = void (*)(void*, void*, void*);
-    for (void* camera : FindManagedObjectsOfType(cameraClass)) {
-        if (camera == nullptr || !IsUnityManagedObjectAlive(camera)) {
-            continue;
-        }
-        bool enabled = false;
-        InvokeManagedResult<bool, GetBool>(
-            api_.behaviourGetEnabled, &enabled, camera);
-        void* target = nullptr;
-        InvokeManagedResult<void*, GetPtr>(
-            api_.cameraGetTargetTexture, &target, camera);
-        std::int32_t clearFlags = -1;
-        if (getClearFlags.Ready()) {
-            InvokeManagedResult<std::int32_t, GetInt>(
-                getClearFlags, &clearFlags, camera);
-        }
-        float background[4]{};
-        if (getBackground.Ready()) {
-            void* self = backgroundUsesNativeSelf
-                ? ReadUnityNativePointer(camera)
-                : camera;
-            if (self != nullptr) {
-                InvokeManagedVoid<ColorAccess>(
-                    getBackground, self, background);
-            }
-        }
-        float depth = 0.0F;
-        if (api_.cameraGetDepth.Ready()) {
-            InvokeManagedResult<float, GetFloat>(
-                api_.cameraGetDepth, &depth, camera);
-        }
-        std::ostringstream stream;
-        stream << "[VR][stereo] GRIP_TRANSPARENCY_CAMERA phase=" << phase
-               << " name=\"" << ManagedObjectName(camera) << "\" enabled="
-               << (enabled ? 1 : 0) << " target=" << (target != nullptr ? 1 : 0)
-               << " depth=" << depth << " clearFlags=" << clearFlags
-               << " bg=" << background[0] << ',' << background[1] << ','
-               << background[2] << ',' << background[3];
-        Log(stream.str());
-    }
-    RunGripSnapshotCensus(phase);
-}
 
-void UnityStereoRenderer::RunGripSnapshotCensus(const char* phase) noexcept {
-    // .257: name the frozen-frame family. Per .245/.254 the frozen popup /
-    // desk-view / transition backdrops are point-in-time snapshots
-    // (CaptureUtility Texture2D or per-presenter capture fields) shown by
-    // ordinary RawImages — unreachable by the RT clears, invisible to the
-    // color-gated plate census. Lane 1 logs every active RawImage whose
-    // texture is a Texture2D (the snapshot signature); lane 2 logs every
-    // VLSRPTargetImage with its Target/Captured type. Diagnostics-only.
-    auto* rawImageClass = Il2cppUtils::GetClass(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "RawImage");
-    if (rawImageClass == nullptr || !api_.behaviourGetEnabled.Ready() ||
-        !api_.componentGetGameObject.Ready()) {
-        return;
-    }
-    static MethodRef rawImageGetTexture =
-        MethodReference(ResolveStrictMethodAny(
-            "UnityEngine.UI.dll", "UnityEngine.UI", "RawImage", "get_texture",
-            {
-                {false, "UnityEngine.Texture", {}},
-                {false, "Texture", {}},
-            }));
-    static MethodRef gameObjectActiveInHierarchy =
-        MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "GameObject",
-            "get_activeInHierarchy", false, "System.Boolean", {}));
-    if (!rawImageGetTexture.Ready()) {
-        return;
-    }
-    using GetPtr = void* (*)(void*, void*);
-    using GetBool = bool (*)(void*, void*);
-    const auto parentPath = [this](void* component,
-                                   const std::string& leaf) -> std::string {
-        std::string path = leaf;
-        if (!api_.componentGetTransform.Ready() ||
-            !api_.transformGetParent.Ready()) {
-            return path;
-        }
-        void* transform = nullptr;
-        InvokeManagedResult<void*, GetPtr>(
-            api_.componentGetTransform, &transform, component);
-        for (int hop = 0; hop < 6 && transform != nullptr; ++hop) {
-            void* parent = nullptr;
-            if (!InvokeManagedResult<void*, GetPtr>(
-                    api_.transformGetParent, &parent, transform) ||
-                parent == nullptr) {
-                break;
-            }
-            path = ManagedObjectName(parent) + "/" + path;
-            transform = parent;
-        }
-        return path;
-    };
-    std::size_t tex2dLogged = 0;
-    constexpr std::size_t kTex2dLogCap = 16;
-    for (void* graphic : FindManagedObjectsOfType(rawImageClass)) {
-        if (graphic == nullptr || !IsUnityManagedObjectAlive(graphic)) {
-            continue;
-        }
-        bool enabled = false;
-        if (!InvokeManagedResult<bool, GetBool>(
-                api_.behaviourGetEnabled, &enabled, graphic) ||
-            !enabled) {
-            continue;
-        }
-        void* gameObject = nullptr;
-        if (!InvokeManagedResult<void*, GetPtr>(
-                api_.componentGetGameObject, &gameObject, graphic) ||
-            gameObject == nullptr) {
-            continue;
-        }
-        bool activeInHierarchy = true;
-        if (gameObjectActiveInHierarchy.Ready()) {
-            InvokeManagedResult<bool, GetBool>(
-                gameObjectActiveInHierarchy, &activeInHierarchy, gameObject);
-        }
-        if (!activeInHierarchy) {
-            continue;
-        }
-        void* texture = nullptr;
-        if (!InvokeManagedResult<void*, GetPtr>(
-                rawImageGetTexture, &texture, graphic) ||
-            texture == nullptr) {
-            continue;
-        }
-        void* textureKlass =
-            UnityResolve::Invoke<void*>("il2cpp_object_get_class", texture);
-        const char* textureClassName = textureKlass != nullptr
-            ? UnityResolve::Invoke<const char*>(
-                  "il2cpp_class_get_name", textureKlass)
-            : nullptr;
-        if (textureClassName == nullptr ||
-            std::strcmp(textureClassName, "Texture2D") != 0) {
-            continue;
-        }
-        // .258: the first run drowned in authored icon/thumbnail art
-        // (overflow>100, same lesson as the .243 BOARD lane). Snapshot
-        // captures are runtime-created: unnamed, or screen-region sized.
-        // Authored art always ships an asset name and icons are small.
-        static MethodRef texture2dGetWidth =
-            MethodReference(ResolveStrictMethod(
-                "UnityEngine.CoreModule.dll", "UnityEngine", "Texture2D",
-                "get_width", false, "System.Int32", {}));
-        static MethodRef texture2dGetHeight =
-            MethodReference(ResolveStrictMethod(
-                "UnityEngine.CoreModule.dll", "UnityEngine", "Texture2D",
-                "get_height", false, "System.Int32", {}));
-        using GetInt = std::int32_t (*)(void*, void*);
-        std::int32_t width = 0;
-        std::int32_t height = 0;
-        if (texture2dGetWidth.Ready() && texture2dGetHeight.Ready()) {
-            InvokeManagedResult<std::int32_t, GetInt>(
-                texture2dGetWidth, &width, texture);
-            InvokeManagedResult<std::int32_t, GetInt>(
-                texture2dGetHeight, &height, texture);
-        }
-        const std::string textureName = ManagedObjectName(texture);
-        const bool snapshotSignature =
-            textureName.empty() || (width >= 400 && height >= 400);
-        if (!snapshotSignature) {
-            continue;
-        }
-        if (++tex2dLogged > kTex2dLogCap) {
-            continue;
-        }
-        std::ostringstream stream;
-        stream << "[VR][stereo] GRIP_TRANSPARENCY_TEX2D phase=" << phase
-               << " tex=\"" << textureName << "\" size=" << width << 'x'
-               << height << " path=\""
-               << parentPath(graphic, ManagedObjectName(graphic)) << "\"";
-        Log(stream.str());
-    }
-    if (tex2dLogged > kTex2dLogCap) {
-        Log("[VR][stereo] GRIP_TRANSPARENCY_TEX2D overflow=" +
-            std::to_string(tex2dLogged - kTex2dLogCap));
-    }
-    // Lane 2: VLSRPTargetImage type census (Target=0 live composite,
-    // Captured=1 snapshot display).
-    // .258: TypeDefIndex 40454 falls in the vl-unity.Runtime.dll image
-    // (starts at 40267 per the dump image table) — the .257 guess list
-    // missed it (VLTI_API class=0 on hardware).
-    static UnityResolve::Class* targetImageClass = [] {
-        for (const char* assembly :
-             {"vl-unity.Runtime.dll", "VL.Rendering.dll",
-              "Assembly-CSharp.dll", "campus-submodule.Runtime.dll"}) {
-            auto* klass = Il2cppUtils::GetClass(
-                assembly, "VL.Rendering", "VLSRPTargetImage");
-            if (klass != nullptr) {
-                return klass;
-            }
-        }
-        return static_cast<UnityResolve::Class*>(nullptr);
-    }();
-    static bool vltiLogged = false;
-    if (!vltiLogged) {
-        vltiLogged = true;
-        Log(std::string("[VR][stereo] GRIP_TRANSPARENCY_VLTI_API class=") +
-            (targetImageClass != nullptr ? "1" : "0"));
-    }
-    if (targetImageClass == nullptr) {
-        return;
-    }
-    static const std::int32_t textureTypeOffset = FindNamedFieldOffset(
-        targetImageClass, {"_textureType"}, {});
-    static const std::int32_t imageOffset =
-        FindNamedFieldOffset(targetImageClass, {"_image"}, {});
-    if (textureTypeOffset < 0) {
-        return;
-    }
-    std::size_t vltiCount = 0;
-    constexpr std::size_t kVltiLogCap = 16;
-    for (void* targetImage : FindManagedObjectsOfType(targetImageClass)) {
-        if (targetImage == nullptr ||
-            !IsUnityManagedObjectAlive(targetImage)) {
-            continue;
-        }
-        std::int32_t textureType = -1;
-        ReadManagedField(targetImage, textureTypeOffset, &textureType);
-        bool imageEnabled = false;
-        std::string leaf = ManagedObjectName(targetImage);
-        if (imageOffset >= 0) {
-            void* image = nullptr;
-            if (ReadManagedField(targetImage, imageOffset, &image) &&
-                image != nullptr && IsUnityManagedObjectAlive(image)) {
-                InvokeManagedResult<bool, GetBool>(
-                    api_.behaviourGetEnabled, &imageEnabled, image);
-            }
-        }
-        if (++vltiCount > kVltiLogCap) {
-            continue;
-        }
-        std::ostringstream stream;
-        stream << "[VR][stereo] GRIP_TRANSPARENCY_VLTI phase=" << phase
-               << " type=" << textureType
-               << " imgEnabled=" << (imageEnabled ? 1 : 0) << " path=\""
-               << parentPath(targetImage, leaf) << "\"";
-        Log(stream.str());
-    }
-    if (vltiCount > kVltiLogCap) {
-        Log("[VR][stereo] GRIP_TRANSPARENCY_VLTI overflow=" +
-            std::to_string(vltiCount - kVltiLogCap));
-    }
-    // Lane 3 (.260): full Graphic dump of the HomePage background subtree
-    // — no color or class gates at all. Four census generations missed
-    // the lobby white; .259 proved it is neither the 3dTargetImage nor a
-    // Root RawImage, so name EVERYTHING that draws under BackgroundCanvas
-    // in one pass (the subtree is small; cap only as a safety net).
-    auto* graphicClass = Il2cppUtils::GetClass(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "Graphic");
-    if (graphicClass == nullptr) {
-        return;
-    }
-    static const std::int32_t homeColorOffset = FindNamedFieldOffset(
-        graphicClass, {"m_Color"}, {"UnityEngine.Color", "Color"});
-    struct HomeColor {
-        float r = 0.0F;
-        float g = 0.0F;
-        float b = 0.0F;
-        float a = 0.0F;
-    };
-    std::size_t homeLogged = 0;
-    constexpr std::size_t kHomeLogCap = 40;
-    for (void* graphic : FindManagedObjectsOfType(graphicClass)) {
-        if (graphic == nullptr || !IsUnityManagedObjectAlive(graphic)) {
-            continue;
-        }
-        const std::string path =
-            parentPath(graphic, ManagedObjectName(graphic));
-        if (path.find("BackgroundCanvas") == std::string::npos ||
-            path.find("Home") == std::string::npos) {
-            continue;
-        }
-        bool enabled = false;
-        InvokeManagedResult<bool, GetBool>(
-            api_.behaviourGetEnabled, &enabled, graphic);
-        HomeColor color{};
-        if (homeColorOffset >= 0) {
-            ReadManagedField(graphic, homeColorOffset, &color);
-        }
-        void* klass =
-            UnityResolve::Invoke<void*>("il2cpp_object_get_class", graphic);
-        const char* className = klass != nullptr
-            ? UnityResolve::Invoke<const char*>(
-                  "il2cpp_class_get_name", klass)
-            : "?";
-        if (++homeLogged > kHomeLogCap) {
-            continue;
-        }
-        std::ostringstream stream;
-        stream << "[VR][stereo] GRIP_TRANSPARENCY_HOMEBG_CENSUS phase="
-               << phase << " class=" << (className != nullptr ? className : "?")
-               << " enabled=" << (enabled ? 1 : 0) << " color=" << color.r
-               << ',' << color.g << ',' << color.b << ',' << color.a
-               << " path=\"" << path << "\"";
-        Log(stream.str());
-    }
-    if (homeLogged > kHomeLogCap) {
-        Log("[VR][stereo] GRIP_TRANSPARENCY_HOMEBG_CENSUS overflow=" +
-            std::to_string(homeLogged - kHomeLogCap));
-    }
-}
+
+
+
 
 namespace {
 
@@ -4422,8 +3704,6 @@ bool UnityStereoRenderer::GripUiPassExecuteEnter(
         !ReadManagedField(pass, drawFbOffset, &saved.drawFrameBuffer)) {
         return false;
     }
-    GripTraceUiPolicy(pass, saved.passIndex, saved.drawFrameBuffer,
-                      saved.needsClear, saved.clearColor);
     // .262: back to the .240 unconditional forcing — the ONLY regime that
     // never ghosted. The .261 fb-frame-only stamp produced a .249-class
     // mix ghost on the 特別指導 card-upgrade exit (screens whose branch
@@ -4478,7 +3758,6 @@ void UnityStereoRenderer::GripUiPassExecuteExit(
 }
 
 void UnityStereoRenderer::ApplyGripUiPassClear() noexcept {
-    perf::SrpSpan resolve(tickTrace, "tick.grip.resolve-pass-api");
     // .256: keeps the Execute-hook offsets resolved (arms the wrapper via
     // g_gripUiPassFixupOwner) and drives the armed-state consumers. The
     // .224 feature writes / live-pass stamping / disarm restore that used
@@ -4487,18 +3766,10 @@ void UnityStereoRenderer::ApplyGripUiPassClear() noexcept {
     if (!ResolveGripUiPassApi()) {
         return;
     }
-    resolve.Stop();
-    perf::SrpSpan targets(tickTrace, "tick.grip.publish-clear-targets");
     PublishGripIntermediateClearTargets();
-    targets.Stop();
-    perf::SrpSpan plate(tickTrace, "tick.grip.plate-hide");
     ApplyGripPlateHide();
-    plate.Stop();
     UiDiscoveryBatch discoveryBatch;
-    perf::SrpSpan background(tickTrace, "tick.grip.background-mute");
     ApplyGripScreenBackgroundMute();
-    background.Stop();
-    perf::SrpSpan adv(tickTrace, "tick.grip.adv-mute");
     ApplyGripAdvUiMute();
 }
 
@@ -5823,83 +5094,14 @@ bool UnityStereoRenderer::ApplyEyePoseAndProjection(
             &nonJitteredProjection.m[0][0], 16,
             smaaT2xExpectedNonJitteredProjection_[eye].begin());
         smaaT2xExpectedProjectionValid_[eye] = true;
-        if (smaaT2xComprehensiveProbeForPair_) {
-            LogSmaaT2xProjectionReadback(eye, "configure");
-        }
+
     }
     Log("[VR][stereo] CALL_OK stage=configure.projection eye=" +
         std::string(eye == 0U ? "left" : "right") + " reflected=0 pixelFlip=deferred");
     return true;
 }
 
-void UnityStereoRenderer::LogSmaaT2xProjectionReadback(
-    std::size_t eye,
-    const char* stage) noexcept {
-    if (!smaaT2xComprehensiveProbeForPair_ || eye >= eyeCameras_.size() ||
-        !smaaT2xExpectedProjectionValid_[eye]) {
-        return;
-    }
-    using GetProjection = void (*)(void*, UnityMatrix4x4*, void*);
-    UnityMatrix4x4 actualProjection{};
-    UnityMatrix4x4 actualNonJittered{};
-    void* nativeCamera = ReadUnityNativePointer(eyeCameras_[eye]);
-    void* projectionSelf = api_.projectionGetterUsesNativeSelf
-        ? nativeCamera
-        : eyeCameras_[eye];
-    void* nonJitteredSelf = api_.nonJitteredProjectionGetterUsesNativeSelf
-        ? nativeCamera
-        : eyeCameras_[eye];
-    const bool projectionReady = projectionSelf != nullptr &&
-        InvokeManagedVoid<GetProjection>(
-            api_.cameraGetProjectionMatrixInjected, projectionSelf,
-            &actualProjection);
-    const bool nonJitteredReady = nonJitteredSelf != nullptr &&
-        InvokeManagedVoid<GetProjection>(
-            api_.cameraGetNonJitteredProjectionMatrixInjected,
-            nonJitteredSelf, &actualNonJittered);
-    const auto maxDifference = [](const float* left, const float* right) {
-        float maximum = 0.0F;
-        for (std::size_t index = 0; index < 16U; ++index) {
-            maximum = std::max(maximum, std::abs(left[index] - right[index]));
-        }
-        return maximum;
-    };
-    const float* actual = &actualProjection.m[0][0];
-    const float* actualNonJitter = &actualNonJittered.m[0][0];
-    const float projectionError = projectionReady
-        ? maxDifference(actual, smaaT2xExpectedProjection_[eye].data())
-        : -1.0F;
-    const float nonJitteredError = nonJitteredReady
-        ? maxDifference(
-              actualNonJitter,
-              smaaT2xExpectedNonJitteredProjection_[eye].data())
-        : -1.0F;
-    const float actualSeparation = projectionReady && nonJitteredReady
-        ? maxDifference(actual, actualNonJitter)
-        : -1.0F;
-    std::ostringstream line;
-    line << std::fixed << std::setprecision(9)
-         << "[VR][smaa-t2x] SMAA_T2X_PROJECTION token="
-         << smaaT2xPairToken_ << " eye=" << (eye == 0U ? "left" : "right")
-         << " stage=" << (stage != nullptr ? stage : "unknown")
-         << " phase=" << smaaT2xPairPhase_
-         << " projectionReady=" << (projectionReady ? 1 : 0)
-         << " nonJitteredReady=" << (nonJitteredReady ? 1 : 0)
-         << " projectionMaxError=" << projectionError
-         << " nonJitteredMaxError=" << nonJitteredError
-         << " actualSeparation=" << actualSeparation
-         << " expectedP02=" << smaaT2xExpectedProjection_[eye][8]
-         << " actualP02=" << (projectionReady ? actual[8] : 0.0F)
-         << " expectedP12=" << smaaT2xExpectedProjection_[eye][9]
-         << " actualP12=" << (projectionReady ? actual[9] : 0.0F)
-         << " expectedNjP02="
-         << smaaT2xExpectedNonJitteredProjection_[eye][8]
-         << " actualNjP02=" << (nonJitteredReady ? actualNonJitter[8] : 0.0F)
-         << " expectedNjP12="
-         << smaaT2xExpectedNonJitteredProjection_[eye][9]
-         << " actualNjP12=" << (nonJitteredReady ? actualNonJitter[9] : 0.0F);
-    Log(line.str());
-}
+
 
 bool UnityStereoRenderer::CorrectSmaaT2xMotionHistoryProjection(
     void* camera,
@@ -5959,7 +5161,7 @@ bool UnityStereoRenderer::CorrectSmaaT2xMotionHistoryProjection(
 
     smaaT2xMotionHistoryCorrectedForPair_[eye] = true;
     const std::uint64_t count = ++smaaT2xMotionHistoryCorrectionCount_[eye];
-    if (smaaT2xComprehensiveProbeForPair_ || count <= 2U || count % 300U == 0U) {
+    if (count <= 2U || count % 300U == 0U) {
         std::ostringstream line;
         line << std::fixed << std::setprecision(9)
              << "[VR][smaa-t2x] SMAA_T2X_MV_MATRIX eye="
@@ -6002,7 +5204,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
     void* sourceUniversalData = nullptr;
     void* sourceVlAdditionalData = nullptr;
     void* sourceVlController = nullptr;
-    perf::SrpSpan discoverData(tickTrace, "tick.data.discover", eye);
     const std::string eyeName = eye == 0U ? "left" : "right";
     Log("[VR][stereo] CALL_BEGIN stage=configure.camera-data-discover eye=" +
         eyeName);
@@ -6024,8 +5225,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
     latestSourceUniversalData_ = sourceUniversalData;
     Log("[VR][stereo] CALL_OK stage=configure.camera-data-discover eye=" +
         eyeName);
-    discoverData.Stop();
-    perf::SrpSpan readData(tickTrace, "tick.data.read-source", eye);
 
     std::int32_t rendererIndex = -1;
     int renderType = 0;
@@ -6146,8 +5345,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
             sourceCamera)) {
         return FailStage("configure.camera-data-read", eye);
     }
-    readData.Stop();
-    perf::SrpSpan resolveData(tickTrace, "tick.data.resolve-aa-history", eye);
     if (eye == 0U) {
         if (sourceCameraSuppressed_) {
             // Keep consuming the source's own pulse so it does not go stale
@@ -6220,8 +5417,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
             1.0F / static_cast<float>(fullHeight_));
     }
 
-    resolveData.Stop();
-    perf::SrpSpan writeData(tickTrace, "tick.data.write-eye", eye);
     Log("[VR][stereo] CALL_BEGIN stage=configure.camera-data-copy eye=" +
         eyeName);
     if (!InvokeManagedVoid<SetInt>(
@@ -6293,8 +5488,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
                            api_.universalRenderScaleOffset, renderScale)) {
         return FailStage("configure.camera-data-copy", eye);
     }
-    writeData.Stop();
-    perf::SrpSpan createVolume(tickTrace, "tick.data.ensure-volume", eye);
 
     using NoArgumentVoid = void (*)(void*, void*);
     if (!InvokeManagedVoid<NoArgumentVoid>(
@@ -6302,8 +5495,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
             eyeUniversalCameraData_[eye])) {
         return FailStage("configure.volume-stack-create", eye);
     }
-    createVolume.Stop();
-    perf::SrpSpan depthSetup(tickTrace, "tick.data.depth-setup", eye);
 
     // Unity's live API table in stereo.192 proved this exact public setter.
     // CopyFrom may preserve the source flags, but source-off mode skips
@@ -6327,10 +5518,8 @@ bool UnityStereoRenderer::ConfigureCameraData(
             eyeUniversalCameraData_[eye])) {
         return FailStage("configure.volume-update-mode", eye);
     }
-    depthSetup.Stop();
     bool volumeManuallyUpdated = false;
     {
-        perf::SrpSpan updateVolume(tickTrace, "tick.data.update-volume", eye);
         ClearEyeBloomOverrides(eye);
         using UpdateVolumeStack = void (*)(void*, void*);
         if (!InvokeManagedVoid<UpdateVolumeStack>(
@@ -6341,7 +5530,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
         volumeManuallyUpdated = true;
     }
 
-    perf::SrpSpan verifyData(tickTrace, "tick.data.verify-eye", eye);
     bool eyeRequiresDepthTexture = false;
     bool eyeRequiresColorTexture = false;
     bool eyeCameraAllowHdr = false;
@@ -6423,8 +5611,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
             " motion=" + (motionAliased ? "1" : "0"));
         return FailStage("configure.per-eye-state-alias", eye);
     }
-    verifyData.Stop();
-    perf::SrpSpan bindEffects(tickTrace, "tick.data.bind-effects", eye);
     BindEyeDepthOfField(eye, sourceVolumeStack);
     BindEyeUrpDepthOfField(eye, sourceVolumeStack);
     latestSourceVolumeStack_ = sourceVolumeStack;
@@ -6440,8 +5626,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
     ApplyModeBodyBloom(eye);
     DeactivateBoundEyeDepthOfField();
 
-    bindEffects.Stop();
-    perf::SrpSpan temporalData(tickTrace, "tick.data.apply-temporal", eye);
     UnityTaaSettingsPrefix eyeTaaSettings{};
     bool taaSettingsCopied = false;
     if (eyeAa.writeTaa &&
@@ -6510,8 +5694,6 @@ bool UnityStereoRenderer::ConfigureCameraData(
                 (perFrameReset ? " perFrame=1" : ""));
         }
     }
-    temporalData.Stop();
-    perf::SrpSpan dataReport(tickTrace, "tick.data.report", eye);
     Log("[VR][stereo] CALL_OK stage=configure.camera-data-copy eye=" +
         eyeName + " renderShadows=" + (renderShadows ? "1" : "0") +
         " allowXR=0");
@@ -7069,13 +6251,7 @@ void* UnityStereoRenderer::GetVolumeComponent(
     return component;
 }
 
-void UnityStereoRenderer::ObserveSourceCameraStateForDiagnostics(
-    const UnitySourceCameraStateDiagnostic& sample) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled || !sample.valid) {
-        return;
-    }
-    sourceCameraStateDiagnostic_ = sample;
-}
+
 
 bool UnityStereoRenderer::TryGetEyeProjectionScale(
     const void* camera,
@@ -7255,185 +6431,8 @@ void UnityStereoRenderer::CaptureSourceLens(void* sourceCamera) noexcept {
         Log(lens.str());
     }
 
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
-    const UnitySourceCameraStateDiagnostic& state =
-        sourceCameraStateDiagnostic_;
-    if (!state.valid || state.sample == 0U ||
-        state.sample == fovDiagnosticLastStateSample_) {
-        return;
-    }
-    const auto& projectionMaps = sourceToEyeProjectionMaps_;
-    const auto& eyeProjectionValid = sourceToEyeProjectionValid_;
-    if (!eyeProjectionValid[0] && !eyeProjectionValid[1]) {
-        return;
-    }
 
-    float projectionLogDelta = 0.0F;
-    const bool projectionDeltaValid =
-        fovDiagnosticLastProjectionM11_ > 0.0F &&
-        std::isfinite(fovDiagnosticLastProjectionM11_) &&
-        std::isfinite(sourceProjection.m11) && sourceProjection.m11 > 0.0F;
-    if (projectionDeltaValid) {
-        projectionLogDelta = std::log(
-            sourceProjection.m11 / fovDiagnosticLastProjectionM11_);
-    }
-    const bool periodic = fovDiagnosticLastStateSample_ == 0U ||
-        state.sample >= fovDiagnosticLastStateSample_ + 30U;
-    const bool projectionMoved = projectionDeltaValid &&
-        std::abs(projectionLogDelta) >= 0.0025F;
-    if (!periodic && !projectionMoved) {
-        return;
-    }
 
-    camera::MotionLogDelta motion{};
-    const bool motionValid = state.hasLookAt &&
-        camera::TryComputeMotionLogDelta(
-            fovDiagnosticLastProjectionM11_, sourceProjection.m11,
-            fovDiagnosticLastLookAtDistance_, state.lookAtDistance, motion);
-    std::string changeMask = "baseline";
-    if (motionValid) {
-        constexpr float kReportedChangeThreshold = 0.005F;
-        const bool projectionChanged =
-            std::abs(motion.projection) >= kReportedChangeThreshold;
-        const bool distanceChanged =
-            std::abs(motion.lookAtDistance) >= kReportedChangeThreshold;
-        changeMask = projectionChanged
-            ? (distanceChanged ? "P+D" : "P")
-            : (distanceChanged ? "D" : "none");
-    } else if (!state.hasLookAt && projectionMoved) {
-        changeMask = "P+no-lookat";
-    }
-
-    ++fovDiagnosticLogs_;
-    std::ostringstream cameraSample;
-    cameraSample << std::fixed << std::setprecision(6)
-                 << "[VR][fov] CAMERA_MOTION sample=" << state.sample
-                 << " log=" << fovDiagnosticLogs_
-                 << " stateFov=" << state.fieldOfViewDegrees
-                 << " actualFov=" << chosen
-                 << " stateFocal=" << state.focalLengthMillimeters
-                 << " actualFocal=" << focalLength
-                 << " stateSensor=" << state.sensorWidthMillimeters << ','
-                 << state.sensorHeightMillimeters
-                 << " actualSensor=" << sensorSize.x << ',' << sensorSize.y
-                 << " statePhysical=" << (state.physical ? 1 : 0)
-                 << " actualPhysical=" << (physical ? 1 : 0)
-                 << " rawPos=" << state.rawPositionX << ','
-                 << state.rawPositionY << ',' << state.rawPositionZ
-                 << " hasLookAt=" << (state.hasLookAt ? 1 : 0)
-                 << " lookAt=" << state.referenceLookAtX << ','
-                 << state.referenceLookAtY << ','
-                 << state.referenceLookAtZ
-                 << " distance=" << state.lookAtDistance
-                 << " dLogP=" << (motionValid ? motion.projection
-                                               : projectionLogDelta)
-                 << " dLogD=" << (motionValid ? motion.lookAtDistance : 0.0F)
-                 << " q=" << (motionValid ? motion.residual : 0.0F)
-                 << " motionValid=" << (motionValid ? 1 : 0)
-                 << " changeThreshold=0.005000"
-                 << " changeMask=" << changeMask;
-    Log(cameraSample.str());
-
-    std::ostringstream projectionSample;
-    projectionSample << std::fixed << std::setprecision(6)
-                     << "[VR][fov] PROJECTION_EQ sample=" << state.sample
-                     << " sourceP=" << sourceProjection.m00 << ','
-                     << sourceProjection.m02 << ',' << sourceProjection.m11
-                     << ',' << sourceProjection.m12
-                     << " sourceAspect=" << aspect
-                     << " sourceShift=" << sourceShift.x << ','
-                     << sourceShift.y
-                     << " fixedScale="
-                     << ModeBodyScreenScale(bloomEyeFovDegrees_);
-    for (std::size_t eye = 0; eye < eyeProjectionValid.size(); ++eye) {
-        projectionSample << " eye" << eye << "Valid="
-                         << (eyeProjectionValid[eye] ? 1 : 0);
-        if (!eyeProjectionValid[eye]) {
-            continue;
-        }
-        const auto& eyeProjection = eyeProjections[eye];
-        const auto& map = projectionMaps[eye];
-        projectionSample << " eye" << eye << "P=" << eyeProjection.m00
-                         << ',' << eyeProjection.m02 << ','
-                         << eyeProjection.m11 << ',' << eyeProjection.m12
-                         << " eye" << eye << "Map=" << map.scaleX << ','
-                         << map.biasX << ',' << map.scaleY << ','
-                         << map.biasY
-                         << " fixedOverX="
-                         << ModeBodyScreenScale(bloomEyeFovDegrees_) /
-                                map.scaleX
-                         << " fixedOverY="
-                         << ModeBodyScreenScale(bloomEyeFovDegrees_) /
-                                map.scaleY;
-    }
-    Log(projectionSample.str());
-
-    const std::size_t effectEye = eyeProjectionValid[0] ? 0U : 1U;
-    const auto& effectMap = projectionMaps[effectEye];
-    const float fixedScale = ModeBodyScreenScale(bloomEyeFovDegrees_);
-    const AuthoredBloomSnapshot& bloom = authoredBloom_[effectEye];
-    const float equivalentDiffusion = camera::EquivalentVlBloomDiffusion(
-        static_cast<float>(bloom.vlDiffusion), effectMap.scaleY);
-    std::int32_t equivalentDiffusionRounded = bloom.vlDiffusion;
-    if (bloom.vlDiffusion > 0) {
-        camera::TryRoundEquivalentVlBloomDiffusion(
-            bloom.vlDiffusion, effectMap.scaleY, equivalentDiffusionRounded);
-    }
-    const int currentDiffusion = equivalentDiffusionRounded;
-    const bool haveProFlare = !authoredProFlareScales_.empty();
-    const AuthoredProFlareScale firstProFlare = haveProFlare
-        ? authoredProFlareScales_.front() : AuthoredProFlareScale{};
-    const bool haveOutline = !actorOutlineMaterials_.empty();
-    const AuthoredOutlineMaterial firstOutline = haveOutline
-        ? actorOutlineMaterials_.front() : AuthoredOutlineMaterial{};
-    std::ostringstream effects;
-    effects << std::fixed << std::setprecision(6)
-            << "[VR][fov] EFFECT_EQ sample=" << state.sample
-            << " eye=" << effectEye
-            << " eyeDesc=" << latestTargetSpec_.width << 'x'
-            << latestTargetSpec_.height
-            << " scaleX=" << effectMap.scaleX
-            << " scaleY=" << effectMap.scaleY
-            << " proFlareCached=" << (haveProFlare ? 1 : 0)
-            << " proFlareAuthoredScale=" << firstProFlare.globalScale
-            << " proFlareCurrentScale="
-            << firstProFlare.globalScale * fixedScale
-            << " proFlareEquivalentX="
-            << firstProFlare.globalScale * effectMap.scaleX
-            << " proFlareEquivalentY="
-            << firstProFlare.globalScale * effectMap.scaleY
-            << " proFlareEquivalentGeo="
-            << firstProFlare.globalScale *
-                   std::sqrt(effectMap.scaleX * effectMap.scaleY)
-            << " proFlareBrightnessAuthored="
-            << firstProFlare.globalBrightness
-            << " bloomValid=" << (bloom.valid ? 1 : 0)
-            << " vlIntensityAuthored=" << bloom.vlIntensity
-            << " vlDiffusionAuthored=" << bloom.vlDiffusion
-            << " vlDiffusionCurrent=" << currentDiffusion
-            << " vlDiffusionEquivalentFloat=" << equivalentDiffusion
-            << " vlDiffusionEquivalentRound="
-            << equivalentDiffusionRounded
-            << " urpIntensityAuthored=" << bloom.urpIntensity
-            << " urpScatterAuthored=" << bloom.urpScatter
-            << " urpScatterCurrent=" << bloom.urpScatter
-            << " outlineCached=" << (haveOutline ? 1 : 0)
-            << " outlineAuthoredValid="
-            << (firstOutline.authoredValid ? 1 : 0)
-            << " outlineAuthored=" << firstOutline.authoredX << ','
-            << firstOutline.authoredY << ',' << firstOutline.authoredZ << ','
-            << firstOutline.authoredW
-            << " outlineCurrentWidthScale="
-            << GakumasLocal::Config::vrEyeOutlineWidth
-            << " writeMode=observe-only";
-    Log(effects.str());
-
-    fovDiagnosticLastProjectionM11_ = sourceProjection.m11;
-    fovDiagnosticLastLookAtDistance_ =
-        state.hasLookAt ? state.lookAtDistance : 0.0F;
-    fovDiagnosticLastStateSample_ = state.sample;
 }
 
 void UnityStereoRenderer::ClearEyeBloomOverrides(std::size_t eye) noexcept {
@@ -7788,27 +6787,13 @@ std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept
     }
     // Describe the already-resolved type, without changing the typed query,
     // result ordering or fallback. No extra Unity call for this diagnostic.
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        static thread_local std::unordered_set<void*> described;
-        if (described.insert(klass->address).second) {
-            WriteVrLog("[VR][perf] DISCOVERY_TYPED_CLASS class=" +
-                std::to_string(reinterpret_cast<std::uintptr_t>(klass->address)) +
-                " name=" + klass->name + " primary=Object.FindObjectsOfType(System.Type)");
-        }
-    }
-    perf::SrpSpan primary(tickTrace, "tick.discovery.primary-find",
-        reinterpret_cast<std::uintptr_t>(klass->address));
+
     auto objects = klass->FindObjectsByType<void*>();
-    primary.Describe("tick.discovery.primary-find", static_cast<int>(objects.size()));
-    primary.Stop();
     if (!objects.empty()) {
         return objects;
     }
-    perf::SrpSpan fallback(tickTrace, "tick.discovery.fallback-find",
-        reinterpret_cast<std::uintptr_t>(klass->address));
     // event=-1 means no array returned; >=0 is the copied array length.
     // Both spans include managed dispatch/type lookup and ToVector, not bare API time.
-    fallback.Describe("tick.discovery.fallback-find", -1);
     if (auto* objectClass =
             UnityResolve::Get("UnityEngine.CoreModule.dll")->Get("Object")) {
         auto* findAll = objectClass->Get<UnityResolve::Method>(
@@ -7819,7 +6804,6 @@ std::vector<void*> FindManagedObjectsOfType(UnityResolve::Class* klass) noexcept
                     findAll->Invoke<UnityResolve::UnityType::Array<void*>*>(
                         type)) {
                 auto all = array->ToVector();
-                fallback.Describe("tick.discovery.fallback-find", static_cast<int>(all.size()));
                 return all;
             }
         }
@@ -7850,21 +6834,15 @@ std::vector<void*> FindGripPlateGraphics(UnityResolve::Class* klass) noexcept {
         void* args[]{type, &inactive, &sort};
         void* result = nullptr;
         void* exception = nullptr;
-        perf::SrpSpan query(tickTrace, "tick.grip.graphic-unsorted",
-            reinterpret_cast<std::uintptr_t>(klass->address));
-        query.Describe("tick.grip.graphic-unsorted", -1);
         const bool ok = type && RuntimeInvokeRaw(find->address, nullptr, args, &result, &exception) &&
             !exception && result;
         if (ok) {
             auto objects = static_cast<UnityResolve::UnityType::Array<void*>*>(result)->ToVector();
-            query.Describe("tick.grip.graphic-unsorted", static_cast<int>(objects.size()));
-            query.Stop();
             if (!objects.empty()) {
                 report("path=public-unsorted inactive=exclude scope=grip-plates");
                 return objects;
             }
         }
-        query.Stop();
         report(ok ? "path=legacy reason=empty-preserve-all-fallback" : "path=legacy reason=invoke-failed");
     } else {
         report("path=legacy reason=exact-api-unavailable");
@@ -7896,7 +6874,6 @@ UnityResolve::UnityType::Array<void*>* FindPresenceInventory(
         void* exception = nullptr;
         bool allowed = false;
         {
-            perf::SrpSpan guard(tickTrace, "tick.discovery.presence-guard");
             allowed = getOverride && RuntimeInvokeRaw(getOverride->address, nullptr, nullptr,
                 &overrideObject, &exception) && !exception && !overrideObject && klass &&
                 native.classFromType(type) == klass;
@@ -7980,48 +6957,21 @@ std::vector<void*> FindUiObjectsWithPresenceCheck(UnityResolve::Class* klass) no
     };
     const bool supported = mono && findAll && objectGetClass && classIsAssignable &&
         assignable(mono->address, klass->address);
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        static std::unordered_set<void*> logged;
-        if (logged.insert(klass->address).second) {
-            WriteVrLog("[VR][stereo] UI_DISCOVERY_PRESENCE_API type=" + klass->name +
-                " class=" + std::to_string(reinterpret_cast<std::uintptr_t>(klass->address)) +
-                " supported=" + (supported ? "1" : "0") + " scope=one-batch fallback=legacy" +
-                " metadata=export-cached objectGetClass=" +
-                std::to_string(reinterpret_cast<std::uintptr_t>(objectGetClass)) +
-                " classIsAssignable=" +
-                std::to_string(reinterpret_cast<std::uintptr_t>(classIsAssignable)));
-        }
-    }
+
     if (!supported) {
         return legacy();
     }
     if (!batch.attempted) {
         batch.attempted = true;
-        perf::SrpSpan scan(tickTrace, "tick.discovery.presence-scan");
-        scan.Describe("tick.discovery.presence-scan", -1);
         void* type = mono->GetType();
-        perf::SrpSpan enumerate(tickTrace, "tick.discovery.presence-enumerate");
         auto* array = FindPresenceInventory(type, mono->address, findAll);
-        enumerate.Stop();
         if (array) {
-            perf::SrpSpan copy(tickTrace, "tick.discovery.presence-copy");
             const auto objects = array->ToVector();
-            copy.Stop();
-            perf::SrpSpan index(tickTrace, "tick.discovery.presence-index");
             const bool complete = batch.presence.Build(objects, objectGetClass);
-            index.Describe("tick.discovery.presence-index",
-                complete ? static_cast<int>(batch.presence.ClassCount()) : -1);
-            index.Stop();
-            if (complete) scan.Describe("tick.discovery.presence-scan", static_cast<int>(objects.size()));
-            scan.Stop();
         }
     }
-    perf::SrpSpan membership(tickTrace, "tick.discovery.presence-membership");
     const bool absentType = batch.presence.ProvesAbsent(klass->address, assignable);
-    membership.Stop();
     if (absentType) {
-        perf::SrpSpan absent(tickTrace, "tick.discovery.absent", reinterpret_cast<std::uintptr_t>(klass->address));
-        absent.Describe("tick.discovery.absent", 0);
         return {};
     }
     // Unknown/failed inventory and present types preserve the original query,
@@ -8067,612 +7017,11 @@ std::string ManagedObjectClassName(void* object) noexcept {
         : std::string(name);
 }
 
-void UnityStereoRenderer::RequestVirtualCameraCensus(
-    const char* reason) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
-    virtualCameraCensusPending_ = true;
-    virtualCameraCensusRunsRemaining_ = 2;
-    // First pass after roughly half a second of stable content. The second
-    // pass is delayed further below to catch asynchronously instantiated
-    // cameras without scanning Resources every frame.
-    virtualCameraCensusDelayTicks_ = 30;
-    virtualCameraCensusReason_ = reason != nullptr ? reason : "unknown";
-    std::ostringstream stream;
-    stream << "[VR][vcam] VCAM_CENSUS_REQUEST reason="
-           << virtualCameraCensusReason_ << " scene=" << sceneCount_ << '/'
-           << loadedSceneCount_ << '/' << activeSceneHandle_;
-    Log(stream.str());
-}
 
-void UnityStereoRenderer::RunVirtualCameraCensusIfDue() noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled ||
-        !sceneIdentityValid_) {
-        return;
-    }
-    const bool identityChanged = !virtualCameraCensusIdentityObserved_ ||
-        virtualCameraCensusSceneCount_ != sceneCount_ ||
-        virtualCameraCensusLoadedSceneCount_ != loadedSceneCount_ ||
-        virtualCameraCensusActiveSceneHandle_ != activeSceneHandle_;
-    if (identityChanged) {
-        virtualCameraCensusIdentityObserved_ = true;
-        virtualCameraCensusSceneCount_ = sceneCount_;
-        virtualCameraCensusLoadedSceneCount_ = loadedSceneCount_;
-        virtualCameraCensusActiveSceneHandle_ = activeSceneHandle_;
-        RequestVirtualCameraCensus("scene-identity");
-    }
-    if (!virtualCameraCensusPending_ ||
-        virtualCameraCensusRunsRemaining_ == 0U || SceneContentUnstable()) {
-        return;
-    }
-    if (virtualCameraCensusDelayTicks_ > 0U) {
-        --virtualCameraCensusDelayTicks_;
-        return;
-    }
-    const char* phase = virtualCameraCensusRunsRemaining_ == 2U
-        ? "initial"
-        : "settled";
-    RunVirtualCameraCensus(phase);
-    --virtualCameraCensusRunsRemaining_;
-    if (virtualCameraCensusRunsRemaining_ == 0U) {
-        virtualCameraCensusPending_ = false;
-    } else {
-        // Approximately three seconds at the normal 60 Hz Tick cadence.
-        virtualCameraCensusDelayTicks_ = 180;
-    }
-}
 
-void UnityStereoRenderer::RunVirtualCameraCensus(const char* phase) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
 
-    struct CensusApi {
-        UnityResolve::Class* virtualCameraClass = nullptr;
-        UnityResolve::Class* switcherClass = nullptr;
-        MethodRef resourcesFindAll{};
-        MethodRef componentGetGameObject{};
-        MethodRef gameObjectGetScene{};
-        MethodRef gameObjectGetActiveSelf{};
-        MethodRef gameObjectGetActiveInHierarchy{};
-        MethodRef behaviourGetEnabled{};
-        MethodRef sceneIsValidInternal{};
-        MethodRef sceneGetNameInternal{};
-        MethodRef sceneGetIsLoadedInternal{};
-        MethodRef virtualCameraGetPriority{};
-        MethodRef virtualCameraGetIsValid{};
-        MethodRef coreGetInstance{};
-        MethodRef coreGetBrainCount{};
-        MethodRef coreGetActiveBrain{};
-        MethodRef coreGetVirtualCameraCount{};
-        MethodRef coreGetVirtualCamera{};
-        MethodRef brainGetActiveVirtualCamera{};
-        MethodRef brainGetOutputCamera{};
-        MethodRef switcherGetCameraCount{};
-        MethodRef switcherGetCamera{};
-        std::int32_t switchableVirtualCameraOffset = -1;
-        std::int32_t switchableDirectorOffset = -1;
-    };
 
-    static const CensusApi censusApi = [] {
-        CensusApi result;
-        result.virtualCameraClass = Il2cppUtils::GetClass(
-            "Cinemachine.dll", "Cinemachine", "CinemachineVirtualCameraBase");
-        result.switcherClass = Il2cppUtils::GetClass(
-            "campus-submodule.Runtime.dll", "Campus.Common",
-            "CampusCameraSwitcher");
-        auto* switchableClass = Il2cppUtils::GetClass(
-            "campus-submodule.Runtime.dll", "Campus.Common",
-            "CampusSwitchableCamera");
 
-        result.resourcesFindAll = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "Resources",
-            "FindObjectsOfTypeAll", true, "UnityEngine.Object[]",
-            {"System.Type"}));
-        result.componentGetGameObject = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "Component",
-            "get_gameObject", false, "UnityEngine.GameObject", {}));
-        result.gameObjectGetScene = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "GameObject",
-            "get_scene", false, "UnityEngine.SceneManagement.Scene", {}));
-        result.gameObjectGetActiveSelf = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "GameObject",
-            "get_activeSelf", false, "System.Boolean", {}));
-        result.gameObjectGetActiveInHierarchy = MethodReference(
-            ResolveStrictMethod(
-                "UnityEngine.CoreModule.dll", "UnityEngine", "GameObject",
-                "get_activeInHierarchy", false, "System.Boolean", {}));
-        result.behaviourGetEnabled = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine", "Behaviour",
-            "get_enabled", false, "System.Boolean", {}));
-        result.sceneIsValidInternal = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine.SceneManagement",
-            "Scene", "IsValidInternal", true, "System.Boolean",
-            {"System.Int32"}));
-        result.sceneGetNameInternal = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine.SceneManagement",
-            "Scene", "GetNameInternal", true, "System.String",
-            {"System.Int32"}));
-        result.sceneGetIsLoadedInternal = MethodReference(ResolveStrictMethod(
-            "UnityEngine.CoreModule.dll", "UnityEngine.SceneManagement",
-            "Scene", "GetIsLoadedInternal", true, "System.Boolean",
-            {"System.Int32"}));
-        result.virtualCameraGetPriority = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineVirtualCameraBase",
-            "get_Priority", false, "System.Int32", {}));
-        result.virtualCameraGetIsValid = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineVirtualCameraBase",
-            "get_IsValid", false, "System.Boolean", {}));
-        result.coreGetInstance = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineCore",
-            "get_Instance", true, "Cinemachine.CinemachineCore", {}));
-        result.coreGetBrainCount = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineCore",
-            "get_BrainCount", false, "System.Int32", {}));
-        result.coreGetActiveBrain = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineCore",
-            "GetActiveBrain", false, "Cinemachine.CinemachineBrain",
-            {"System.Int32"}));
-        result.coreGetVirtualCameraCount = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineCore",
-            "get_VirtualCameraCount", false, "System.Int32", {}));
-        result.coreGetVirtualCamera = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineCore",
-            "GetVirtualCamera", false,
-            "Cinemachine.CinemachineVirtualCameraBase", {"System.Int32"}));
-        result.brainGetActiveVirtualCamera = MethodReference(
-            ResolveStrictMethod(
-                "Cinemachine.dll", "Cinemachine", "CinemachineBrain",
-                "get_ActiveVirtualCamera", false,
-                "Cinemachine.ICinemachineCamera", {}));
-        result.brainGetOutputCamera = MethodReference(ResolveStrictMethod(
-            "Cinemachine.dll", "Cinemachine", "CinemachineBrain",
-            "get_OutputCamera", false, "UnityEngine.Camera", {}));
-        result.switcherGetCameraCount = MethodReference(ResolveStrictMethod(
-            "campus-submodule.Runtime.dll", "Campus.Common",
-            "CampusCameraSwitcher", "get_CameraCount", false,
-            "System.Int32", {}));
-        result.switcherGetCamera = MethodReference(ResolveStrictMethod(
-            "campus-submodule.Runtime.dll", "Campus.Common",
-            "CampusCameraSwitcher", "GetCamera", false,
-            "Campus.Common.CampusSwitchableCamera", {"System.Int32"}));
-        result.switchableVirtualCameraOffset = FindNamedFieldOffset(
-            switchableClass, {"virtualCamera"},
-            {"Cinemachine.CinemachineVirtualCamera",
-             "CinemachineVirtualCamera"});
-        result.switchableDirectorOffset = FindNamedFieldOffset(
-            switchableClass, {"director"},
-            {"UnityEngine.Playables.PlayableDirector", "PlayableDirector"});
-        return result;
-    }();
-
-    if (!virtualCameraCensusApiLogged_) {
-        virtualCameraCensusApiLogged_ = true;
-        std::ostringstream apiLog;
-        apiLog << "[VR][vcam] VCAM_CENSUS_API vcamClass="
-               << (censusApi.virtualCameraClass != nullptr ? 1 : 0)
-               << " findAll=" << (censusApi.resourcesFindAll.Ready() ? 1 : 0)
-               << " gameObject="
-               << (censusApi.componentGetGameObject.Ready() ? 1 : 0)
-               << " scene="
-               << (censusApi.gameObjectGetScene.Ready() &&
-                           censusApi.sceneIsValidInternal.Ready() &&
-                           censusApi.sceneGetNameInternal.Ready() &&
-                           censusApi.sceneGetIsLoadedInternal.Ready()
-                       ? 1
-                       : 0)
-               << " state="
-               << (censusApi.virtualCameraGetPriority.Ready() &&
-                           censusApi.virtualCameraGetIsValid.Ready()
-                       ? 1
-                       : 0)
-               << " core="
-               << (censusApi.coreGetInstance.Ready() &&
-                           censusApi.coreGetVirtualCameraCount.Ready() &&
-                           censusApi.coreGetVirtualCamera.Ready()
-                       ? 1
-                       : 0)
-               << " brain="
-               << (censusApi.coreGetBrainCount.Ready() &&
-                           censusApi.coreGetActiveBrain.Ready() &&
-                           censusApi.brainGetActiveVirtualCamera.Ready()
-                       ? 1
-                       : 0)
-               << " switcher="
-               << (censusApi.switcherClass != nullptr &&
-                           censusApi.switcherGetCameraCount.Ready() &&
-                           censusApi.switcherGetCamera.Ready()
-                       ? 1
-                       : 0)
-               << " switchFields="
-               << censusApi.switchableVirtualCameraOffset << '/'
-               << censusApi.switchableDirectorOffset;
-        Log(apiLog.str());
-    }
-
-    if (censusApi.virtualCameraClass == nullptr ||
-        !censusApi.resourcesFindAll.HasInfo() ||
-        !censusApi.componentGetGameObject.Ready() ||
-        !censusApi.gameObjectGetScene.HasInfo() ||
-        !censusApi.sceneIsValidInternal.Ready() ||
-        !censusApi.sceneGetNameInternal.Ready() ||
-        !censusApi.sceneGetIsLoadedInternal.Ready()) {
-        Log("[VR][vcam] VCAM_CENSUS_SKIP reason=essential-api-missing");
-        return;
-    }
-
-    const auto findAll = [](UnityResolve::Class* klass) {
-        std::vector<void*> objects;
-        if (klass == nullptr) {
-            return objects;
-        }
-        void* type = klass->GetType();
-        if (type == nullptr) {
-            return objects;
-        }
-        void* arguments[] = {type};
-        void* arrayObject = nullptr;
-        if (!RuntimeInvoke(censusApi.resourcesFindAll, nullptr, arguments,
-                           &arrayObject, nullptr) ||
-            arrayObject == nullptr) {
-            return objects;
-        }
-        try {
-            return reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(
-                       arrayObject)
-                ->ToVector();
-        } catch (...) {
-            return objects;
-        }
-    };
-
-    struct SceneInfo {
-        int handle = 0;
-        bool valid = false;
-        bool loaded = false;
-        std::string name = "-";
-    };
-    const auto readScene = [](void* gameObject, SceneInfo* scene) {
-        if (gameObject == nullptr || scene == nullptr) {
-            return false;
-        }
-        void* boxedScene = nullptr;
-        if (!RuntimeInvoke(censusApi.gameObjectGetScene, gameObject, nullptr,
-                           &boxedScene, nullptr) ||
-            boxedScene == nullptr) {
-            return false;
-        }
-        void* rawScene = UnboxObject(boxedScene);
-        if (rawScene == nullptr ||
-            !ReadManagedField(rawScene, 0, &scene->handle)) {
-            return false;
-        }
-        using GetSceneBool = bool (*)(int, void*);
-        using GetSceneString = void* (*)(int, void*);
-        (void)InvokeManagedResult<bool, GetSceneBool>(
-            censusApi.sceneIsValidInternal, &scene->valid, scene->handle);
-        (void)InvokeManagedResult<bool, GetSceneBool>(
-            censusApi.sceneGetIsLoadedInternal, &scene->loaded, scene->handle);
-        void* name = nullptr;
-        if (InvokeManagedResult<void*, GetSceneString>(
-                censusApi.sceneGetNameInternal, &name, scene->handle)) {
-            scene->name = ManagedStringValue(name);
-        }
-        return true;
-    };
-
-    const std::uint64_t serial = ++virtualCameraCensusSerial_;
-    std::ostringstream censusStart;
-    censusStart << "[VR][vcam] VCAM_CENSUS_BEGIN serial=" << serial
-                << " phase=" << (phase != nullptr ? phase : "unknown")
-                << " reason=" << virtualCameraCensusReason_
-                << " identity=" << sceneCount_ << '/' << loadedSceneCount_
-                << '/' << activeSceneHandle_;
-    Log(censusStart.str());
-
-    std::vector<void*> coreCameras;
-    std::vector<void*> activeBrainCameras;
-    void* core = nullptr;
-    int coreCount = -1;
-    int brainCount = -1;
-    using GetStaticObject = void* (*)(void*);
-    using GetObject = void* (*)(void*, void*);
-    using GetObjectAt = void* (*)(void*, int, void*);
-    using GetInt = int (*)(void*, void*);
-    using GetBool = bool (*)(void*, void*);
-    if (censusApi.coreGetInstance.Ready()) {
-        (void)InvokeManagedResult<void*, GetStaticObject>(
-            censusApi.coreGetInstance, &core);
-    }
-    if (core != nullptr && censusApi.coreGetVirtualCameraCount.Ready() &&
-        InvokeManagedResult<int, GetInt>(
-            censusApi.coreGetVirtualCameraCount, &coreCount, core) &&
-        coreCount >= 0 && coreCount <= 4096 &&
-        censusApi.coreGetVirtualCamera.Ready()) {
-        coreCameras.reserve(static_cast<std::size_t>(coreCount));
-        for (int index = 0; index < coreCount; ++index) {
-            void* camera = nullptr;
-            if (InvokeManagedResult<void*, GetObjectAt>(
-                    censusApi.coreGetVirtualCamera, &camera, core, index) &&
-                camera != nullptr) {
-                coreCameras.push_back(camera);
-            }
-        }
-    }
-    if (core != nullptr && censusApi.coreGetBrainCount.Ready() &&
-        InvokeManagedResult<int, GetInt>(
-            censusApi.coreGetBrainCount, &brainCount, core) &&
-        brainCount >= 0 && brainCount <= 64 &&
-        censusApi.coreGetActiveBrain.Ready()) {
-        for (int index = 0; index < brainCount; ++index) {
-            void* brain = nullptr;
-            if (!InvokeManagedResult<void*, GetObjectAt>(
-                    censusApi.coreGetActiveBrain, &brain, core, index) ||
-                !IsUnityManagedObjectAlive(brain)) {
-                continue;
-            }
-            void* activeCamera = nullptr;
-            void* outputCamera = nullptr;
-            if (censusApi.brainGetActiveVirtualCamera.Ready()) {
-                (void)InvokeManagedResult<void*, GetObject>(
-                    censusApi.brainGetActiveVirtualCamera, &activeCamera,
-                    brain);
-            }
-            if (censusApi.brainGetOutputCamera.Ready()) {
-                (void)InvokeManagedResult<void*, GetObject>(
-                    censusApi.brainGetOutputCamera, &outputCamera, brain);
-            }
-            if (activeCamera != nullptr) {
-                activeBrainCameras.push_back(activeCamera);
-            }
-            std::ostringstream brainLog;
-            brainLog << "[VR][vcam] VCAM_CENSUS_BRAIN serial=" << serial
-                     << " index=" << index << " brain=" << brain
-                     << " name=" << std::quoted(ManagedObjectName(brain))
-                     << " active=" << activeCamera
-                     << " activeName="
-                     << std::quoted(ManagedObjectName(activeCamera))
-                     << " activeClass="
-                     << ManagedObjectClassName(activeCamera)
-                     << " output=" << outputCamera
-                     << " outputName="
-                     << std::quoted(ManagedObjectName(outputCamera));
-            Log(brainLog.str());
-        }
-    }
-
-    struct CameraRecord {
-        void* camera = nullptr;
-        void* gameObject = nullptr;
-        SceneInfo scene{};
-        std::string name = "-";
-        std::string className = "-";
-        int enabled = -1;
-        int activeSelf = -1;
-        int activeInHierarchy = -1;
-        int cameraValid = -1;
-        int priority = 0;
-        bool priorityKnown = false;
-        bool coreRegistered = false;
-        bool brainActive = false;
-    };
-    const std::vector<void*> allCameras = findAll(censusApi.virtualCameraClass);
-    std::vector<CameraRecord> records;
-    records.reserve(allCameras.size());
-    std::size_t dead = 0;
-    std::size_t outsideLoadedScene = 0;
-    for (void* camera : allCameras) {
-        if (!IsUnityManagedObjectAlive(camera)) {
-            ++dead;
-            continue;
-        }
-        CameraRecord record;
-        record.camera = camera;
-        record.name = ManagedObjectName(camera);
-        record.className = ManagedObjectClassName(camera);
-        if (!InvokeManagedResult<void*, GetObject>(
-                censusApi.componentGetGameObject, &record.gameObject, camera) ||
-            !IsUnityManagedObjectAlive(record.gameObject) ||
-            !readScene(record.gameObject, &record.scene) ||
-            !record.scene.valid || !record.scene.loaded) {
-            ++outsideLoadedScene;
-            continue;
-        }
-        bool value = false;
-        if (censusApi.behaviourGetEnabled.Ready() &&
-            InvokeManagedResult<bool, GetBool>(
-                censusApi.behaviourGetEnabled, &value, camera)) {
-            record.enabled = value ? 1 : 0;
-        }
-        if (censusApi.gameObjectGetActiveSelf.Ready() &&
-            InvokeManagedResult<bool, GetBool>(
-                censusApi.gameObjectGetActiveSelf, &value,
-                record.gameObject)) {
-            record.activeSelf = value ? 1 : 0;
-        }
-        if (censusApi.gameObjectGetActiveInHierarchy.Ready() &&
-            InvokeManagedResult<bool, GetBool>(
-                censusApi.gameObjectGetActiveInHierarchy, &value,
-                record.gameObject)) {
-            record.activeInHierarchy = value ? 1 : 0;
-        }
-        if (censusApi.virtualCameraGetIsValid.Ready() &&
-            InvokeManagedResult<bool, GetBool>(
-                censusApi.virtualCameraGetIsValid, &value, camera)) {
-            record.cameraValid = value ? 1 : 0;
-        }
-        if (censusApi.virtualCameraGetPriority.Ready()) {
-            record.priorityKnown = InvokeManagedResult<int, GetInt>(
-                censusApi.virtualCameraGetPriority, &record.priority, camera);
-        }
-        record.coreRegistered = std::find(
-            coreCameras.begin(), coreCameras.end(), camera) != coreCameras.end();
-        record.brainActive = std::find(
-            activeBrainCameras.begin(), activeBrainCameras.end(), camera) !=
-            activeBrainCameras.end();
-        records.push_back(std::move(record));
-    }
-    std::sort(records.begin(), records.end(), [](const auto& left,
-                                                  const auto& right) {
-        const auto leftText =
-            std::tie(left.scene.handle, left.scene.name, left.name,
-                     left.className);
-        const auto rightText =
-            std::tie(right.scene.handle, right.scene.name, right.name,
-                     right.className);
-        if (leftText != rightText) {
-            return leftText < rightText;
-        }
-        return reinterpret_cast<std::uintptr_t>(left.camera) <
-            reinterpret_cast<std::uintptr_t>(right.camera);
-    });
-
-    std::ostringstream counts;
-    counts << "[VR][vcam] VCAM_CENSUS_COUNTS serial=" << serial
-           << " foundAll=" << allCameras.size()
-           << " loaded=" << records.size() << " core=" << coreCount
-           << " brains=" << brainCount;
-    Log(counts.str());
-
-    std::size_t index = 0;
-    while (index < records.size()) {
-        const int handle = records[index].scene.handle;
-        const std::string& sceneName = records[index].scene.name;
-        std::size_t end = index + 1U;
-        while (end < records.size() && records[end].scene.handle == handle) {
-            ++end;
-        }
-        std::ostringstream sceneLog;
-        sceneLog << "[VR][vcam] VCAM_CENSUS_SCENE serial=" << serial
-                 << " handle=" << handle << " name="
-                 << std::quoted(sceneName) << " count=" << (end - index);
-        Log(sceneLog.str());
-        for (; index < end; ++index) {
-            const CameraRecord& record = records[index];
-            std::ostringstream item;
-            item << "[VR][vcam] VCAM_CENSUS_ITEM serial=" << serial
-                 << " scene=" << record.scene.handle << " sceneName="
-                 << std::quoted(record.scene.name) << " camera="
-                 << record.camera << " gameObject=" << record.gameObject
-                 << " name=" << std::quoted(record.name)
-                 << " class=" << record.className
-                 << " enabled=" << record.enabled
-                 << " activeSelf=" << record.activeSelf
-                 << " activeHierarchy=" << record.activeInHierarchy
-                 << " valid=" << record.cameraValid << " priority=";
-            if (record.priorityKnown) {
-                item << record.priority;
-            } else {
-                item << '?';
-            }
-            item << " core=" << (record.coreRegistered ? 1 : 0)
-                 << " brainActive=" << (record.brainActive ? 1 : 0);
-            Log(item.str());
-        }
-    }
-
-    std::size_t switcherCount = 0;
-    std::size_t selectableCount = 0;
-    if (censusApi.switcherClass != nullptr &&
-        censusApi.switcherGetCameraCount.Ready() &&
-        censusApi.switcherGetCamera.Ready() &&
-        censusApi.switchableVirtualCameraOffset >= 0) {
-        for (void* switcher : findAll(censusApi.switcherClass)) {
-            if (!IsUnityManagedObjectAlive(switcher)) {
-                continue;
-            }
-            void* gameObject = nullptr;
-            SceneInfo scene;
-            if (!InvokeManagedResult<void*, GetObject>(
-                    censusApi.componentGetGameObject, &gameObject, switcher) ||
-                !IsUnityManagedObjectAlive(gameObject) ||
-                !readScene(gameObject, &scene) || !scene.valid ||
-                !scene.loaded) {
-                continue;
-            }
-            int count = -1;
-            if (!InvokeManagedResult<int, GetInt>(
-                    censusApi.switcherGetCameraCount, &count, switcher) ||
-                count < 0 || count > 512) {
-                continue;
-            }
-            ++switcherCount;
-            std::ostringstream switcherLog;
-            switcherLog << "[VR][vcam] VCAM_SELECTABLE_LIST serial=" << serial
-                        << " scene=" << scene.handle << " sceneName="
-                        << std::quoted(scene.name) << " switcher=" << switcher
-                        << " name=" << std::quoted(ManagedObjectName(switcher))
-                        << " count=" << count;
-            Log(switcherLog.str());
-            for (int cameraIndex = 0; cameraIndex < count; ++cameraIndex) {
-                void* entry = nullptr;
-                if (!InvokeManagedResult<void*, GetObjectAt>(
-                        censusApi.switcherGetCamera, &entry, switcher,
-                        cameraIndex) ||
-                    !IsUnityManagedObjectAlive(entry)) {
-                    continue;
-                }
-                void* virtualCamera = nullptr;
-                void* director = nullptr;
-                (void)ReadManagedField(
-                    entry, censusApi.switchableVirtualCameraOffset,
-                    &virtualCamera);
-                if (censusApi.switchableDirectorOffset >= 0) {
-                    (void)ReadManagedField(
-                        entry, censusApi.switchableDirectorOffset, &director);
-                }
-                int priority = 0;
-                const bool priorityKnown =
-                    IsUnityManagedObjectAlive(virtualCamera) &&
-                    censusApi.virtualCameraGetPriority.Ready() &&
-                    InvokeManagedResult<int, GetInt>(
-                        censusApi.virtualCameraGetPriority, &priority,
-                        virtualCamera);
-                const bool registered = std::find(
-                    coreCameras.begin(), coreCameras.end(), virtualCamera) !=
-                    coreCameras.end();
-                const bool active = std::find(
-                    activeBrainCameras.begin(), activeBrainCameras.end(),
-                    virtualCamera) != activeBrainCameras.end();
-                ++selectableCount;
-                std::ostringstream selectable;
-                selectable
-                    << "[VR][vcam] VCAM_SELECTABLE_ITEM serial=" << serial
-                    << " scene=" << scene.handle << " switcher=" << switcher
-                    << " index=" << cameraIndex << " entry=" << entry
-                    << " entryName=" << std::quoted(ManagedObjectName(entry))
-                    << " camera=" << virtualCamera << " cameraName="
-                    << std::quoted(ManagedObjectName(virtualCamera))
-                    << " cameraClass="
-                    << ManagedObjectClassName(virtualCamera)
-                    << " cameraAlive="
-                    << (IsUnityManagedObjectAlive(virtualCamera) ? 1 : 0)
-                    << " director=" << director << " directorName="
-                    << std::quoted(ManagedObjectName(director))
-                    << " priority=";
-                if (priorityKnown) {
-                    selectable << priority;
-                } else {
-                    selectable << '?';
-                }
-                selectable << " core=" << (registered ? 1 : 0)
-                           << " brainActive=" << (active ? 1 : 0);
-                Log(selectable.str());
-            }
-        }
-    }
-
-    std::ostringstream end;
-    end << "[VR][vcam] VCAM_CENSUS_END serial=" << serial
-        << " loaded=" << records.size() << " dead=" << dead
-        << " outsideLoadedScene=" << outsideLoadedScene
-        << " coreResolved=" << coreCameras.size()
-        << " activeBrainsResolved=" << activeBrainCameras.size()
-        << " switchers=" << switcherCount
-        << " selectable=" << selectableCount;
-    Log(end.str());
-}
 
 bool ContainsCmovToken(std::string_view text) noexcept {
     if (text.size() < 4U) {
@@ -8755,19 +7104,6 @@ void UnityStereoRenderer::EnsureSceneManagerApi() noexcept {
         Log(dump.str());
         return;
     }
-    for (auto* method : klass->methods) {
-        if (method == nullptr) {
-            continue;
-        }
-        const auto& name = method->name;
-        if (name.find("sceneCount") == std::string::npos &&
-            name.find("SceneCount") == std::string::npos &&
-            name.find("GetActiveScene") == std::string::npos &&
-            name.find("loadedScene") == std::string::npos) {
-            continue;
-        }
-        dump << " | " << MethodSignature(method);
-    }
     sceneManagerGetSceneCount_ = MethodReference(
         FindMethodByName(klass, "get_sceneCount", true, 0U));
     sceneManagerGetLoadedSceneCount_ = MethodReference(
@@ -8788,190 +7124,13 @@ void UnityStereoRenderer::EnsureSceneManagerApi() noexcept {
     Log(dump.str());
 }
 
-const char* UnityStereoRenderer::LifetimeWriteCategoryName(
-    LifetimeWriteCategory category) noexcept {
-    switch (category) {
-    case LifetimeWriteCategory::EyeGameObject:
-        return "eye-game-object";
-    case LifetimeWriteCategory::EyeCamera:
-        return "eye-camera";
-    case LifetimeWriteCategory::SourceCamera:
-        return "source-camera";
-    case LifetimeWriteCategory::TargetTexture:
-        return "target-texture";
-    case LifetimeWriteCategory::MainCameraTag:
-        return "main-camera-tag";
-    case LifetimeWriteCategory::RenderTarget:
-        return "render-target";
-    case LifetimeWriteCategory::OutlineMaterial:
-        return "outline-material";
-    case LifetimeWriteCategory::ProFlare:
-        return "pro-flare";
-    case LifetimeWriteCategory::UiTextureOverlay:
-        return "ui-texture-overlay";
-    case LifetimeWriteCategory::LiveCameraOverlay:
-        return "live-camera-overlay";
-    case LifetimeWriteCategory::CmovParticle:
-        return "cmov-particle";
-    case LifetimeWriteCategory::Count:
-        break;
-    }
-    return "unknown";
-}
 
-void UnityStereoRenderer::RecordLifetimeWrite(
-    LifetimeWriteCategory category,
-    const char* action,
-    void* object,
-    void* related,
-    std::intptr_t value) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
-    const std::size_t index = static_cast<std::size_t>(category);
-    if (index >= lifetimeWrites_.size()) {
-        return;
-    }
-    const SceneReadyDiagnosticState ready = CurrentSceneReadyDiagnosticState();
-    LifetimeWriteRecord& record = lifetimeWrites_[index];
-    record.serial = ++lifetimeWriteSerial_;
-    record.sceneReadyEpoch = ready.epoch;
-    record.action = action != nullptr ? action : "unknown";
-    record.object = object;
-    record.related = related;
-    record.value = value;
-}
 
-void UnityStereoRenderer::LogLifetimeSnapshot(
-    const char* phase,
-    const char* where) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
-    const std::uint64_t snapshot = ++lifetimeSnapshotSerial_;
-    const SceneReadyDiagnosticState ready = CurrentSceneReadyDiagnosticState();
-    std::ostringstream header;
-    header << "[VR][lifetime] LIFETIME_SNAPSHOT serial=" << snapshot
-           << " phase=" << (phase != nullptr ? phase : "unknown")
-           << " where=" << (where != nullptr ? where : "unknown")
-           << " readyEpoch=" << ready.epoch
-           << " revokeSerial=" << ready.revokeSerial
-           << " releaseSerial=" << ready.releaseSerial
-           << " transition=" << (ready.transitionActive ? 1 : 0)
-           << " contentReady=" << (ready.contentReady ? 1 : 0)
-           << " loadingKnown=" << (ready.loadingKnown ? 1 : 0)
-           << " loading=" << (ready.loadingActive ? 1 : 0)
-           << " identity=" << (ready.epochSawIdentity ? 1 : 0)
-           << " renderAllowed=" << (ready.renderAllowed ? 1 : 0)
-           << " publishAllowed=" << (ready.publishAllowed ? 1 : 0)
-           << " scene=" << sceneCount_ << '/' << loadedSceneCount_ << '/'
-           << activeSceneHandle_ << " stage=" << StageName(stage_)
-           << " armed=" << (stageArmed_ ? 1 : 0)
-           << " parked=" << (sceneReadyParked_ ? 1 : 0)
-           << " eyeHeld=" << (eyeArmHeld_ ? 1 : 0);
-    Log(header.str());
 
-    std::ostringstream state;
-    state << "[VR][lifetime] LIFETIME_STATE snapshot=" << snapshot
-          << " full=" << fullWidth_ << 'x' << fullHeight_
-          << " fullGeneration=" << fullGeneration_
-          << " retiredHandles=" << retiredFullTargetHandles_.size()
-          << " source=" << latestSourceCamera_
-          << " sourceData=" << latestSourceUniversalData_
-          << " sourceTarget=" << latestSourceTarget_
-          << " suppressedSource=" << suppressedSourceCamera_
-          << " sourceSuppressed=" << (sourceCameraSuppressed_ ? 1 : 0)
-          << " tinyCamera=" << tinySourceCamera_
-          << " tinyTarget=" << tinySourceTarget_
-          << " tinySaved=" << tinySavedTarget_
-          << " tinyActive=" << (tinyModeActive_ ? 1 : 0)
-          << " tagObject=" << eyeMainCameraTaggedObject_
-          << " tagApplied=" << (eyeMainCameraTagApplied_ ? 1 : 0)
-          << " caches=" << actorOutlineMaterials_.size() << '/'
-          << authoredProFlareScales_.size() << '/'
-          << uiTextureOverlays_.size() << '/'
-          << liveCameraOverlays_.size() << '/' << cmovParticles_.size()
-          << " cacheOwned=" << (outlineEyeScaled_ ? 1 : 0) << '/'
-          << (proFlareEyeScaled_ ? 1 : 0) << '/'
-          << (uiTextureOverlaysHidden_ ? 1 : 0) << '/'
-          << (liveCameraOverlaysHidden_ ? 1 : 0) << '/'
-          << (cmovParticlesHidden_ ? 1 : 0);
-    Log(state.str());
 
-    const auto logObject = [this, snapshot](
-                               const char* role,
-                               void* managed,
-                               Il2CppGCHandle handle) {
-        const bool alive = IsUnityManagedObjectAlive(managed);
-        void* native = alive ? ReadUnityNativePointer(managed) : nullptr;
-        std::ostringstream object;
-        object << "[VR][lifetime] LIFETIME_OBJECT snapshot=" << snapshot
-               << " role=" << role << " managed=" << managed
-               << " native=" << native << " handle=" << handle
-               << " alive=" << (alive ? 1 : 0);
-        Log(object.str());
-    };
-    for (std::size_t eye = 0; eye < eyeGameObjects_.size(); ++eye) {
-        const char* suffix = eye == 0U ? "left" : "right";
-        const std::string gameObjectRole = std::string("eye-game-object-") + suffix;
-        const std::string cameraRole = std::string("eye-camera-") + suffix;
-        const std::string urpRole = std::string("eye-urp-data-") + suffix;
-        const std::string vlRole = std::string("eye-vlsrp-data-") + suffix;
-        const std::string admissionRole = std::string("admission-target-") + suffix;
-        const std::string fullRole = std::string("full-target-") + suffix;
-        logObject(gameObjectRole.c_str(), eyeGameObjects_[eye],
-                  eyeGameObjectHandles_[eye]);
-        logObject(cameraRole.c_str(), eyeCameras_[eye], eyeCameraHandles_[eye]);
-        logObject(urpRole.c_str(), eyeUniversalCameraData_[eye],
-                  eyeUniversalCameraDataHandles_[eye]);
-        logObject(vlRole.c_str(), eyeVlAdditionalCameraData_[eye],
-                  eyeVlAdditionalCameraDataHandles_[eye]);
-        logObject(admissionRole.c_str(), admissionTargets_[eye],
-                  admissionTargetHandles_[eye]);
-        logObject(fullRole.c_str(), fullTargets_[eye], fullTargetHandles_[eye]);
-    }
-    logObject("latest-source-camera", latestSourceCamera_, nullptr);
-    logObject("latest-source-data", latestSourceUniversalData_, nullptr);
-    logObject("latest-source-target", latestSourceTarget_, nullptr);
-    logObject("suppressed-source-camera", suppressedSourceCamera_, nullptr);
-    logObject("tiny-source-camera", tinySourceCamera_, nullptr);
-    logObject("tiny-source-target", tinySourceTarget_, tinySourceTargetHandle_);
-    logObject("tiny-saved-target", tinySavedTarget_, nullptr);
-    logObject("tagged-eye-object", eyeMainCameraTaggedObject_, nullptr);
-    logObject("matcap-command-buffer", matcapCompCommandBuffer_, nullptr);
 
-    for (std::size_t index = 0; index < lifetimeWrites_.size(); ++index) {
-        const LifetimeWriteRecord& record = lifetimeWrites_[index];
-        if (record.serial == 0U) {
-            continue;
-        }
-        const auto category = static_cast<LifetimeWriteCategory>(index);
-        std::ostringstream write;
-        write << "[VR][lifetime] LIFETIME_LAST_WRITE snapshot=" << snapshot
-              << " category=" << LifetimeWriteCategoryName(category)
-              << " serial=" << record.serial
-              << " readyEpoch=" << record.sceneReadyEpoch
-              << " action=" << record.action << " object=" << record.object
-              << " related=" << record.related << " value=" << record.value;
-        Log(write.str());
-    }
-}
 
-void UnityStereoRenderer::ObserveLifetimeSceneReadyEdges(
-    const char* where) noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        return;
-    }
-    const SceneReadyDiagnosticState ready = CurrentSceneReadyDiagnosticState();
-    if (ready.revokeSerial != observedSceneReadyRevokeSerial_) {
-        observedSceneReadyRevokeSerial_ = ready.revokeSerial;
-        LogLifetimeSnapshot("ready-revoke", where);
-    }
-    if (ready.releaseSerial != observedSceneReadyReleaseSerial_) {
-        observedSceneReadyReleaseSerial_ = ready.releaseSerial;
-        LogLifetimeSnapshot("ready-release", where);
-    }
-}
+
 
 bool UnityStereoRenderer::SceneContentUnstable() const noexcept {
     return !SceneReadyAllowsStereoRender() ||
@@ -9095,9 +7254,7 @@ void UnityStereoRenderer::RefreshSceneIdentity(const char* where) noexcept {
     activeSceneHandle_ = handle;
     // Snapshot the old resource ownership before the ready gate or cache
     // fences mutate it. This also runs for keep-armed identity flaps.
-    LogLifetimeSnapshot("identity-before-gate", where);
     NoteSceneReadyIdentityChanged(where);
-    ObserveLifetimeSceneReadyEdges("identity-after-gate");
     // Identity-only flaps (no open ready epoch) are additive UI / idol-path
     // replacements. Holding eyes and queueing disarm is what made .164 hitch
     // the whole session after stereo was already up. Contest still keeps
@@ -9167,7 +7324,6 @@ void UnityStereoRenderer::DropOutlineMaterialCache(const char* reason) noexcept 
     outlineGripLoggedScale_ = -1.0F;
     lastOutlineWidthScale_ = -1.0F;
     loggedOutlineWidthScale_ = -1.0F;
-    outlineMaterialDumpLogged_ = false;
     outlineMaterialDiscoverSerial_ = 0;
     outlineEmptyDiscoverLogged_ = false;
     // Scene identities are generation fences: anything queued before the fence
@@ -9469,7 +7625,6 @@ void UnityStereoRenderer::CaptureQueuedActorOutlineMaterials() noexcept {
 }
 
 void UnityStereoRenderer::PrepareActorOutlineMaterialsForCurrentDraw() noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.outline-prepare");
     const bool captured =
         outlineCapturePending_.load(std::memory_order_acquire);
     if (!IsOwnerThread() || (!outlineDiscoverAtActorDraw_ && !captured) ||
@@ -9674,93 +7829,7 @@ void UnityStereoRenderer::CaptureOfficialOutlineVector(
     }
 }
 
-void UnityStereoRenderer::DumpActorOutlineMaterials() noexcept {
-    if (outlineMaterialDumpLogged_ || actorOutlineMaterials_.empty()) {
-        return;
-    }
-    outlineMaterialDumpLogged_ = true;
-    EnsureOutlineMaterialApi();
-    const std::size_t dumpCount =
-        std::min<std::size_t>(actorOutlineMaterials_.size(), 6U);
-    for (std::size_t index = 0; index < dumpCount; ++index) {
-        void* material = actorOutlineMaterials_[index].material;
-        if (material == nullptr || !IsUnityManagedObjectAlive(material)) {
-            continue;
-        }
-        void* shader = nullptr;
-        if (api_.materialGetShader.Ready()) {
-            (void)InvokeManagedResult<void*, GetPtrFn>(
-                api_.materialGetShader, &shader, material);
-        }
-        int hasOutlineParam = -1;
-        if (api_.materialHasProperty.Ready() && outlineParamId_ != 0) {
-            bool has = false;
-            if (InvokeManagedResult<bool, HasPropertyFn>(
-                    api_.materialHasProperty, &has, material,
-                    outlineParamId_)) {
-                hasOutlineParam = has ? 1 : 0;
-            }
-        }
-        UnityVector4 local{};
-        int gotLocal = 0;
-        if (MaterialGetVector(
-                api_.materialGetVectorInjected, materialGetVectorUsesOutParam_,
-                material, outlineParamId_, &local)) {
-            gotLocal = 1;
-        }
-        int forwardPass = -1;
-        if (api_.materialFindPass.Ready() &&
-            outlineFindPassForwardName_ != nullptr) {
-            (void)InvokeManagedResult<int, FindPassFn>(
-                api_.materialFindPass, &forwardPass, material,
-                outlineFindPassForwardName_);
-        }
-        std::string outlineProps;
-        int propertyCount = 0;
-        if (shader != nullptr && api_.shaderGetPropertyCount.Ready() &&
-            api_.shaderGetPropertyName.Ready() &&
-            InvokeManagedResult<int, GetIntFn>(
-                api_.shaderGetPropertyCount, &propertyCount, shader)) {
-            const int limit = std::min(propertyCount, 64);
-            for (int property = 0; property < limit; ++property) {
-                void* nameObject = nullptr;
-                if (!InvokeManagedResult<void*, GetPropertyNameFn>(
-                        api_.shaderGetPropertyName, &nameObject, shader,
-                        property) ||
-                    nameObject == nullptr) {
-                    continue;
-                }
-                std::string name;
-                try {
-                    name = reinterpret_cast<UnityResolve::UnityType::String*>(
-                               nameObject)
-                               ->ToString();
-                } catch (...) {
-                    continue;
-                }
-                if (name.find("utline") == std::string::npos &&
-                    name.find("Outline") == std::string::npos) {
-                    continue;
-                }
-                if (!outlineProps.empty()) {
-                    outlineProps += ",";
-                }
-                outlineProps += name;
-            }
-        }
-        Log(std::string("[VR][stereo] EYE_OUTLINE_MAT shader=") +
-            ManagedObjectName(shader) +
-            " hasOutlineParam=" + std::to_string(hasOutlineParam) +
-            " gotLocal=" + std::to_string(gotLocal) +
-            " local=" + std::to_string(local.x) + "," +
-            std::to_string(local.y) + "," + std::to_string(local.z) + "," +
-            std::to_string(local.w) +
-            " findPass=" + std::to_string(forwardPass) +
-            " propCount=" + std::to_string(propertyCount) +
-            " outlineProps=" +
-            (outlineProps.empty() ? "-" : outlineProps));
-    }
-}
+
 
 void UnityStereoRenderer::WriteOutlineMaterialsForEyes() noexcept {
     if (!SceneReadyAllowsStereoRender()) {
@@ -9785,7 +7854,6 @@ void UnityStereoRenderer::WriteOutlineMaterialsForEyes() noexcept {
     if (actorOutlineMaterials_.empty()) {
         return;
     }
-    DumpActorOutlineMaterials();
     GakumasLocal::Config::ClampVrEyeAaSettings();
     const float screenScale = GakumasLocal::Config::vrEyeOutlineWidth;
     const float eyeFov = bloomEyeFovDegrees_ > 1.0F
@@ -9839,9 +7907,6 @@ void UnityStereoRenderer::WriteOutlineMaterialsForEyes() noexcept {
         ++written;
     }
     if (lastWritten != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::OutlineMaterial, "eye-scale", lastWritten,
-            nullptr, static_cast<std::intptr_t>(written));
     }
     outlineEyeScaled_ = written > 0U;
     if (written > 0U) {
@@ -9935,9 +8000,6 @@ void UnityStereoRenderer::WriteOutlineMaterialsForGrip() noexcept {
         ++written;
     }
     if (lastWritten != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::OutlineMaterial, "grip-restore", lastWritten,
-            nullptr, static_cast<std::intptr_t>(written));
     }
     outlineEyeScaled_ = false;
     const auto now = std::chrono::steady_clock::now();
@@ -10328,9 +8390,6 @@ void UnityStereoRenderer::HideUiTextureOverlaysForEyes() noexcept {
     }
     uiTextureOverlaysHidden_ = hidden > 0U;
     if (!writtenMaterials.empty()) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::UiTextureOverlay, "hide-material",
-            writtenMaterials.back(), nullptr, static_cast<std::intptr_t>(hidden));
     }
     if (hidden > 0U && !uiTextureOverlayHideLogged_) {
         uiTextureOverlayHideLogged_ = true;
@@ -10384,9 +8443,6 @@ void UnityStereoRenderer::RestoreUiTextureOverlays(
         }
     }
     if (lastRestored != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::UiTextureOverlay, "restore-material",
-            lastRestored, nullptr, static_cast<std::intptr_t>(restored));
     }
     uiTextureOverlaysHidden_ = false;
     if (!uiTextureOverlayRestoreLogged_) {
@@ -10450,10 +8506,7 @@ void UnityStereoRenderer::DiscoverLiveCameraOverlays() noexcept {
         liveCameraOverlayNextDiscoverAt_ =
             now + std::chrono::milliseconds(250);
     }
-    perf::SrpSpan refresh(tickTrace, "tick.overlay.refresh");
     const auto objects = FindUiObjectsWithPresenceCheck(klass);
-    refresh.Describe("tick.overlay.refresh", static_cast<int>(objects.size()));
-    perf::SrpSpan classify(tickTrace, "tick.overlay.classify");
     using GetObject = void* (*)(void*, void*);
     using GetBool = bool (*)(void*, void*);
     using GetInt = int (*)(void*, void*);
@@ -10544,7 +8597,6 @@ void UnityStereoRenderer::DiscoverLiveCameraOverlays() noexcept {
         }
         Log(entry.str());
     }
-    classify.Stop();
     if (added > 0U || !liveCameraOverlayDiscoverLogged_ ||
         (empty && now >= liveCameraOverlayNextEmptyLogAt_)) {
         liveCameraOverlayDiscoverLogged_ = true;
@@ -10616,9 +8668,6 @@ void UnityStereoRenderer::HideLiveCameraOverlaysForEyes() noexcept {
         }
     }
     if (lastChanged != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::LiveCameraOverlay, "set-inactive",
-            lastChanged, nullptr, static_cast<std::intptr_t>(hidden));
     }
     if (hidden > 0U) {
         liveCameraOverlaysHidden_ = true;
@@ -10662,9 +8711,6 @@ void UnityStereoRenderer::RestoreLiveCameraOverlays(
         }
     }
     if (lastChanged != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::LiveCameraOverlay, "set-active",
-            lastChanged, nullptr, static_cast<std::intptr_t>(restored));
     }
     liveCameraOverlaysHidden_ = false;
     if (!liveCameraOverlayRestoreLogged_) {
@@ -10723,10 +8769,7 @@ void UnityStereoRenderer::DiscoverCmovParticles() noexcept {
     if (empty) {
         cmovParticleNextDiscoverAt_ = now + std::chrono::milliseconds(250);
     }
-    perf::SrpSpan refresh(tickTrace, "tick.cmov.refresh");
     const auto objects = FindManagedObjectsOfType(klass);
-    refresh.Describe("tick.cmov.refresh", static_cast<int>(objects.size()));
-    perf::SrpSpan classify(tickTrace, "tick.cmov.classify");
     using GetObject = void* (*)(void*, void*);
     using GetBool = bool (*)(void*, void*);
     using GetInt = int (*)(void*, void*);
@@ -10809,8 +8852,6 @@ void UnityStereoRenderer::DiscoverCmovParticles() noexcept {
               << (activeSelf ? 1 : 0) << " layer=" << layer;
         Log(entry.str());
     }
-    classify.Describe("tick.cmov.classify", static_cast<int>(cmovSeen));
-    classify.Stop();
     if (added > 0U || !cmovParticleDiscoverLogged_ ||
         (empty && now >= cmovParticleNextEmptyLogAt_)) {
         cmovParticleDiscoverLogged_ = true;
@@ -10879,9 +8920,6 @@ void UnityStereoRenderer::HideCmovParticlesForEyes() noexcept {
         }
     }
     if (lastChanged != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::CmovParticle, "set-inactive", lastChanged,
-            nullptr, static_cast<std::intptr_t>(hidden));
     }
     if (hidden > 0U) {
         cmovParticlesHidden_ = true;
@@ -10926,9 +8964,6 @@ void UnityStereoRenderer::RestoreCmovParticles(
         }
     }
     if (lastChanged != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::CmovParticle, "set-active", lastChanged,
-            nullptr, static_cast<std::intptr_t>(restored));
     }
     cmovParticlesHidden_ = false;
     if (!cmovParticleRestoreLogged_) {
@@ -11217,9 +9252,6 @@ void UnityStereoRenderer::WriteProFlareScalesForGrip() noexcept {
         ++written;
     }
     if (lastWritten != nullptr) {
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::ProFlare, "grip-authored", lastWritten,
-            nullptr, static_cast<std::intptr_t>(written));
     }
     proFlareEyeScaled_ = false;
     if (!proFlareGripWriteLogged_ && (written > 0U || skippedDead > 0U)) {
@@ -11361,9 +9393,6 @@ void UnityStereoRenderer::SyncEyeAsMainCameraTag() noexcept {
         }
         eyeMainCameraTagApplied_ = true;
         eyeMainCameraTaggedObject_ = eyeGameObjects_[0];
-        RecordLifetimeWrite(
-            LifetimeWriteCategory::MainCameraTag, "set-main-camera",
-            eyeGameObjects_[0], mainCameraTagString_, 1);
         Log("[VR][stereo] EYE_MAIN_CAMERA_TAG applied=1 eye=left sourceTagKept=1");
         return;
     }
@@ -11375,9 +9404,6 @@ void UnityStereoRenderer::SyncEyeAsMainCameraTag() noexcept {
                 untaggedTagString_)) {
             Log("[VR][stereo] EYE_MAIN_CAMERA_TAG failed=eye-clear");
         } else {
-            RecordLifetimeWrite(
-                LifetimeWriteCategory::MainCameraTag, "set-untagged",
-                eyeMainCameraTaggedObject_, untaggedTagString_, 0);
         }
     }
     eyeMainCameraTagApplied_ = false;
@@ -11414,63 +9440,11 @@ const char* UnityStereoRenderer::ClassifyCamera(void* camera) const noexcept {
 
 bool UnityStereoRenderer::BeginActorShadowSourceAnchor(
     const char* passName) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-anchor-begin");
     // Pass-activity census, ahead of every gate below. The .89 run showed
     // the campus pass only executes per-frame in some scenes, so anything
     // keyed on its call count can silently starve; this prints which passes
     // ran on which cameras every ~10 s so the log shows the actual pattern.
-    if (passName != nullptr && IsOwnerThread()) {
-        std::size_t passIndex = 3;
-        if (std::strcmp(passName, "campus-actor-param") == 0) {
-            passIndex = 0;
-        } else if (std::strcmp(passName, "vl-actor-param") == 0) {
-            passIndex = 1;
-        } else if (std::strcmp(passName, "actor-shadow") == 0 ||
-                   std::strcmp(passName, "actor-shadow-add") == 0) {
-            passIndex = 2;
-        }
-        const char* cameraClass = ClassifyCamera(currentCamera_);
-        std::size_t cameraIndex = 3;
-        if (std::strcmp(cameraClass, "source") == 0) {
-            cameraIndex = 0;
-        } else if (std::strcmp(cameraClass, "left") == 0) {
-            cameraIndex = 1;
-        } else if (std::strcmp(cameraClass, "right") == 0) {
-            cameraIndex = 2;
-        }
-        ++passActivityCounts_[passIndex][cameraIndex];
-        const auto now = std::chrono::steady_clock::now();
-        if (passActivityPrintAt_ == std::chrono::steady_clock::time_point{}) {
-            passActivityPrintAt_ = now + std::chrono::seconds(10);
-        } else if (now >= passActivityPrintAt_) {
-            passActivityPrintAt_ = now + std::chrono::seconds(10);
-            std::ostringstream stream;
-            stream << "[VR][shadow] PASS_ACTIVITY window=10s";
-            static constexpr const char* kPassNames[4] = {
-                "campus", "vl", "shadow", "other"};
-            for (std::size_t pass = 0; pass < 4; ++pass) {
-                stream << ' ' << kPassNames[pass] << "=s:"
-                       << passActivityCounts_[pass][0] << ",l:"
-                       << passActivityCounts_[pass][1] << ",r:"
-                       << passActivityCounts_[pass][2] << ",o:"
-                       << passActivityCounts_[pass][3];
-                passActivityCounts_[pass] = {};
-            }
-            Log(stream.str());
-        }
-        // Render-side diagnostic host: fires on either MatCap parameter pass while
-        // it renders the source camera, rate-limited by wall clock instead of
-        // the .87 "every 30th call" rule that starved all session on .89.
-        if ((passIndex == 0 || passIndex == 1) && cameraIndex == 0 &&
-            currentCamera_ != nullptr) {
-            ++actorLightDiagnosticCalls_;
-            if (now >= actorLightDiagnosticNextAt_) {
-                actorLightDiagnosticNextAt_ =
-                    now + std::chrono::milliseconds(1500);
-                RecordActorLightDiagnostics(ReadCurrentCameraPoseForDiagnostics());
-            }
-        }
-    }
+
     if (actorShadowAnchorActive_ ||
         !GakumasLocal::Config::vrActorShadowSourceAnchor || !IsOwnerThread() ||
         !actorShadowAnchorPoseValid_) {
@@ -11579,7 +9553,6 @@ bool UnityStereoRenderer::BeginActorShadowSourceAnchor(
 }
 
 void UnityStereoRenderer::EndActorShadowSourceAnchor() noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-anchor-end");
     if (!actorShadowAnchorActive_) {
         return;
     }
@@ -11847,62 +9820,14 @@ bool UnityStereoRenderer::ReadShaderGlobal(
     return true;
 }
 
-pose::Pose UnityStereoRenderer::ReadCurrentCameraPoseForDiagnostics() noexcept {
-    // Zero orientation marks "unreadable"; a valid quaternion can never be
-    // all zeros.
-    pose::Pose failed{};
-    failed.orientation = {0.0F, 0.0F, 0.0F, 0.0F};
-    void* camera = currentCamera_;
-    if (camera == nullptr || !api_.componentGetTransform.Ready() ||
-        !api_.transformGetPositionInjected.Ready() ||
-        !api_.transformGetRotationInjected.Ready() ||
-        !IsUnityManagedObjectAlive(camera)) {
-        return failed;
-    }
-    using GetTransform = void* (*)(void*, void*);
-    using GetVector3 = void (*)(void*, UnityVector3*, void*);
-    using GetQuaternion = void (*)(void*, UnityQuaternion*, void*);
-    void* transform = nullptr;
-    if (!InvokeManagedResult<void*, GetTransform>(
-            api_.componentGetTransform, &transform, camera) ||
-        transform == nullptr) {
-        return failed;
-    }
-    void* nativeTransform = nullptr;
-    if (api_.transformPositionGetterUsesNativeSelf ||
-        api_.transformRotationGetterUsesNativeSelf) {
-        nativeTransform = ReadUnityNativePointer(transform);
-        if (nativeTransform == nullptr) {
-            return failed;
-        }
-    }
-    void* positionSelf = api_.transformPositionGetterUsesNativeSelf
-        ? nativeTransform
-        : transform;
-    void* rotationSelf = api_.transformRotationGetterUsesNativeSelf
-        ? nativeTransform
-        : transform;
-    UnityVector3 position{};
-    UnityQuaternion rotation{};
-    if (!InvokeManagedVoid<GetVector3>(
-            api_.transformGetPositionInjected, positionSelf, &position) ||
-        !InvokeManagedVoid<GetQuaternion>(
-            api_.transformGetRotationInjected, rotationSelf, &rotation)) {
-        return failed;
-    }
-    const pose::Pose result{
-        {position.x, position.y, position.z},
-        {rotation.x, rotation.y, rotation.z, rotation.w},
-    };
-    return IsFinitePose(result) ? result : failed;
-}
+
 
 bool UnityStereoRenderer::EnsureActorLightShaderIds() noexcept {
     const bool allKnown = actorLightMatcapMainId_ != 0 && actorLightMatcapRimId_ != 0 &&
         actorLightLitActorMainId_ != 0 && actorLightVlSpecColorId_ != 0 &&
         actorLightGlobalLightParameterId_ != 0 && actorLightMatcapLightColorId_ != 0 &&
         actorLightDirectionId_ != 0 && actorLightWorldToActorShadowId_ != 0;
-    if (allKnown && actorLightDiagnosticResolved_) {
+    if (allKnown && actorLightShaderApiResolved_) {
         return true;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -11910,8 +9835,8 @@ bool UnityStereoRenderer::EnsureActorLightShaderIds() noexcept {
         return actorLightMatcapMainId_ != 0;
     }
     actorLightIdRetryAt_ = now + std::chrono::seconds(1);
-    if (!actorLightDiagnosticResolved_) {
-        actorLightDiagnosticResolved_ = true;
+    if (!actorLightShaderApiResolved_) {
+        actorLightShaderApiResolved_ = true;
         auto* shaderClass = Il2cppUtils::GetClass(
             "UnityEngine.CoreModule.dll", "UnityEngine", "Shader");
         if (shaderClass != nullptr) {
@@ -12104,209 +10029,10 @@ bool UnityStereoRenderer::EnsureActorLightShaderIds() noexcept {
     return actorLightMatcapMainId_ != 0 || actorLightLitActorMainId_ != 0;
 }
 
-void UnityStereoRenderer::RecordActorLightDiagnostics(
-    const pose::Pose& headPose) noexcept {
-    // One-shot entry trace, before any resolve work: if a run ends with this
-    // line but no ACTOR_LIGHT_DIAGNOSTIC sample after it, the crash is inside the
-    // diagnostic resolve/read path.
-    if (!actorLightDiagnosticEnterLogged_) {
-        actorLightDiagnosticEnterLogged_ = true;
-        Log("[VR][shadow] ACTOR_LIGHT_DIAGNOSTIC_ENTER first call");
-    }
-    (void)EnsureActorLightShaderIds();
-    const auto readGlobal =
-        [this](const MethodRef& getter, std::int32_t id, float* out,
-               std::size_t count) -> bool {
-        return ReadShaderGlobal(getter, id, out, count);
-    };
-    const auto appendVector =
-        [](std::ostringstream& stream, const char* label, const float* value,
-           bool ok) {
-            stream << ' ' << label << '=';
-            if (!ok) {
-                stream << '-';
-                return;
-            }
-            stream << '(' << value[0] << ',' << value[1] << ',' << value[2]
-                   << ',' << value[3] << ')';
-        };
-    float matcapMain[4]{};
-    float matcapRim[4]{};
-    float litMain[4]{};
-    float specColor[4]{};
-    float globalLight[4]{};
-    float lightColor[4]{};
-    float lightDir[4]{};
-    float camPos[4]{};
-    float shadowMatrix[16]{};
-    const bool matcapMainOk = readGlobal(
-        shaderGetGlobalVector_, actorLightMatcapMainId_, matcapMain, 4U);
-    const bool matcapRimOk =
-        readGlobal(shaderGetGlobalVector_, actorLightMatcapRimId_, matcapRim, 4U);
-    const bool litMainOk =
-        readGlobal(shaderGetGlobalVector_, actorLightLitActorMainId_, litMain, 4U);
-    const bool specColorOk = readGlobal(
-        shaderGetGlobalVector_, actorLightVlSpecColorId_, specColor, 4U);
-    const bool globalLightOk = readGlobal(
-        shaderGetGlobalVector_, actorLightGlobalLightParameterId_, globalLight,
-        4U);
-    const bool lightColorOk = readGlobal(
-        shaderGetGlobalVector_, actorLightMatcapLightColorId_, lightColor, 4U);
-    const bool lightDirOk = readGlobal(
-        shaderGetGlobalVector_, actorLightDirectionId_, lightDir, 4U);
-    const bool camPosOk = readGlobal(
-        shaderGetGlobalVector_, actorLightWorldSpaceCameraPosId_, camPos, 4U);
-    const bool shadowOk = readGlobal(
-        shaderGetGlobalMatrix_, actorLightWorldToActorShadowId_, shadowMatrix, 16U);
-    const bool headPoseOk = headPose.orientation.x != 0.0F ||
-        headPose.orientation.y != 0.0F || headPose.orientation.z != 0.0F ||
-        headPose.orientation.w != 0.0F;
-    const pose::Vector3 headForward = pose::Rotate(
-        headPose.orientation, pose::Vector3{0.0F, 0.0F, 1.0F});
-    const pose::Vector3 shotForward = pose::Rotate(
-        actorShadowAnchorPose_.orientation, pose::Vector3{0.0F, 0.0F, 1.0F});
-    std::ostringstream stream;
-    stream << "[VR][shadow] ACTOR_LIGHT_DIAGNOSTIC" << std::fixed
-           << std::setprecision(3);
-    appendVector(stream, "matcapMain", matcapMain, matcapMainOk);
-    appendVector(stream, "matcapRim", matcapRim, matcapRimOk);
-    appendVector(stream, "litMain", litMain, litMainOk);
-    appendVector(stream, "specColor", specColor, specColorOk);
-    appendVector(stream, "glp", globalLight, globalLightOk);
-    appendVector(stream, "lightColor", lightColor, lightColorOk);
-    appendVector(stream, "lightDir", lightDir, lightDirOk);
-    appendVector(stream, "camPos", camPos, camPosOk);
-    stream << " shadowM0=";
-    if (shadowOk) {
-        float shadowSum = 0.0F;
-        for (float value : shadowMatrix) {
-            shadowSum += std::abs(value);
-        }
-        // Matrix4x4 is column-major in memory; elements [2],[6],[10] form
-        // row 2 of ShadowUV<-World — the light-view z row, i.e. the actual
-        // projection axis. Row 0 (the [0],[4],[8] samples inside shadowM0's
-        // columns) can roll with the head without the shadow moving, so the
-        // verdict on "does the shadow follow the head" must read this row.
-        stream << '(' << shadowMatrix[0] << ',' << shadowMatrix[1] << ','
-               << shadowMatrix[2] << ',' << shadowMatrix[3]
-               << ") shadowRow2=(" << shadowMatrix[2] << ','
-               << shadowMatrix[6] << ',' << shadowMatrix[10]
-               << ") shadowSum=" << shadowSum;
-    } else {
-        stream << '-';
-    }
-    stream << " headFwd=";
-    if (headPoseOk) {
-        stream << '(' << headForward.x << ',' << headForward.y << ','
-               << headForward.z << ')';
-    } else {
-        stream << '-';
-    }
-    // VLActorShadow volume readback: directionalType decides how the
-    // projected actor shadow derives its virtual light (0=Fixed 1=Matcap
-    // 2=ShadowLight). Matcap derives from the rendering camera's rotation,
-    // which would match the user's "projection follows head angle, not
-    // position" report exactly.
-    std::int32_t shadowDirType = -1;
-    float shadowLightDir[3]{};
-    bool shadowLightDirOk = false;
-    if (!actorShadowVolumeResolved_) {
-        actorShadowVolumeResolved_ = true;
-        auto* actorShadowClass = Il2cppUtils::GetClass(
-            "vl-unity.Runtime.dll", "VL.Rendering", "VLActorShadow");
-        if (actorShadowClass != nullptr) {
-            vlActorShadowType_ = actorShadowClass->GetType();
-            actorShadowDirectionalTypeOffset_ =
-                FindClassFieldOffset(actorShadowClass, {"directionalType"});
-            actorShadowLightDirectionalOffset_ =
-                FindClassFieldOffset(actorShadowClass, {"lightDirectional"});
-        }
-    }
-    if (vlActorShadowType_ != nullptr && volumeManagerGetInstance_.Ready() &&
-        volumeManagerGetStack_.Ready()) {
-        using GetStatic = void* (*)(void*);
-        using GetObject = void* (*)(void*, void*);
-        void* volumeManager = nullptr;
-        void* stack = nullptr;
-        if (InvokeManagedResult<void*, GetStatic>(
-                volumeManagerGetInstance_, &volumeManager) &&
-            volumeManager != nullptr &&
-            InvokeManagedResult<void*, GetObject>(
-                volumeManagerGetStack_, &stack, volumeManager) &&
-            stack != nullptr) {
-            void* component = GetVolumeComponent(stack, vlActorShadowType_);
-            if (component != nullptr) {
-                if (actorShadowDirectionalTypeOffset_ >= 0) {
-                    void* typeParam = ReadVolumeParameter(
-                        component, actorShadowDirectionalTypeOffset_);
-                    if (typeParam != nullptr) {
-                        if (volumeParameterEnumValueOffset_ < 0) {
-                            volumeParameterEnumValueOffset_ =
-                                ResolveVolumeField(
-                                    typeParam, {"m_Value", "value"}, {});
-                        }
-                        if (volumeParameterEnumValueOffset_ >= 0) {
-                            (void)ReadManagedField(
-                                typeParam, volumeParameterEnumValueOffset_,
-                                &shadowDirType);
-                        }
-                    }
-                }
-                if (actorShadowLightDirectionalOffset_ >= 0) {
-                    void* dirParam = ReadVolumeParameter(
-                        component, actorShadowLightDirectionalOffset_);
-                    if (dirParam != nullptr) {
-                        if (volumeParameterVector3ValueOffset_ < 0) {
-                            volumeParameterVector3ValueOffset_ =
-                                ResolveVolumeField(
-                                    dirParam, {"m_Value", "value"},
-                                    {"UnityEngine.Vector3", "Vector3"});
-                        }
-                        if (volumeParameterVector3ValueOffset_ >= 0) {
-                            shadowLightDirOk =
-                                ReadManagedField(
-                                    dirParam, volumeParameterVector3ValueOffset_,
-                                    &shadowLightDir[0]) &&
-                                ReadManagedField(
-                                    dirParam,
-                                    volumeParameterVector3ValueOffset_ +
-                                        static_cast<std::int32_t>(sizeof(float)),
-                                    &shadowLightDir[1]) &&
-                                ReadManagedField(
-                                    dirParam,
-                                    volumeParameterVector3ValueOffset_ +
-                                        static_cast<std::int32_t>(
-                                            2U * sizeof(float)),
-                                    &shadowLightDir[2]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    stream << " shadowType=";
-    if (shadowDirType >= 0) {
-        stream << shadowDirType;
-    } else {
-        stream << '-';
-    }
-    stream << " lightAuth=";
-    if (shadowLightDirOk) {
-        stream << '(' << shadowLightDir[0] << ',' << shadowLightDir[1] << ','
-               << shadowLightDir[2] << ')';
-    } else {
-        stream << '-';
-    }
-    stream << " shotFwd=(" << shotForward.x << ',' << shotForward.y << ','
-           << shotForward.z << ") anchorValid="
-           << (actorShadowAnchorPoseValid_ ? 1 : 0)
-           << " tick=" << actorLightDiagnosticTicks_;
-    Log(stream.str());
-}
+
 
 void UnityStereoRenderer::ApplyActorMatcapCompensation(
     void* renderContext, void* renderingData) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-compensation");
     // After CampusActorParameterPass.Execute. Rim-only compensate
     // (accepted `.130`) needs the projected-shadow bracket's saved
     // head pose. Authored rim (`.146`) runs when the toon-frame lock
@@ -12524,8 +10250,6 @@ void UnityStereoRenderer::ApplyActorMatcapCompensation(
         auto* contextClass = Il2cppUtils::GetClass(
             "UnityEngine.CoreModule.dll", "UnityEngine.Rendering",
             "ScriptableRenderContext");
-        DumpSetupCameraCandidates(commandBufferClass, "CommandBuffer");
-        DumpSetupCameraCandidates(contextClass, "ScriptableRenderContext");
         bool contextSetupStatic = false;
         bool contextSetupStereo = false;
         bool contextSetupEye = false;
@@ -13072,55 +10796,7 @@ void UnityStereoRenderer::ApplyActorMatcapCompensation(
     }
 }
 
-void UnityStereoRenderer::LogShadowHeartbeat() noexcept {
-    // Deliberately no gates: this runs on whatever thread the campus pass
-    // hook runs on, and reports the raw state the gated paths depend on.
-    // deltas are "deadline minus now" in ms; negative means overdue (should
-    // have fired), "unset" means the zero-initialized time_point.
-    const auto now = std::chrono::steady_clock::now();
-    const auto deadlineText =
-        [&now](std::chrono::steady_clock::time_point at) -> std::string {
-        if (at == std::chrono::steady_clock::time_point{}) {
-            return "unset";
-        }
-        return std::to_string(
-            std::chrono::duration_cast<std::chrono::milliseconds>(at - now)
-                .count());
-    };
-    std::uint64_t censusTotal = 0;
-    for (const auto& perPass : passActivityCounts_) {
-        for (const std::uint32_t value : perPass) {
-            censusTotal += value;
-        }
-    }
-    std::ostringstream stream;
-    stream << "[VR][shadow] SHADOW_HB self=" << static_cast<const void*>(this)
-           << " tid=" << GetCurrentThreadId() << " owner=" << ownerThreadId_
-           << " cam=" << ClassifyCamera(currentCamera_)
-           << " anchorActive=" << (actorShadowAnchorActive_ ? 1 : 0)
-           << " anchorValid=" << (actorShadowAnchorPoseValid_ ? 1 : 0)
-           << " applied=" << matcapCompApplied_
-           << " gbufferLock=" << matcapGbufferLockApplied_
-           << " lock="
-           << (GakumasLocal::Config::vrActorShadowSourceAnchor ? 1 : 0)
-           << " toonLock="
-           << (GakumasLocal::Config::vrActorToonSourceAnchor ? 1 : 0)
-           << " toonShared=1"
-           << " toonPose=" << (toonLightingPoseValid_ ? 1 : 0)
-           << " followRef=" << GakumasLocal::Config::vrToonFollowRef
-           << " diagnosticCalls=" << actorLightDiagnosticCalls_
-           << " census=" << censusTotal
-           << " campusS=" << passActivityCounts_[0][0]
-           << " printIn=" << deadlineText(passActivityPrintAt_)
-           << " diagnosticIn=" << deadlineText(actorLightDiagnosticNextAt_)
-           << " ids=" << actorLightMatcapMainId_ << '/' << actorLightMatcapRimId_ << '/'
-           << actorLightLitActorMainId_ << '/' << actorLightVlSpecColorId_ << '/'
-           << actorLightGlobalLightParameterId_ << '/' << actorLightMatcapLightColorId_
-           << '/' << actorLightWorldSpaceCameraPosId_ << '/'
-           << actorLightDirectionId_ << '/'
-           << actorLightWorldToActorShadowId_;
-    Log(stream.str());
-}
+
 
 bool UnityStereoRenderer::EnsureCameraDataFieldOffsets() noexcept {
     if (actorShadowViewPatchResolved_) {
@@ -13242,7 +10918,6 @@ bool UnityStereoRenderer::InvokeContextSetupCameraProperties(
 
 bool UnityStereoRenderer::BeginActorMatcapCamPosLock(
     void* renderContext, void* renderingData) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-lock-begin");
     if (renderContext == nullptr || renderingData == nullptr ||
         !IsOwnerThread()) {
         return false;
@@ -13296,7 +10971,6 @@ bool UnityStereoRenderer::BeginActorMatcapCamPosLock(
 
 void UnityStereoRenderer::EndActorMatcapCamPosLock(
     void* renderContext, void* renderingData) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.matcap-lock-end");
     if (renderContext == nullptr || renderingData == nullptr ||
         !IsOwnerThread()) {
         return;
@@ -13902,7 +11576,6 @@ bool UnityStereoRenderer::UploadMatcapCamPos(
 
 bool UnityStereoRenderer::BeginActorShadowViewPatch(
     void* renderingData) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-view-begin");
     // Augments an active anchor bracket only: same toggle, same shot pose.
     if (renderingData == nullptr || !actorShadowAnchorActive_ ||
         !IsOwnerThread() || actorShadowViewPatchActive_) {
@@ -13988,7 +11661,6 @@ bool UnityStereoRenderer::BeginActorShadowViewPatch(
 
 void UnityStereoRenderer::EndActorShadowViewPatch(
     void* renderingData) noexcept {
-    perf::SrpSpan span(perf::srpPerformance, "mod.shadow-view-end");
     if (!actorShadowViewPatchActive_) {
         return;
     }
@@ -14077,7 +11749,6 @@ bool UnityStereoRenderer::ConfigureCamera(
     using SetDepth = void (*)(void*, float, void*);
     using GetClip = float (*)(void*, void*);
     using SetClip = void (*)(void*, float, void*);
-    perf::SrpSpan copy(tickTrace, "tick.eye.copy-or-mask");
     const std::string eyeName = eye == 0U ? "left" : "right";
     Log("[VR][stereo] CALL_BEGIN stage=configure.copy eye=" + eyeName);
     // A disabled source is no longer a valid temporal donor.
@@ -14113,19 +11784,12 @@ bool UnityStereoRenderer::ConfigureCamera(
     } else {
         Log("[VR][stereo] CALL_OK stage=configure.copy eye=" + eyeName);
     }
-    copy.Stop();
-    perf::SrpSpan bind(tickTrace, "tick.eye.bind-target");
     Log("[VR][stereo] CALL_BEGIN stage=configure.target eye=" + eyeName);
     if (!InvokeManagedVoid<SetTarget>(api_.cameraSetTargetTexture,
                                      eyeCameras_[eye], target)) {
         return FailStage("configure.target", eye);
     }
-    RecordLifetimeWrite(
-        LifetimeWriteCategory::TargetTexture, "eye-bind", eyeCameras_[eye],
-        target, static_cast<std::intptr_t>(eye));
     Log("[VR][stereo] CALL_OK stage=configure.target eye=" + eyeName);
-    bind.Stop();
-    perf::SrpSpan lens(tickTrace, "tick.eye.capture-lens");
     if (sceneEnabled) {
         if (eye < frame.trackingSample.eyes.size() &&
             IsFiniteFov(frame.trackingSample.eyes[eye].fov)) {
@@ -14139,13 +11803,9 @@ bool UnityStereoRenderer::ConfigureCamera(
         }
         CaptureSourceLens(sourceCamera);
     }
-    lens.Stop();
-    perf::SrpSpan data(tickTrace, "tick.eye.camera-data");
     if (sceneEnabled && !ConfigureCameraData(eye, sourceCamera, target)) {
         return false;
     }
-    data.Stop();
-    perf::SrpSpan clips(tickTrace, "tick.eye.depth-and-clips");
     if (!sceneEnabled) {
         Log("[VR][stereo] CALL_BEGIN stage=configure.mask eye=" + eyeName +
             " value=0");
@@ -14244,15 +11904,11 @@ bool UnityStereoRenderer::ConfigureCamera(
                 " clamped=" +
                 std::string(eyeNearClip < nearClip ? "1" : "0"));
         }
-        clips.Stop();
-        perf::SrpSpan pose(tickTrace, "tick.eye.pose-projection");
         if (!ApplyEyePoseAndProjection(
                 eye, frame, appliedEyeNearClip, appliedEyeFarClip)) {
             return false;
         }
     }
-    clips.Stop();
-    perf::SrpSpan enable(tickTrace, "tick.eye.enable");
     return SetCameraEnabled(eye, true);
 }
 
@@ -14277,12 +11933,9 @@ bool UnityStereoRenderer::ArmCurrentStage(
         return false;
     }
     for (std::size_t eye = 0; eye < count; ++eye) {
-        perf::SrpSpan camera(tickTrace, "tick.arm.ensure-camera", eye);
         if (!EnsureCamera(eye)) {
             return false;
         }
-        camera.Stop();
-        perf::SrpSpan target(tickTrace, "tick.arm.ensure-target", eye);
         if (
             (!full && !EnsureAdmissionTarget(eye)) ||
             (full && !EnsureFullTarget(eye, targetSpec.width, targetSpec.height,
@@ -14290,7 +11943,6 @@ bool UnityStereoRenderer::ArmCurrentStage(
             return false;
         }
     }
-    perf::SrpSpan temporal(tickTrace, "tick.arm.temporal-state");
     GakumasLocal::Config::ClampVrEyeAaSettings();
     const bool smaaT2xRequested =
         full && GakumasLocal::Config::vrEyeAaMode == 4;
@@ -14361,21 +12013,8 @@ bool UnityStereoRenderer::ArmCurrentStage(
             ++smaaT2xPairToken_;
         }
     }
-    const std::uint64_t nextResolvedCount = smaaT2xResolvedCount_ + 1U;
-    smaaT2xComprehensiveProbeForPair_ =
-        GakumasLocal::Config::vrDiagnosticsStartupEnabled &&
-        smaaT2xActiveForPair_ && smaaT2xPass_.HasHistory() &&
-        (nextResolvedCount <= 2U || nextResolvedCount % 30U == 0U);
-    const std::uint64_t nextTscmaaResolvedCount = tscmaaResolvedCount_ + 1U;
-    tscmaaComprehensiveProbeForPair_ =
-        GakumasLocal::Config::vrDiagnosticsStartupEnabled &&
-        tscmaaActiveForPair_ && tscmaaPass_.HasHistory() &&
-        (nextTscmaaResolvedCount <= 2U ||
-         nextTscmaaResolvedCount % 30U == 0U);
     smaaT2xExpectedProjectionValid_.fill(false);
     smaaT2xMotionHistoryCorrectedForPair_.fill(false);
-    temporal.Stop();
-    perf::SrpSpan source(tickTrace, "tick.arm.source-depth-and-log");
     using GetDepth = float (*)(void*, void*);
     float sourceDepth = 0.0F;
     Log("[VR][stereo] CALL_BEGIN stage=configure.source-depth");
@@ -14404,9 +12043,7 @@ bool UnityStereoRenderer::ArmCurrentStage(
               << " token=" << smaaT2xPairToken_;
     }
     Log(begin.str());
-    source.Stop();
     for (std::size_t eye = 0; eye < count; ++eye) {
-        perf::SrpSpan configure(tickTrace, "tick.arm.configure-eye", eye);
         void* target = full ? fullTargets_[eye] : admissionTargets_[eye];
         if (!ConfigureCamera(eye, sourceCamera, target, full, frame,
                              sourceDepth)) {
@@ -14428,7 +12065,6 @@ bool UnityStereoRenderer::ArmCurrentStage(
             return false;
         }
     }
-    perf::SrpSpan activation(tickTrace, "tick.arm.activate");
     stageContextEpoch_ = 0;
     observedMask_ = 0;
     armedPoseRevision_ = frame.trackingSample.revision;
@@ -14467,23 +12103,15 @@ void UnityStereoRenderer::Tick(
     bool pipelineIdle) noexcept {
     BindStereoGpuPublishOwner(this);
     ApplyPendingGpuFailure();
-    perf::TraceCapture tickCapture(tickTrace,
-        GakumasLocal::Config::vrDiagnosticsStartupEnabled, GetCurrentThreadId(), "TICK_PERF",
-        [this](std::string_view line) noexcept { Log(line); });
     static thread_local perf::Accumulator tickTiming;
     perf::Scope tickScope(tickTiming, GakumasLocal::Config::vrDiagnosticsStartupEnabled,
         "unity.tick", [this](std::string_view line) noexcept { Log(line); });
-    perf::SrpSpan bootstrap(tickTrace, "tick.bootstrap");
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        EnsureLivenessCrashProbe();
-    }
     if (IsOwnerThread()) {
         FrameLoopDriverEnsureOnUnityThread();
     }
     while (IsOwnerThread() && ConsumeLivePauseToggle()) {
         ToggleLivePause();
     }
-    bootstrap.Stop();
     if (IsOwnerThread()) {
         // Captured before the eligibility gates below: the actor-shadow
         // anchor also serves the Grip path, where the eye ladder never
@@ -14508,11 +12136,9 @@ void UnityStereoRenderer::Tick(
         // camera stops hard-swapping local blend=0 lighting volumes
         // (lobby boundary row, `.228` census).
         {
-            perf::SrpSpan span(tickTrace, "tick.volume-anchor");
             UpdateVolumeTriggerAnchor(sourceCamera, frame);
         }
         {
-            perf::SrpSpan span(tickTrace, "tick.hand-glowsticks");
             TickHandGlowSticks(headsetPose_, headsetPoseValid_, frame.trackingSample);
         }
         // Diagnostic counter only: the .85 run showed Tick goes quiet inside
@@ -14520,12 +12146,10 @@ void UnityStereoRenderer::Tick(
         // itself moved to the render-side anchor bracket, which the .84 run
         // proved fires every frame. Diagnostics print this counter so the two
         // cadences can be compared offline.
-        ++actorLightDiagnosticTicks_;
     }
     if (!pipelineIdle || !IsOwnerThread()) {
         return;
     }
-    perf::SrpSpan readiness(tickTrace, "tick.scene-ready");
     const auto spec = ReadStereoRenderTargetSpec();
     const bool sourcePresent = spec.enabled && sourceCamera != nullptr &&
         IsUnityManagedObjectAlive(sourceCamera) &&
@@ -14534,19 +12158,13 @@ void UnityStereoRenderer::Tick(
     // Sample loading before identity so a same-Tick loading edge can
     // start an epoch and still HoldEyeArm on this identity change.
     SampleSceneReady("tick", spec.enabled, sourcePresent);
-    ObserveLifetimeSceneReadyEdges("tick-after-sample");
     const bool sceneContentReadyEdge = SceneReadyConsumeContentReadyEdge();
     if (sceneContentReadyEdge) {
         RequestActorOutlineDiscover("content-ready");
     }
-    readiness.Stop();
-    perf::SrpSpan identity(tickTrace, "tick.scene-identity-census");
     RefreshSceneIdentity("tick");
     if (sceneContentReadyEdge) {
-        RequestVirtualCameraCensus("content-ready");
     }
-    RunVirtualCameraCensusIfDue();
-    identity.Stop();
     if (!beginLogged_) {
         beginLogged_ = true;
         Log("[VR][stereo] QUEUE_LADDER_BEGIN stages=A/B/C crashPolicy=preserve-first-fault");
@@ -14648,7 +12266,6 @@ void UnityStereoRenderer::Tick(
         RestoreUiTextureOverlays("stage-terminal");
         return;
     }
-    perf::SrpSpan sourceBoundaryTiming(tickTrace, "tick.source-boundary");
     if (!stageArmed_ && !decisionPending_ && !publishPending_) {
         attemptedSceneHandle_ = activeSceneHandleKnown_ ? activeSceneHandle_ : 0;
     }
@@ -14683,7 +12300,6 @@ void UnityStereoRenderer::Tick(
         latestSourceCamera_ != sourceCamera) {
         RestoreSourceCamera("source-boundary");
         NoteSceneReadySourceCameraChanged();
-        ObserveLifetimeSceneReadyEdges("source-boundary");
     }
     if (stereoInvalidatedForIneligibility_ || sourceBoundary) {
         ResetTemporalHistories(sourceBoundary
@@ -14705,7 +12321,6 @@ void UnityStereoRenderer::Tick(
         }
         InvalidateUnityStereoFrame();
         continuousStereo_ = false;
-        sourceFingerprintValid_.fill(false);
         stereoInvalidatedForIneligibility_ = false;
         latestSourceVolumeStack_ = nullptr;
         sourceCutSignatureValid_ = false;
@@ -14721,32 +12336,15 @@ void UnityStereoRenderer::Tick(
     lastEligibleGeneration_ = spec.generation;
     latestFrame_ = frame;
     latestTargetSpec_ = {spec.eyeWidth, spec.eyeHeight, spec.generation};
-    sourceBoundaryTiming.Stop();
-    perf::SrpSpan effects(tickTrace, "tick.source-effects");
-    perf::SrpSpan suppression(tickTrace, "tick.source-suppression");
     SyncSourceCameraSuppression(sourceCamera);
-    suppression.Stop();
-    perf::SrpSpan overlayDiscover(tickTrace, "tick.overlay.discover");
     DiscoverLiveCameraOverlays();
-    overlayDiscover.Stop();
-    perf::SrpSpan overlayHide(tickTrace, "tick.overlay.hide");
     HideLiveCameraOverlaysForEyes();
-    overlayHide.Stop();
-    perf::SrpSpan cmovDiscover(tickTrace, "tick.cmov.discover");
     DiscoverCmovParticles();
-    cmovDiscover.Stop();
-    perf::SrpSpan cmovHide(tickTrace, "tick.cmov.hide");
     HideCmovParticlesForEyes();
-    cmovHide.Stop();
-    effects.Stop();
     if (stageArmed_ || decisionPending_ || publishPending_) {
         return;
     }
-    perf::SrpSpan arm(tickTrace, "tick.arm-stage");
-    perf::SrpSpan armCall(tickTrace, "tick.arm.call");
     ArmCurrentStage(sourceCamera, frame, latestTargetSpec_);
-    armCall.Stop();
-    perf::SrpSpan armTail(tickTrace, "tick.arm.post");
     if (!portraitArmedLogged_ && !spec.landscape && stageArmed_) {
         MaybeLogPortraitArmed(sourceCamera);
     }
@@ -14777,7 +12375,6 @@ void UnityStereoRenderer::OnBeginCamera(void* camera) noexcept {
     EnsureOutlineMaterialApi();
     if (camera != nullptr && !SceneReadyAllowsStereoPublish()) {
         NoteSceneReadyCameraBoundary(ClassifyCamera(camera), true);
-        ObserveLifetimeSceneReadyEdges("begin-camera");
     }
     if (camera != nullptr &&
         (camera == eyeCameras_[0] || camera == eyeCameras_[1])) {
@@ -14790,7 +12387,6 @@ void UnityStereoRenderer::OnBeginCamera(void* camera) noexcept {
             WriteProFlareScalesForEyes();
             WriteOutlineMaterialsForEyes();
         }
-        NoteBeginEyeSky(camera);
         if (!eyeBeginCameraLogged_) {
             eyeBeginCameraLogged_ = true;
             Log("[VR][stereo] EYE_BEGIN_CAMERA eye=" +
@@ -14816,7 +12412,6 @@ bool UnityStereoRenderer::OnEndCamera(void* camera) noexcept {
     if (ownerThreadId_ == 0U || ownerThreadId_ == GetCurrentThreadId()) {
         if (camera != nullptr && !SceneReadyAllowsStereoPublish()) {
             NoteSceneReadyCameraBoundary(ClassifyCamera(camera), false);
-            ObserveLifetimeSceneReadyEdges("end-camera");
         }
         if (currentCamera_ == camera) {
             currentCamera_ = nullptr;
@@ -14828,9 +12423,6 @@ bool UnityStereoRenderer::OnEndCamera(void* camera) noexcept {
                 sourceCameraEndedLogged_ = true;
                 Log("[VR][stereo] SOURCE_CAMERA_ENDED expectEyeDof=1");
             }
-            LogTaaForensics(
-                camera, latestSourceUniversalData_, "source",
-                sourceCameraSuppressed_);
         }
     }
     std::size_t eye = eyeCameras_.size();
@@ -14843,9 +12435,6 @@ bool UnityStereoRenderer::OnEndCamera(void* camera) noexcept {
     if (eye == eyeCameras_.size()) {
         return false;
     }
-    LogTaaForensics(
-        camera, eyeUniversalCameraData_[eye],
-        eye == 0U ? "left" : "right", sourceCameraSuppressed_);
     if (eye == 1U) {
         RestoreUiTextureOverlays("right-eye-end");
     }
@@ -14949,7 +12538,6 @@ void UnityStereoRenderer::ApplySceneIneligible() noexcept {
         ResetTemporalHistories("scene-ineligible");
         InvalidateUnityStereoFrame();
         continuousStereo_ = false;
-        sourceFingerprintValid_.fill(false);
         RestoreLensFlareScales();
         // .58/.59 kept the ProFlare cache across exit so lobby /
         // Monitor BeginCamera kept writing ~900 destroyed Live
@@ -15034,9 +12622,7 @@ bool UnityStereoRenderer::QueueSmaaT2xMotionVectorCopy(
         }
         return false;
     }
-    if (smaaT2xComprehensiveProbeForPair_) {
-        LogSmaaT2xProjectionReadback(eye, "post-process");
-    }
+
 
     // `.200`-`.202` proved every CPU-timed immediate-context D3D copy
     // races Unity's own GPU submission: the shared RTHandle read back either
@@ -15123,9 +12709,7 @@ bool UnityStereoRenderer::QueueSmaaT2xMotionVectorCopy(
     smaaT2xMotionCopyTokens_[eye] = smaaT2xPairToken_;
     smaaT2xMotionCopyEvents_[eye] = renderPassEvent;
     const std::uint64_t count = ++smaaT2xMotionBoundaryCount_;
-    if (count <= 4U || count % 600U == 0U ||
-        smaaT2xComprehensiveProbeForPair_ ||
-        tscmaaComprehensiveProbeForPair_) {
+    if (count <= 4U || count % 600U == 0U) {
         const std::string aaTag = tscmaaRequestedForPair_
             ? "[VR][tscmaa] TSCMAA_MV_BOUNDARY source="
             : "[VR][smaa-t2x] SMAA_T2X_MV_BOUNDARY source=";
@@ -15476,9 +13060,7 @@ bool UnityStereoRenderer::BindQueuedSmaaT2xMotionVectors() noexcept {
         }
         texture->Release(); // The epoch cache retains the binding, not pixel freshness.
         const std::uint64_t count = ++smaaT2xMotionBoundaryCount_;
-        if (count <= 4U || count % 600U == 0U ||
-            smaaT2xComprehensiveProbeForPair_ ||
-            tscmaaComprehensiveProbeForPair_) {
+        if (count <= 4U || count % 600U == 0U) {
             const std::string aaTag = tscmaaRequestedForPair_
                 ? "[VR][tscmaa] TSCMAA_MV_BOUNDARY source=render-loop "
                 : "[VR][smaa-t2x] SMAA_T2X_MV_BOUNDARY source=render-loop ";
@@ -15628,15 +13210,12 @@ void UnityStereoRenderer::ConsumeStageDecisionAtSafePoint() noexcept {
 void UnityStereoRenderer::ResetTemporalHistories(const char* reason) noexcept {
     const std::string tag = reason != nullptr ? reason : "unknown";
     taaHistoryResetPending_.fill(true);
-    ResetSkyTaaSamples();
     smaaT2xPass_.ResetHistory();
     tscmaaPass_.ResetHistory();
     smaaT2xPhase_ = 0;
     smaaT2xPairPhase_ = 0;
     smaaT2xResolvedCount_ = 0;
     tscmaaResolvedCount_ = 0;
-    smaaT2xComprehensiveProbeForPair_ = false;
-    tscmaaComprehensiveProbeForPair_ = false;
     smaaT2xExpectedProjectionValid_.fill(false);
     smaaT2xMotionCopyTokens_.fill(0);
     smaaT2xMotionSourcesReadyForPair_ = false;
@@ -16111,7 +13690,6 @@ void UnityStereoRenderer::PendingStereoGpuPublish::Reset() noexcept {
     tracking = {};
     mode = StereoGpuPublishMode::MailboxOnly;
     srgb = false;
-    comprehensiveProbe = false;
     quality = 0;
     phase = 0;
     token = 0;
@@ -16155,11 +13733,6 @@ bool UnityStereoRenderer::QueueStereoGpuPublish(
     pendingGpuPublish_.tracking = armedFrame_.trackingSample;
     pendingGpuPublish_.mode = mode;
     pendingGpuPublish_.srgb = srgb;
-    pendingGpuPublish_.comprehensiveProbe = mode == StereoGpuPublishMode::SmaaT2x
-        ? smaaT2xComprehensiveProbeForPair_
-        : mode == StereoGpuPublishMode::Tscmaa
-            ? tscmaaComprehensiveProbeForPair_
-            : false;
     pendingGpuPublish_.quality = GakumasLocal::Config::vrEyeSmaaQuality;
     pendingGpuPublish_.phase = smaaT2xPairPhase_;
     pendingGpuPublish_.token = smaaT2xPairToken_;
@@ -16203,7 +13776,6 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
         work.tracking = pendingGpuPublish_.tracking;
         work.mode = pendingGpuPublish_.mode;
         work.srgb = pendingGpuPublish_.srgb;
-        work.comprehensiveProbe = pendingGpuPublish_.comprehensiveProbe;
         work.quality = pendingGpuPublish_.quality;
         work.phase = pendingGpuPublish_.phase;
         work.token = pendingGpuPublish_.token;
@@ -16260,7 +13832,7 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
             else FallBackSmaaT2x("ordered-motion-capture");
             return false;
         }
-        if (work.token <= 4U || work.token % 300U == 0U || work.comprehensiveProbe) {
+        if (work.token <= 4U || work.token % 300U == 0U) {
             Log("[VR][stereo] TEMPORAL_MV_ORDERED mode=" + std::string(modeName) +
                 " token=" + std::to_string(work.token) +
                 " poseRevision=" + std::to_string(work.tracking.revision) +
@@ -16274,7 +13846,7 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
         const bool resolvedReady = context != nullptr &&
             smaaT2xPass_.ResolveStereo(
                 context, work.colors, work.srgb, work.quality, work.phase,
-                work.token, false, resolved);
+                work.token, resolved);
         if (!resolvedReady) {
             releaseLocals();
             FallBackSmaaT2x((std::string("resolve-") +
@@ -16284,52 +13856,7 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
         }
         publishTextures = resolved;
         ++smaaT2xResolvedCount_;
-        if (work.comprehensiveProbe) {
-            const auto resources = smaaT2xPass_.GetResourceDiagnostics();
-            D3D11_TEXTURE2D_DESC colorDescription{};
-            work.colors[0]->GetDesc(&colorDescription);
-            std::ostringstream resourceLine;
-            resourceLine << "[VR][smaa-t2x] SMAA_T2X_RESOURCES token="
-                         << work.token << " count="
-                         << smaaT2xResolvedCount_ << " phase="
-                         << work.phase << " poseRevision="
-                         << work.tracking.revision
-                         << " poseEpoch="
-                         << work.tracking.poseEpoch;
-            const auto& currentPhase = d3d11::kSmaaT2xPhases[work.phase];
-            const auto& previousPhase =
-                d3d11::kSmaaT2xPhases[work.phase ^ 1U];
-            resourceLine << std::fixed << std::setprecision(9)
-                         << " jitterDeltaUv="
-                         << (previousPhase.jitterX - currentPhase.jitterX) /
-                                static_cast<float>(colorDescription.Width)
-                         << ','
-                         << (previousPhase.jitterY - currentPhase.jitterY) /
-                                static_cast<float>(colorDescription.Height);
-            for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
-                const auto& value = resources.eyes[eye];
-                resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
-                             << std::hex << "input:0x"
-                             << reinterpret_cast<std::uintptr_t>(work.colors[eye])
-                             << ",native:0x"
-                             << reinterpret_cast<std::uintptr_t>(
-                                    work.nativePointers[eye])
-                             << ",mv:0x" << value.motion
-                             << ",currentMv:0x" << value.currentMotionProbe
-                             << ",prevMv:0x" << value.previousMotionProbe
-                             << ",current:0x" << value.currentSpatial
-                             << ",previous:0x" << value.previousSpatial
-                             << ",resolved:0x" << value.resolved << std::dec
-                             << ",mvToken:" << value.motionPairToken
-                             << ",currentMvToken:"
-                             << value.currentMotionProbePairToken
-                             << ",prevMvToken:"
-                             << value.previousMotionProbePairToken
-                             << ",nextSpatial:" << value.nextSpatialWriteIndex
-                             << ",history:" << (value.historyValid ? 1 : 0);
-            }
-            Log(resourceLine.str());
-        }
+
         Log("[VR][smaa-t2x] SMAA_T2X_FRAME resolved=1 token=" +
             std::to_string(work.token) + " phase=" +
             std::to_string(work.phase) + " history=" +
@@ -16344,7 +13871,7 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
         const bool resolvedReady = context != nullptr &&
             tscmaaPass_.ResolveStereo(
                 context, work.colors, work.srgb, work.quality, work.token,
-                resolved, nullptr);
+                resolved);
         aaScope.Stop();
         if (!resolvedReady) {
             releaseLocals();
@@ -16355,76 +13882,14 @@ bool UnityStereoRenderer::ConsumePendingStereoGpuPublish() noexcept {
         }
         publishTextures = resolved;
         ++tscmaaResolvedCount_;
-        if (work.comprehensiveProbe) {
-            const auto resources = tscmaaPass_.GetResourceDiagnostics();
-            std::ostringstream resourceLine;
-            resourceLine << "[VR][tscmaa] TSCMAA_RESOURCES token="
-                         << work.token << " count="
-                         << tscmaaResolvedCount_
-                         << " poseRevision="
-                         << work.tracking.revision
-                         << " poseEpoch="
-                         << work.tracking.poseEpoch
-                         << " quality="
-                         << work.quality
-                         << " workingEdges=0x" << std::hex
-                         << resources.workingEdges
-                         << " workingShapeCandidates=0x"
-                         << resources.workingShapeCandidates
-                         << " workingDeferredItems=0x"
-                         << resources.workingDeferredItems;
-            for (std::size_t eye = 0; eye < resources.eyes.size(); ++eye) {
-                const auto& value = resources.eyes[eye];
-                resourceLine << ' ' << (eye == 0U ? "left=" : "right=")
-                             << "input:0x"
-                             << reinterpret_cast<std::uintptr_t>(work.colors[eye])
-                             << ",native:0x"
-                             << reinterpret_cast<std::uintptr_t>(
-                                    work.nativePointers[eye])
-                             << ",mv:0x" << value.motion
-                             << ",spatial:0x" << value.spatial
-                             << ",history:0x" << value.resolvedHistory
-                             << ",output:0x" << value.resolvedOutput
-                             << std::dec
-                             << ",mvToken:" << value.motionPairToken
-                             << ",nextResolved:"
-                             << value.nextResolvedWriteIndex
-                             << ",historyValid:"
-                             << (value.historyValid ? 1 : 0);
-            }
-            Log(resourceLine.str());
-        }
+
         Log("[VR][tscmaa] TSCMAA_FRAME resolved=1 token=" +
             std::to_string(work.token) + " history=" +
             std::string(tscmaaPass_.HasHistory() ? "valid" : "cold") +
             " jitter=off");
     }
 
-    if (verboseFrameLog_ && publishedFrames_ < 2U && context != nullptr) {
-        std::array<std::uint64_t, 2> fingerprints{};
-        std::array<bool, 2> sampled{};
-        for (std::size_t eye = 0; eye < publishTextures.size(); ++eye) {
-            sampled[eye] = d3d11::ComputeTextureFingerprint(
-                context, publishTextures[eye], 0, fingerprints[eye]);
-        }
-        std::ostringstream content;
-        content << "[VR][stereo] STEREO_SOURCE_FINGERPRINT nextFrame="
-                << (publishedFrames_ + 1U);
-        for (std::size_t eye = 0; eye < fingerprints.size(); ++eye) {
-            content << ' ' << (eye == 0U ? "left=" : "right=");
-            if (sampled[eye]) {
-                content << "0x" << std::hex << fingerprints[eye] << std::dec
-                        << " changed="
-                        << (!sourceFingerprintValid_[eye] ||
-                            sourceFingerprints_[eye] != fingerprints[eye]);
-                sourceFingerprints_[eye] = fingerprints[eye];
-                sourceFingerprintValid_[eye] = true;
-            } else {
-                content << "unavailable";
-            }
-        }
-        Log(content.str());
-    }
+
     if (context != nullptr) {
         context->Release();
         context = nullptr;
@@ -16489,7 +13954,6 @@ void UnityStereoRenderer::OnRenderLoopCompleted() noexcept {
         latestSourceCamera_ != nullptr &&
         IsUnityManagedObjectAlive(latestSourceCamera_);
     SampleSceneReady("render-loop", stereoEligible, sourcePresent);
-    ObserveLifetimeSceneReadyEdges("render-loop-after-sample");
     if (SceneReadyConsumeContentReadyEdge()) {
         RequestActorOutlineDiscover("content-ready");
     }
@@ -16792,7 +14256,6 @@ bool UnityStereoRenderer::TryRecoverFailedScene(bool sourceReady) noexcept {
     continuousStereo_ = false;
     publishedFrames_ = 0;
     armedFrame_ = {};
-    sourceFingerprintValid_.fill(false);
     latestSourceCamera_ = latestSourceUniversalData_ = latestSourceTarget_ = nullptr;
     latestSourceVolumeStack_ = nullptr;
     additionalDataLoggedSource_ = nullptr;
@@ -16856,12 +14319,10 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
         // what silently ate ALL shadow telemetry on the .88-.91 runs (the
         // "impossible" pattern of counters rising while their log lines
         // vanished, resuming instantly in scene-ineligible windows).
-        const bool alwaysKeep =
+        const bool alwaysKeep = IsDiagnosticStateEvent(message) ||
             message.find("GAME_QUIT") != std::string_view::npos ||
             message.find("SCENE_FAILURE") != std::string_view::npos ||
             message.find("PERF_TIMING") != std::string_view::npos ||
-            message.find("SRP_PERF_") != std::string_view::npos ||
-            message.find("TICK_PERF_") != std::string_view::npos ||
             message.find("[VR][shadow]") != std::string_view::npos ||
             message.find("[VR][fov]") != std::string_view::npos ||
             message.find("FAILED") != std::string_view::npos ||
@@ -16882,13 +14343,10 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             // stereo or a dead toggle would be indistinguishable from an
             // inactive scene.
             message.find("GRIP_TRANSPARENCY") != std::string_view::npos ||
-            message.find("GRIP_TRACE_") != std::string_view::npos ||
+            message.find("GRIP_BACKGROUND_") != std::string_view::npos ||
             message.find("GRIP_BLUR_SOURCE_") != std::string_view::npos ||
             message.find("SOURCE_HISTORY_RESET") != std::string_view::npos ||
             message.find("SOURCE_CUT_PULSE") != std::string_view::npos ||
-            message.find("TAA_PASS") != std::string_view::npos ||
-            message.find("TAA_JITTER") != std::string_view::npos ||
-            message.find("TAA_MV_UPDATE") != std::string_view::npos ||
             message.find("SMAA_T2X_") != std::string_view::npos ||
             message.find("TSCMAA_") != std::string_view::npos ||
             // Functional VL post-process actions must remain visible even
@@ -16905,7 +14363,6 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             message.find("COMPUTE_VIEW_DIR") != std::string_view::npos ||
             message.find("VLSRP_HISTORY_RESET") != std::string_view::npos ||
             message.find("COPY_FROM_SKIPPED") != std::string_view::npos ||
-            message.find("TAA_INPUT") != std::string_view::npos ||
             // .114: the applied=1 line was eaten by this very mute, which
             // cost a night of forensics. Tag traffic always passes.
             message.find("EYE_MAIN_CAMERA_TAG") != std::string_view::npos ||
@@ -16915,19 +14372,16 @@ void UnityStereoRenderer::Log(std::string_view message) const noexcept {
             // Per-scene virtual-camera diagnostics are low-frequency and
             // explain whether a requested specific-camera selection is even
             // possible. Never let steady stereo hide the only census proof.
-            message.find("VCAM_") != std::string_view::npos ||
             message.find("OUTLINE_CACHE_DROPPED") != std::string_view::npos ||
             message.find("PRO_FLARE_CACHE_DROPPED") != std::string_view::npos ||
             message.find("UI_TEXTURE_OVERLAY") != std::string_view::npos ||
             message.find("LIVE_CAMERA_OVERLAY") != std::string_view::npos ||
             message.find("LIVE_CMOV_PS") != std::string_view::npos ||
-            message.find("PRO_FLARE_RENDER") != std::string_view::npos ||
             message.find("HEAVY_DISCOVER") != std::string_view::npos ||
             message.find("EYE_ARM_HELD") != std::string_view::npos ||
             message.find("EYE_ARM_SKIPPED") != std::string_view::npos ||
             message.find("EYE_ARM_RELEASED") != std::string_view::npos ||
             message.find("SCENE_READY") != std::string_view::npos ||
-            message.find("LIFETIME_") != std::string_view::npos ||
             message.find("PORTRAIT_LATCH") != std::string_view::npos ||
             message.find("FREECAM_HEAD_SKIP") != std::string_view::npos ||
             message.find("HAND_GLOW") != std::string_view::npos ||

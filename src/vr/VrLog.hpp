@@ -4,6 +4,7 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include "DiagnosticHealth.hpp"
 
 namespace gakumas::vr {
 
@@ -38,6 +39,7 @@ private:
     std::ofstream stream_;
     bool opened_ = false;
     bool fileEnabled_ = false;
+    DiagnosticHealth health_{}; // Protected by mutex_; reset for each run.
 };
 
 } // namespace gakumas::vr

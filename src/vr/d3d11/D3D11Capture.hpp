@@ -106,25 +106,7 @@ public:
     // camera repaints onto an alpha-0 base instead of a frozen 3D frame.
     // Driven from the game thread (Grip transparency bridge); read on
     // Unity's Present thread. Arming also schedules a one-shot forensic
-    // probe of the presented backbuffer a couple of seconds later.
     void SetTransparentBackbufferClear(bool enabled) noexcept;
-
-    // One-shot forensic sample recorded while the transparent clear is
-    // armed: clear statistics plus four raw pixels of the presented
-    // backbuffer (corners and centre). Produced on Unity's Present thread,
-    // consumed (and reset) by the VR worker for logging.
-    struct TransparencyProbe final {
-        std::uint64_t clearCount = 0;
-        std::uint32_t lastClearError = 0;
-        std::uint32_t sampleError = 0;
-        std::uint32_t format = 0;
-        std::uint32_t width = 0;
-        std::uint32_t height = 0;
-        // Raw little-endian 32-bit texel values, byte order as stored.
-        std::array<std::uint32_t, 4> pixels{};
-    };
-    [[nodiscard]] bool ConsumeTransparencyProbe(
-        TransparencyProbe* probe) noexcept;
 
     // .226: the frozen 3D lives in a URP intermediate color attachment that
     // the UI render pass loads and the final blit re-composites over the
@@ -211,9 +193,6 @@ private:
         ID3D11Device* device,
         const D3D11_TEXTURE2D_DESC& backbufferDescription) noexcept;
     void ReleaseTransparentClearTargetsLocked() noexcept;
-    void MaybeRunTransparencyProbeLocked(
-        ID3D11Texture2D* backBuffer,
-        const D3D11_TEXTURE2D_DESC& description) noexcept;
     static bool IsUnityTopLevelWindow(HWND window) noexcept;
     static bool IsSameFrameLayout(
         const D3D11_TEXTURE2D_DESC& left,
@@ -256,10 +235,7 @@ private:
     std::atomic<std::uint64_t> transparentClearCount_{0};
     std::atomic<std::uint32_t> transparentClearLastError_{0};
     // Frames until the one-shot probe fires; negative means no probe armed.
-    std::atomic<std::int32_t> transparencyProbeCountdown_{-1};
     // Guarded by captureMutex_.
-    TransparencyProbe transparencyProbe_{};
-    bool transparencyProbeReady_ = false;
     // Intermediate-attachment clear targets; all guarded by captureMutex_.
     struct TransparentClearTarget final {
         ID3D11Texture2D* texture = nullptr; // AddRef-owned

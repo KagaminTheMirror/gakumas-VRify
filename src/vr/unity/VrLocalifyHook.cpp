@@ -19,7 +19,6 @@
 #include "vr/config/VrifyConfig.hpp"
 #include "vr/PerformanceTiming.hpp"
 #include "vr/PerformanceProbe.hpp"
-#include "vr/SrpPerformanceTrace.hpp"
 // #include <jni.h>
 #include <thread>
 #include <map>
@@ -47,10 +46,9 @@
     #include "vr/SkyRenderHooks.hpp"
     #include "vr/UnityStereoRenderer.hpp"
     #include "vr/frame/FrameLoopDriver.hpp"
-    #include "vr/GripTransparencyTrace.hpp"
     #include "vr/GripBlurSource.hpp"
     #include "vr/VrHandGlowSticks.hpp"
-    #include "vr/input/ScrollInputDiagnostics.hpp"
+    #include "vr/input/UnityAnalogScroll.hpp"
     #include "vr/input/UnityPointerInput.hpp"
     #include "vr/pose/RelativePoseBridge.hpp"
     #include "cpprest/details/http_helpers.h"
@@ -217,32 +215,10 @@ namespace GakumasLocal::HookMain {
     thread_local std::uint32_t unityRenderLoopDepth = 0;
     UnityResolve::Method* eyePassEventGetter = nullptr;
 
-    struct CinemachineFovDiagnosticLayout {
-        bool attempted = false;
-        bool logged = false;
-        bool ready = false;
-        bool stateValueType = false;
-        bool lensValueType = false;
-        bool hasLookAtShape = false;
-        std::int32_t stateLens = -1;
-        std::int32_t stateReferenceLookAt = -1;
-        std::int32_t stateRawPosition = -1;
-        std::int32_t lensFieldOfView = -1;
-        std::int32_t lensFocalLength = -1;
-        std::int32_t lensSensorSize = -1;
-        std::int32_t lensPhysical = -1;
-        std::int32_t lensShift = -1;
-        UnityResolve::Method* stateHasLookAt = nullptr;
-    };
-
-    CinemachineFovDiagnosticLayout cinemachineFovDiagnosticLayout{};
-
     struct PendingCinemachineObservation {
         bool sampled = false;
         bool stateValid = false;
-        bool fovValid = false;
         std::uint64_t sample = 0U;
-        gakumas::vr::UnitySourceCameraStateDiagnostic fov{};
     };
 
     struct ProFlareProjectionLayout {
@@ -292,59 +268,6 @@ namespace GakumasLocal::HookMain {
     std::array<float, 2> proFlareLastLoggedScaleX{};
     std::array<float, 2> proFlareLastLoggedScaleY{};
     std::array<bool, 2> proFlareMissingProjectionLogged{};
-
-    struct EyeRenderPassTraceEntry {
-        void* pass = nullptr;
-        Il2cppUtils::Il2CppClassHead* klass = nullptr;
-        int event = (std::numeric_limits<int>::min)();
-    };
-
-    constexpr std::size_t kMaxEyeRenderPassTraceEntries = 160U;
-    thread_local std::array<EyeRenderPassTraceEntry,
-                            kMaxEyeRenderPassTraceEntries>
-        eyeRenderPassTraceEntries{};
-    thread_local std::size_t eyeRenderPassTraceCount = 0U;
-    thread_local bool eyeRenderPassTraceActive = false;
-    thread_local bool eyeRenderPassTraceOverflow = false;
-    thread_local void* eyeRenderPassTraceCamera = nullptr;
-    thread_local std::size_t eyeRenderPassTraceEye = 0U;
-    std::array<std::uint64_t, 2> eyeRenderPassLastSignature{};
-    std::array<std::uint64_t, 2> eyeRenderPassFrameSerial{};
-
-    struct EyeRenderPassExecutionContext {
-        void* pass = nullptr;
-        Il2cppUtils::Il2CppClassHead* klass = nullptr;
-        int event = (std::numeric_limits<int>::min)();
-    };
-
-    enum class EyeFullscreenDrawApi : std::uint8_t {
-        BlitterTriangle,
-        BlitterQuad,
-        CommandDrawProcedural,
-        CommandBlit,
-    };
-
-    struct EyeFullscreenDrawKey {
-        void* renderPass = nullptr;
-        void* material = nullptr;
-        int shaderPass = 0;
-        int topology = -1;
-        int vertexCount = -1;
-        int instanceCount = -1;
-        std::uint64_t stackSignature = 0U;
-        std::size_t eye = 0U;
-        EyeFullscreenDrawApi api = EyeFullscreenDrawApi::BlitterTriangle;
-    };
-
-    constexpr std::size_t kMaxEyeFullscreenDrawKeys = 1024U;
-    thread_local EyeRenderPassExecutionContext eyeRenderPassExecution{};
-    thread_local std::array<EyeFullscreenDrawKey, kMaxEyeFullscreenDrawKeys>
-        eyeFullscreenDrawKeys{};
-    thread_local std::size_t eyeFullscreenDrawKeyCount = 0U;
-    thread_local std::array<void*, 2> eyeFullscreenEpochFirstPass{};
-    std::atomic_bool eyeFullscreenDrawOverflowLogged = false;
-    std::atomic_bool eyeCommandDrawProceduralHookReady = false;
-    UnityResolve::Method* eyeMaterialGetShader = nullptr;
 
     struct ActorShadowStereoReuseState {
         UnityResolve::Field* featurePass = nullptr;
@@ -1110,223 +1033,9 @@ namespace GakumasLocal::HookMain {
         }
     }
 
-    void EnsureCinemachineFovDiagnosticLayout() noexcept {
-        auto& layout = cinemachineFovDiagnosticLayout;
-        if (!layout.attempted) {
-            layout.attempted = true;
-            constexpr std::int32_t kBoxedHeader = 0x10;
-            auto* stateClass = Il2cppUtils::GetClass(
-                "Cinemachine.dll", "Cinemachine", "CameraState");
-            auto* lensClass = Il2cppUtils::GetClass(
-                "Cinemachine.dll", "Cinemachine", "LensSettings");
-            layout.stateValueType = stateClass != nullptr &&
-                UnityResolve::Invoke<bool>(
-                    "il2cpp_class_is_valuetype", stateClass->address);
-            layout.lensValueType = lensClass != nullptr &&
-                UnityResolve::Invoke<bool>(
-                    "il2cpp_class_is_valuetype", lensClass->address);
-            const auto* stateLens = stateClass != nullptr
-                ? stateClass->Get<UnityResolve::Field>("<Lens>k__BackingField")
-                : nullptr;
-            const auto* stateReferenceLookAt = stateClass != nullptr
-                ? stateClass->Get<UnityResolve::Field>(
-                      "<ReferenceLookAt>k__BackingField")
-                : nullptr;
-            const auto* stateRawPosition = stateClass != nullptr
-                ? stateClass->Get<UnityResolve::Field>(
-                      "<RawPosition>k__BackingField")
-                : nullptr;
-            const auto* lensFieldOfView = lensClass != nullptr
-                ? lensClass->Get<UnityResolve::Field>("FieldOfView")
-                : nullptr;
-            const auto* lensFocalLength = lensClass != nullptr
-                ? lensClass->Get<UnityResolve::Field>("FocalLength")
-                : nullptr;
-            const auto* lensSensorSize = lensClass != nullptr
-                ? lensClass->Get<UnityResolve::Field>(
-                      "<SensorSize>k__BackingField")
-                : nullptr;
-            const auto* lensPhysical = lensClass != nullptr
-                ? lensClass->Get<UnityResolve::Field>(
-                      "<IsPhysicalCamera>k__BackingField")
-                : nullptr;
-            const auto* lensShift = lensClass != nullptr
-                ? lensClass->Get<UnityResolve::Field>("LensShift")
-                : nullptr;
-            layout.stateHasLookAt = stateClass != nullptr
-                ? stateClass->Get<UnityResolve::Method>("get_HasLookAt")
-                : nullptr;
 
-            const auto unboxedOffset = [kBoxedHeader](
-                                           const UnityResolve::Field* field) {
-                return field != nullptr && field->offset >= kBoxedHeader
-                    ? field->offset - kBoxedHeader : -1;
-            };
-            layout.stateLens = unboxedOffset(stateLens);
-            layout.stateReferenceLookAt = stateReferenceLookAt != nullptr
-                ? unboxedOffset(stateReferenceLookAt) : -1;
-            layout.stateRawPosition = stateRawPosition != nullptr
-                ? unboxedOffset(stateRawPosition) : -1;
-            layout.lensFieldOfView = lensFieldOfView != nullptr
-                ? unboxedOffset(lensFieldOfView) : -1;
-            layout.lensFocalLength = lensFocalLength != nullptr
-                ? unboxedOffset(lensFocalLength) : -1;
-            layout.lensSensorSize = lensSensorSize != nullptr
-                ? unboxedOffset(lensSensorSize) : -1;
-            layout.lensPhysical = lensPhysical != nullptr
-                ? unboxedOffset(lensPhysical) : -1;
-            layout.lensShift = unboxedOffset(lensShift);
 
-            layout.hasLookAtShape = layout.stateHasLookAt != nullptr &&
-                layout.stateHasLookAt->function != nullptr &&
-                layout.stateHasLookAt->address != nullptr &&
-                !layout.stateHasLookAt->static_function &&
-                layout.stateHasLookAt->args.empty() &&
-                layout.stateHasLookAt->return_type != nullptr &&
-                layout.stateHasLookAt->return_type->name == "System.Boolean";
-            // Old dump offsets are accepted only after the installed build's
-            // live class table reports the same fields, types, and offsets.
-            // UnityResolve reports value-type fields against a boxed object;
-            // the hook receives the unboxed struct, so strip the proven 0x10
-            // object header before comparing or reading.
-            layout.ready =
-                layout.stateValueType && layout.lensValueType &&
-                FieldTypeContains(stateLens, "Cinemachine.LensSettings") &&
-                FieldTypeContains(stateReferenceLookAt, "UnityEngine.Vector3") &&
-                FieldTypeContains(stateRawPosition, "UnityEngine.Vector3") &&
-                FieldTypeContains(lensFieldOfView, "System.Single") &&
-                FieldTypeContains(lensFocalLength, "System.Single") &&
-                FieldTypeContains(lensSensorSize, "UnityEngine.Vector2") &&
-                FieldTypeContains(lensPhysical, "System.Boolean") &&
-                FieldTypeContains(lensShift, "UnityEngine.Vector2") &&
-                layout.stateLens == 0x00 &&
-                layout.stateReferenceLookAt == 0x3C &&
-                layout.stateRawPosition == 0x48 &&
-                layout.lensFieldOfView == 0x00 &&
-                layout.lensFocalLength == 0x14 &&
-                layout.lensSensorSize == 0x1C &&
-                layout.lensPhysical == 0x24 &&
-                layout.lensShift == 0x28 && layout.hasLookAtShape;
-        }
-        if (!layout.logged) {
-            layout.logged = WriteUnityCameraDiagnosticEvent(
-                std::string("[VR][fov] CAMERA_STATE_LAYOUT ready=") +
-                (layout.ready ? "1" : "0") +
-                " stateValueType=" +
-                    (layout.stateValueType ? "1" : "0") +
-                " lensValueType=" +
-                    (layout.lensValueType ? "1" : "0") +
-                " stateLens=" + std::to_string(layout.stateLens) +
-                " referenceLookAt=" +
-                    std::to_string(layout.stateReferenceLookAt) +
-                " rawPosition=" + std::to_string(layout.stateRawPosition) +
-                " lensFov=" + std::to_string(layout.lensFieldOfView) +
-                " focal=" + std::to_string(layout.lensFocalLength) +
-                " sensor=" + std::to_string(layout.lensSensorSize) +
-                " physical=" + std::to_string(layout.lensPhysical) +
-                " lensShift=" + std::to_string(layout.lensShift) +
-                " boxedHeader=16" +
-                " hasLookAtMethod=" +
-                    (layout.stateHasLookAt != nullptr ? "1" : "0") +
-                " hasLookAtShape=" +
-                    (layout.hasLookAtShape ? "1" : "0"));
-        }
-    }
 
-    bool TryReadCinemachineFovDiagnostic(
-        const void* state,
-        std::uint64_t sample,
-        gakumas::vr::UnitySourceCameraStateDiagnostic* result) noexcept {
-        if (state == nullptr || result == nullptr) {
-            return false;
-        }
-        EnsureCinemachineFovDiagnosticLayout();
-        const auto& layout = cinemachineFovDiagnosticLayout;
-        if (!layout.ready) {
-            return false;
-        }
-        using Vector2 = UnityResolve::UnityType::Vector2;
-        using Vector3 = UnityResolve::UnityType::Vector3;
-        const auto* bytes = static_cast<const unsigned char*>(state);
-        const auto* lens = bytes + layout.stateLens;
-        Vector3 rawPosition{};
-        Vector3 referenceLookAt{};
-        Vector2 sensorSize{};
-        Vector2 lensShift{};
-        float fov = 0.0F;
-        float focal = 0.0F;
-        bool physical = false;
-        bool hasLookAt = false;
-        __try {
-            std::memcpy(&rawPosition, bytes + layout.stateRawPosition,
-                        sizeof(rawPosition));
-            std::memcpy(&referenceLookAt,
-                        bytes + layout.stateReferenceLookAt,
-                        sizeof(referenceLookAt));
-            std::memcpy(&fov, lens + layout.lensFieldOfView, sizeof(fov));
-            std::memcpy(&focal, lens + layout.lensFocalLength, sizeof(focal));
-            std::memcpy(&sensorSize, lens + layout.lensSensorSize,
-                        sizeof(sensorSize));
-            std::memcpy(&physical, lens + layout.lensPhysical,
-                        sizeof(physical));
-            std::memcpy(&lensShift, lens + layout.lensShift,
-                        sizeof(lensShift));
-            using GetHasLookAt = bool (*)(const void*, void*);
-            hasLookAt = reinterpret_cast<GetHasLookAt>(
-                layout.stateHasLookAt->function)(
-                    state, layout.stateHasLookAt->address);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
-        }
-        const bool rawFinite = std::isfinite(rawPosition.x) &&
-            std::isfinite(rawPosition.y) && std::isfinite(rawPosition.z) &&
-            std::abs(rawPosition.x) < 1000000.0F &&
-            std::abs(rawPosition.y) < 1000000.0F &&
-            std::abs(rawPosition.z) < 1000000.0F;
-        const bool lensFinite = std::isfinite(fov) && fov > 0.1F &&
-            fov < 179.9F && std::isfinite(focal) &&
-            std::isfinite(sensorSize.x) && std::isfinite(sensorSize.y) &&
-            std::isfinite(lensShift.x) && std::isfinite(lensShift.y);
-        const bool lookAtFinite = !hasLookAt ||
-            (std::isfinite(referenceLookAt.x) &&
-             std::isfinite(referenceLookAt.y) &&
-             std::isfinite(referenceLookAt.z) &&
-             std::abs(referenceLookAt.x) < 1000000.0F &&
-             std::abs(referenceLookAt.y) < 1000000.0F &&
-             std::abs(referenceLookAt.z) < 1000000.0F);
-        if (!rawFinite || !lensFinite || !lookAtFinite) {
-            return false;
-        }
-        float lookAtDistance = 0.0F;
-        if (hasLookAt) {
-            const float dx = referenceLookAt.x - rawPosition.x;
-            const float dy = referenceLookAt.y - rawPosition.y;
-            const float dz = referenceLookAt.z - rawPosition.z;
-            lookAtDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (!std::isfinite(lookAtDistance) || lookAtDistance <= 0.0F) {
-                return false;
-            }
-        }
-        *result = {};
-        result->sample = sample;
-        result->valid = true;
-        result->hasLookAt = hasLookAt;
-        result->physical = physical;
-        result->fieldOfViewDegrees = fov;
-        result->focalLengthMillimeters = focal;
-        result->sensorWidthMillimeters = sensorSize.x;
-        result->sensorHeightMillimeters = sensorSize.y;
-        result->lensShiftX = lensShift.x;
-        result->lensShiftY = lensShift.y;
-        result->rawPositionX = rawPosition.x;
-        result->rawPositionY = rawPosition.y;
-        result->rawPositionZ = rawPosition.z;
-        result->referenceLookAtX = referenceLookAt.x;
-        result->referenceLookAtY = referenceLookAt.y;
-        result->referenceLookAtZ = referenceLookAt.z;
-        result->lookAtDistance = lookAtDistance;
-        return true;
-    }
 
     bool IsValidCinemachinePose(
         const UnityResolve::UnityType::Vector3& position,
@@ -1828,18 +1537,7 @@ namespace GakumasLocal::HookMain {
         }
     }
 
-    void BeginEyeRenderPassTrace(void* camera) noexcept {
-        if (!AreVrUnityCameraDiagnosticsEnabled() || camera == nullptr ||
-            !unityStereoRenderer.IsEyeCamera(camera)) {
-            return;
-        }
-        const std::string_view role = unityStereoRenderer.ClassifyCamera(camera);
-        eyeRenderPassTraceEye = role == "right" ? 1U : 0U;
-        eyeRenderPassTraceCamera = camera;
-        eyeRenderPassTraceCount = 0U;
-        eyeRenderPassTraceOverflow = false;
-        eyeRenderPassTraceActive = true;
-    }
+
 
     int ReadEyeRenderPassEvent(void* pass) noexcept {
         if (pass == nullptr || eyePassEventGetter == nullptr) {
@@ -1851,315 +1549,15 @@ namespace GakumasLocal::HookMain {
             : (std::numeric_limits<int>::min)();
     }
 
-    void RecordEyeRenderPass(void* pass) noexcept {
-        if (!eyeRenderPassTraceActive || pass == nullptr) {
-            return;
-        }
-        if (eyeRenderPassTraceCount == 0U &&
-            eyeFullscreenEpochFirstPass[eyeRenderPassTraceEye] != pass) {
-            eyeFullscreenEpochFirstPass[eyeRenderPassTraceEye] = pass;
-            std::size_t writeIndex = 0U;
-            for (std::size_t index = 0U;
-                 index < eyeFullscreenDrawKeyCount; ++index) {
-                if (eyeFullscreenDrawKeys[index].eye == eyeRenderPassTraceEye) {
-                    continue;
-                }
-                eyeFullscreenDrawKeys[writeIndex++] = eyeFullscreenDrawKeys[index];
-            }
-            eyeFullscreenDrawKeyCount = writeIndex;
-            eyeFullscreenDrawOverflowLogged.store(false, std::memory_order_release);
-            std::ostringstream epoch;
-            epoch << "[VR][eye-pass] EYE_FULLSCREEN_EPOCH role="
-                  << (eyeRenderPassTraceEye == 0U ? "left" : "right")
-                  << " firstPass=0x" << std::hex
-                  << reinterpret_cast<std::uintptr_t>(pass) << std::dec
-                  << " retainedOtherEye=" << writeIndex;
-            WriteUnityCameraDiagnosticEvent(epoch.str());
-        }
-        if (eyeRenderPassTraceCount >= eyeRenderPassTraceEntries.size()) {
-            eyeRenderPassTraceOverflow = true;
-            return;
-        }
-        const int event = ReadEyeRenderPassEvent(pass);
-        eyeRenderPassTraceEntries[eyeRenderPassTraceCount++] = {
-            pass,
-            Il2cppUtils::get_class_from_instance(pass),
-            event,
-        };
-    }
 
-    bool RememberEyeFullscreenDraw(
-        void* renderPass,
-        void* material,
-        int shaderPass,
-        int topology,
-        int vertexCount,
-        int instanceCount,
-        std::uint64_t stackSignature,
-        std::size_t eye,
-        EyeFullscreenDrawApi api) noexcept {
-        for (std::size_t index = 0U; index < eyeFullscreenDrawKeyCount; ++index) {
-            const auto& key = eyeFullscreenDrawKeys[index];
-            if (key.renderPass == renderPass && key.material == material &&
-                key.shaderPass == shaderPass && key.topology == topology &&
-                key.vertexCount == vertexCount &&
-                key.instanceCount == instanceCount &&
-                key.stackSignature == stackSignature && key.eye == eye &&
-                key.api == api) {
-                return false;
-            }
-        }
-        if (eyeFullscreenDrawKeyCount >= eyeFullscreenDrawKeys.size()) {
-            if (!eyeFullscreenDrawOverflowLogged.exchange(
-                    true, std::memory_order_acq_rel)) {
-                WriteUnityCameraDiagnosticEvent(
-                    "[VR][eye-pass] EYE_FULLSCREEN_DRAW_OVERFLOW capacity=1024");
-            }
-            return false;
-        }
-        eyeFullscreenDrawKeys[eyeFullscreenDrawKeyCount++] = {
-            renderPass,
-            material,
-            shaderPass,
-            topology,
-            vertexCount,
-            instanceCount,
-            stackSignature,
-            eye,
-            api,
-        };
-        return true;
-    }
 
-    void ObserveEyeFullscreenDraw(
-        EyeFullscreenDrawApi api,
-        void* material,
-        int shaderPass,
-        int topology,
-        int vertexCount,
-        int instanceCount) noexcept {
-        void* camera = unityStereoRenderer.CurrentCamera();
-        if (!eyeRenderPassTraceActive || eyeRenderPassExecution.pass == nullptr ||
-            camera == nullptr || !unityStereoRenderer.IsEyeCamera(camera)) {
-            return;
-        }
-        const std::string_view role = unityStereoRenderer.ClassifyCamera(camera);
-        const std::size_t eye = role == "right" ? 1U : 0U;
 
-        std::array<void*, 16> stack{};
-        const USHORT stackCount = CaptureStackBackTrace(
-            0, static_cast<DWORD>(stack.size()), stack.data(), nullptr);
-        static const auto gameBase = reinterpret_cast<std::uintptr_t>(
-            GetModuleHandleW(L"GameAssembly.dll"));
-        std::uint64_t stackSignature = 1469598103934665603ULL;
-        bool hasGameFrame = false;
-        for (USHORT index = 0U; index < stackCount; ++index) {
-            const auto address = reinterpret_cast<std::uintptr_t>(stack[index]);
-            if (gameBase == 0U || address < gameBase ||
-                address - gameBase >= 0x40000000ULL) {
-                continue;
-            }
-            stackSignature ^= static_cast<std::uint64_t>(address - gameBase);
-            stackSignature *= 1099511628211ULL;
-            hasGameFrame = true;
-        }
-        if (!hasGameFrame) {
-            stackSignature = 0U;
-        }
-        if (!RememberEyeFullscreenDraw(
-                eyeRenderPassExecution.pass, material, shaderPass, topology,
-                vertexCount, instanceCount, stackSignature, eye, api)) {
-            return;
-        }
 
-        void* shader = nullptr;
-        if (material != nullptr && eyeMaterialGetShader != nullptr) {
-            const auto value = InvokeUnityGetter<void*>(eyeMaterialGetShader, material);
-            if (value.has_value()) {
-                shader = *value;
-            }
-        }
 
-        const char* nameSpace = eyeRenderPassExecution.klass != nullptr &&
-                eyeRenderPassExecution.klass->namespaze != nullptr
-            ? eyeRenderPassExecution.klass->namespaze
-            : "?";
-        const char* name = eyeRenderPassExecution.klass != nullptr &&
-                eyeRenderPassExecution.klass->name != nullptr
-            ? eyeRenderPassExecution.klass->name
-            : "?";
-        const char* apiName = "?";
-        const char* primitive = "?";
-        switch (api) {
-            case EyeFullscreenDrawApi::BlitterTriangle:
-                apiName = "Blitter.DrawTriangle";
-                primitive = "triangle";
-                break;
-            case EyeFullscreenDrawApi::BlitterQuad:
-                apiName = "Blitter.DrawQuad";
-                primitive = "quad";
-                break;
-            case EyeFullscreenDrawApi::CommandDrawProcedural:
-                apiName = "CommandBuffer.DrawProcedural";
-                primitive = "procedural";
-                break;
-            case EyeFullscreenDrawApi::CommandBlit:
-                apiName = "CommandBuffer.Blit";
-                primitive = "blit";
-                break;
-        }
-        std::ostringstream line;
-        line << "[VR][eye-pass] EYE_FULLSCREEN_DRAW role=" << role
-             << " api=" << apiName << " primitive=" << primitive
-             << " parent=" << nameSpace << '.' << name
-             << " event=";
-        if (eyeRenderPassExecution.event == (std::numeric_limits<int>::min)()) {
-            line << '?';
-        } else {
-            line << eyeRenderPassExecution.event;
-        }
-        line << " renderPass=0x" << std::hex
-             << reinterpret_cast<std::uintptr_t>(eyeRenderPassExecution.pass)
-             << " material=0x" << reinterpret_cast<std::uintptr_t>(material)
-             << std::dec << " materialName=\"" << ReadUnityObjectName(material)
-             << "\" shader=0x" << std::hex
-             << reinterpret_cast<std::uintptr_t>(shader) << std::dec
-             << " shaderName=\"" << ReadUnityObjectName(shader)
-             << "\" shaderPass=" << shaderPass << " topology=";
-        if (topology < 0) {
-            line << '-';
-        } else {
-            line << topology;
-        }
-        line << " vertices=";
-        if (vertexCount < 0) {
-            line << '-';
-        } else {
-            line << vertexCount;
-        }
-        line << " instances=";
-        if (instanceCount < 0) {
-            line << '-';
-        } else {
-            line << instanceCount;
-        }
-        line << " stackSignature=0x" << std::hex << stackSignature << std::dec;
-        line << " stackGameRva=";
-        bool wroteStack = false;
-        for (USHORT index = 0U; index < stackCount; ++index) {
-            const auto address = reinterpret_cast<std::uintptr_t>(stack[index]);
-            if (gameBase == 0U || address < gameBase ||
-                address - gameBase >= 0x40000000ULL) {
-                continue;
-            }
-            if (wroteStack) {
-                line << ',';
-            }
-            line << "+0x" << std::hex << (address - gameBase) << std::dec;
-            wroteStack = true;
-        }
-        if (!wroteStack) {
-            line << '-';
-        }
-        line << " originalCalled=1";
-        WriteUnityCameraDiagnosticEvent(line.str());
-    }
 
-    void DescribeEyeRenderObjectsPass(void* pass) noexcept {
-        if (pass == nullptr ||
-            eyeRenderObjectsLastInstance.exchange(
-                pass, std::memory_order_acq_rel) == pass) {
-            return;
-        }
-        const auto& fields = eyeRenderObjectsPassFields;
-        const auto renderQueueType =
-            ReadUnityInstanceField<int>(pass, fields.renderQueueType);
-        const auto profilerTag =
-            ReadUnityInstanceField<UnityResolve::UnityType::String*>(
-                pass, fields.profilerTag);
-        const auto cameraSettings =
-            ReadUnityInstanceField<void*>(pass, fields.cameraSettings);
-        const auto overrideMaterial =
-            ReadUnityInstanceField<void*>(pass, fields.overrideMaterial);
-        const auto overrideMaterialPass =
-            ReadUnityInstanceField<int>(pass, fields.overrideMaterialPassIndex);
-        const auto overrideShader =
-            ReadUnityInstanceField<void*>(pass, fields.overrideShader);
-        const auto overrideShaderPass =
-            ReadUnityInstanceField<int>(pass, fields.overrideShaderPassIndex);
 
-        std::optional<int> lowerBound;
-        std::optional<int> upperBound;
-        std::optional<int> layerMask;
-        std::optional<std::uint32_t> renderingLayerMask;
-        std::optional<int> excludeMotionVectors;
-        if (fields.filteringSettings != nullptr) {
-            void* filtering = static_cast<std::byte*>(pass) +
-                fields.filteringSettings->offset;
-            layerMask = ReadUnityValueField<int>(filtering, fields.layerMask);
-            renderingLayerMask = ReadUnityValueField<std::uint32_t>(
-                filtering, fields.renderingLayerMask);
-            excludeMotionVectors = ReadUnityValueField<int>(
-                filtering, fields.excludeMotionVectorObjects);
-            constexpr std::int32_t boxedHeader =
-                static_cast<std::int32_t>(sizeof(void*) * 2U);
-            if (fields.renderQueueRange != nullptr &&
-                fields.renderQueueRange->offset >= boxedHeader) {
-                void* range = static_cast<std::byte*>(filtering) +
-                    (fields.renderQueueRange->offset - boxedHeader);
-                lowerBound = ReadUnityValueField<int>(range, fields.lowerBound);
-                upperBound = ReadUnityValueField<int>(range, fields.upperBound);
-            }
-        }
 
-        const auto optionalInt = [](const std::optional<int>& value) {
-            return value.has_value() ? std::to_string(*value) : std::string("?");
-        };
-        std::ostringstream line;
-        line << "[VR][eye-pass] EYE_RENDER_OBJECTS_INSTANCE pass=0x"
-             << std::hex << reinterpret_cast<std::uintptr_t>(pass) << std::dec
-             << " profilerTag=\""
-             << (profilerTag.has_value()
-                     ? ReadUnityStringValue(*profilerTag)
-                     : std::string{})
-             << "\" renderQueueType=" << optionalInt(renderQueueType)
-             << " queue=" << optionalInt(lowerBound) << ','
-             << optionalInt(upperBound)
-             << " layerMask=" << optionalInt(layerMask)
-             << " renderingLayerMask=";
-        if (renderingLayerMask.has_value()) {
-            line << "0x" << std::hex << *renderingLayerMask << std::dec;
-        } else {
-            line << '?';
-        }
-        line << " excludeMotionVectors=" << optionalInt(excludeMotionVectors)
-             << " cameraSettings="
-             << (cameraSettings.has_value() ? *cameraSettings : nullptr)
-             << " overrideMaterial="
-             << (overrideMaterial.has_value() ? *overrideMaterial : nullptr)
-             << " overrideMaterialName=\""
-             << (overrideMaterial.has_value()
-                     ? ReadUnityObjectName(*overrideMaterial)
-                     : std::string{})
-             << "\" overrideMaterialPass=" << optionalInt(overrideMaterialPass)
-             << " overrideShader="
-             << (overrideShader.has_value() ? *overrideShader : nullptr)
-             << " overrideShaderName=\""
-             << (overrideShader.has_value()
-                     ? ReadUnityObjectName(*overrideShader)
-                     : std::string{})
-             << "\" overrideShaderPass=" << optionalInt(overrideShaderPass);
-        WriteUnityCameraDiagnosticEvent(line.str());
-    }
 
-    void ObserveEyeRenderObjectsPass(void* pass) noexcept {
-        if (!eyeRenderObjectsPassFields.Ready() || !eyeRenderPassTraceActive ||
-            pass == nullptr ||
-            ReadEyeRenderPassEvent(pass) != 600) {
-            return;
-        }
-        DescribeEyeRenderObjectsPass(pass);
-    }
 
     int EyeRenderObjectsRoleIndex(const char* role) noexcept {
         if (role != nullptr && std::strcmp(role, "left") == 0) {
@@ -2228,84 +1626,9 @@ namespace GakumasLocal::HookMain {
     // Observe-only: dump.cs ProFlareRenderingSystem.ComputeAndRenderFlares
     // is the actual raster. Do not skip — that would kill accepted .175
     // ordinary flares. Log camera role during the White night 8 s intro.
-    void LogProFlareRender(void* camera) noexcept {
-        const bool isEye = unityStereoRenderer.IsEyeCamera(camera);
-        const char* role = unityStereoRenderer.ClassifyCamera(camera);
-        const int roleIndex = EyeRenderObjectsRoleIndex(role);
-        auto& count = proFlareRenderLogs[roleIndex];
-        ++count;
-        if (count > 24 && count % 90 != 0) {
-            return;
-        }
-        std::ostringstream line;
-        line << "[VR][fov] PRO_FLARE_RENDER role="
-             << (role != nullptr ? role : "?") << " camera=0x" << std::hex
-             << reinterpret_cast<std::uintptr_t>(camera) << std::dec
-             << " eye=" << (isEye ? 1 : 0)
-             << " method=ComputeAndRenderFlares count=" << count;
-        static_cast<void>(gakumas::vr::WriteVrLog(line.str()));
-    }
 
-    void EndEyeRenderPassTrace(void* camera) noexcept {
-        if (!eyeRenderPassTraceActive || camera == nullptr ||
-            camera != eyeRenderPassTraceCamera) {
-            return;
-        }
-        eyeRenderPassTraceActive = false;
-        const std::size_t eye = eyeRenderPassTraceEye;
-        std::uint64_t signature = 1469598103934665603ULL;
-        const auto mix = [&signature](std::uint64_t value) {
-            signature ^= value;
-            signature *= 1099511628211ULL;
-        };
-        mix(static_cast<std::uint64_t>(eyeRenderPassTraceCount));
-        for (std::size_t index = 0U; index < eyeRenderPassTraceCount; ++index) {
-            const auto& entry = eyeRenderPassTraceEntries[index];
-            mix(static_cast<std::uint64_t>(
-                reinterpret_cast<std::uintptr_t>(entry.klass)));
-            mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(entry.event)));
-        }
-        const std::uint64_t serial = ++eyeRenderPassFrameSerial[eye];
-        const bool changed = eyeRenderPassLastSignature[eye] != signature;
-        const bool periodic = eye == 0U && serial % 600U == 0U;
-        if (!changed && !periodic) {
-            return;
-        }
-        eyeRenderPassLastSignature[eye] = signature;
-        const char* role = eye == 0U ? "left" : "right";
-        std::ostringstream begin;
-        begin << "[VR][eye-pass] EYE_PASS_QUEUE_BEGIN role=" << role
-              << " frame=" << serial << " count=" << eyeRenderPassTraceCount
-              << " signature=0x" << std::hex << signature << std::dec
-              << " changed=" << (changed ? 1 : 0)
-              << " overflow=" << (eyeRenderPassTraceOverflow ? 1 : 0);
-        WriteUnityCameraDiagnosticEvent(begin.str());
-        for (std::size_t index = 0U; index < eyeRenderPassTraceCount; ++index) {
-            const auto& entry = eyeRenderPassTraceEntries[index];
-            const char* nameSpace = entry.klass != nullptr &&
-                    entry.klass->namespaze != nullptr
-                ? entry.klass->namespaze
-                : "?";
-            const char* name = entry.klass != nullptr && entry.klass->name != nullptr
-                ? entry.klass->name
-                : "?";
-            std::ostringstream line;
-            line << "[VR][eye-pass] EYE_PASS role=" << role
-                 << " index=" << index << " event=";
-            if (entry.event == (std::numeric_limits<int>::min)()) {
-                line << '?';
-            } else {
-                line << entry.event;
-            }
-            line << " type=" << nameSpace << '.' << name
-                 << " pass=0x" << std::hex
-                 << reinterpret_cast<std::uintptr_t>(entry.pass) << std::dec;
-            WriteUnityCameraDiagnosticEvent(line.str());
-        }
-        WriteUnityCameraDiagnosticEvent(
-            std::string("[VR][eye-pass] EYE_PASS_QUEUE_END role=") + role +
-            " frame=" + std::to_string(serial));
-    }
+
+
 
     void TrackVrSourceCamera(void* camera) {
         if (!IsVrUnityRuntimeEnabled()) {
@@ -2455,8 +1778,6 @@ namespace GakumasLocal::HookMain {
             return observation;
         }
         observation.stateValid = true;
-        observation.fovValid = TryReadCinemachineFovDiagnostic(
-            state, sample, &observation.fov);
         if (sample != 1U && sample % 300U != 0U) {
             return observation;
         }
@@ -2473,61 +1794,7 @@ namespace GakumasLocal::HookMain {
         return observation;
     }
 
-    void PublishCinemachineObservation(
-        void* brain,
-        void* outputCamera,
-        bool selectedSource,
-        const PendingCinemachineObservation& observation) noexcept {
-        if (!AreVrUnityCameraDiagnosticsEnabled() || !observation.sampled) {
-            return;
-        }
-        const bool periodic = observation.sample == 1U ||
-            observation.sample % 300U == 0U;
-        if (!observation.stateValid || !observation.fovValid) {
-            if (periodic) {
-                WriteUnityCameraDiagnosticEvent(
-                    "[VR][fov] CAMERA_STATE_REJECTED sample=" +
-                    std::to_string(observation.sample) +
-                    " reason=invalid-state-or-layout");
-            }
-            return;
-        }
-        if (outputCamera == nullptr) {
-            if (periodic) {
-                WriteUnityCameraDiagnosticEvent(
-                    "[VR][fov] CAMERA_STATE_REJECTED sample=" +
-                    std::to_string(observation.sample) +
-                    " reason=no-output-camera");
-            }
-            return;
-        }
-        if (!selectedSource) {
-            if (periodic) {
-                std::ostringstream stream;
-                stream << "[VR][fov] CAMERA_STATE_REJECTED sample="
-                       << observation.sample
-                       << " reason=output-not-selected-source brain=0x"
-                       << std::hex << reinterpret_cast<std::uintptr_t>(brain)
-                       << " output=0x"
-                       << reinterpret_cast<std::uintptr_t>(outputCamera)
-                       << std::dec;
-                WriteUnityCameraDiagnosticEvent(stream.str());
-            }
-            return;
-        }
-        unityStereoRenderer.ObserveSourceCameraStateForDiagnostics(
-            observation.fov);
-        if (periodic) {
-            WriteUnityCameraDiagnosticEvent(
-                "[VR][fov] CAMERA_STATE_PAIRED sample=" +
-                std::to_string(observation.sample) +
-                " outputSelected=1 hasLookAt=" +
-                (observation.fov.hasLookAt ? "1" : "0") +
-                " motionSemantics=" +
-                (observation.fov.hasLookAt ? "projection+distance"
-                                           : "projection-only"));
-        }
-    }
+
 
     bool TryCopyNativeBytes(
         const void* source,
@@ -2544,91 +1811,7 @@ namespace GakumasLocal::HookMain {
         }
     }
 
-    void LogProduceTransitionLayoutForDiagnostics() noexcept {
-        if (!AreVrUnityCameraDiagnosticsEnabled() ||
-            produceTransitionLayoutLogged.exchange(
-                true, std::memory_order_acq_rel)) {
-            return;
-        }
-        auto* menuClass = Il2cppUtils::GetClass(
-            "Assembly-CSharp.dll", "Campus.Common", "VerticalAdvMenuView");
-        auto* buttonViewClass = Il2cppUtils::GetClass(
-            "Assembly-CSharp.dll", "Campus.Common",
-            "VerticalAdvMenuButtonView");
-        auto* buttonBaseClass = Il2cppUtils::GetClass(
-            "quaunity-ui.Runtime.dll", "Qua.UI", "ButtonBase");
-        UnityResolve::Method* initialize = nullptr;
-        if (menuClass != nullptr) {
-            for (auto* method : menuClass->methods) {
-                if (method == nullptr || method->name != "Initialize" ||
-                    method->static_function || !method->args.empty() ||
-                    method->return_type == nullptr ||
-                    method->return_type->name != "System.Void" ||
-                    method->function == nullptr || method->address == nullptr) {
-                    continue;
-                }
-                if (initialize != nullptr) {
-                    initialize = nullptr;
-                    break;
-                }
-                initialize = method;
-            }
-        }
-        std::ostringstream summary;
-        summary << "[VR][produce] VERTICAL_ADV_LAYOUT menu="
-                << (menuClass != nullptr ? 1 : 0)
-                << " buttonView=" << (buttonViewClass != nullptr ? 1 : 0)
-                << " buttonBase=" << (buttonBaseClass != nullptr ? 1 : 0)
-                << " initializeShape=" << (initialize != nullptr ? 1 : 0)
-                << " initializeFunction=0x" << std::hex
-                << reinterpret_cast<std::uintptr_t>(
-                       initialize != nullptr ? initialize->function : nullptr)
-                << " methodInfo=0x"
-                << reinterpret_cast<std::uintptr_t>(
-                       initialize != nullptr ? initialize->address : nullptr)
-                << std::dec;
-        static_cast<void>(gakumas::vr::WriteVrLog(summary.str()));
 
-        const auto logFields = [](const char* owner,
-                                  UnityResolve::Class* klass) {
-            if (klass == nullptr) {
-                return;
-            }
-            for (auto* field : klass->fields) {
-                if (field == nullptr) {
-                    continue;
-                }
-                std::ostringstream stream;
-                stream << "[VR][produce] VERTICAL_ADV_FIELD owner=" << owner
-                       << " name=" << field->name
-                       << " type="
-                       << (field->type != nullptr ? field->type->name : "?")
-                       << " offset=" << field->offset
-                       << " static=" << (field->static_field ? 1 : 0);
-                static_cast<void>(gakumas::vr::WriteVrLog(stream.str()));
-            }
-        };
-        logFields("VerticalAdvMenuView", menuClass);
-        logFields("VerticalAdvMenuButtonView", buttonViewClass);
-        logFields("ButtonBase", buttonBaseClass);
-
-        if (initialize != nullptr) {
-            std::array<unsigned char, 96> body{};
-            const bool bodyReadable = TryCopyNativeBytes(
-                initialize->function, body.data(), body.size());
-            std::ostringstream stream;
-            stream << "[VR][produce] VERTICAL_ADV_INITIALIZE_BYTES readable="
-                   << (bodyReadable ? 1 : 0) << " count="
-                   << (bodyReadable ? body.size() : 0U) << " hex=";
-            if (bodyReadable) {
-                stream << std::hex << std::setfill('0');
-                for (unsigned char byte : body) {
-                    stream << std::setw(2) << static_cast<unsigned int>(byte);
-                }
-            }
-            static_cast<void>(gakumas::vr::WriteVrLog(stream.str()));
-        }
-    }
 #endif
 
     UnityResolve::UnityType::Camera* mainCameraCache = nullptr;
@@ -2865,8 +2048,6 @@ namespace GakumasLocal::HookMain {
             void* outputCamera = ReadCinemachineOutputCamera(self);
             const bool selectedSource =
                 outputCamera != nullptr && IsSelectedVrMainCamera(outputCamera);
-            PublishCinemachineObservation(
-                self, outputCamera, selectedSource, cameraObservation);
             const bool pipelineIdle = IsUnityRenderPipelineIdle();
             const bool queueDiagnosticHooksReady =
                 unityCameraRenderHookReady.load(std::memory_order_acquire) &&
@@ -3220,138 +2401,6 @@ namespace GakumasLocal::HookMain {
     }
 #endif
 
-    using gakumas::vr::perf::srpPerformance;
-
-    struct SrpNativeCount {
-        std::atomic<std::uint64_t> calls{0}, sampled{0};
-        std::atomic<unsigned long> firstTid{0}, lastTid{0};
-        std::atomic<std::uintptr_t> firstCaller{0};
-    };
-    std::array<SrpNativeCount, 10> srpNativeCounts;
-    constexpr const char* srpNativeNames[]{"wrapper.cull", "wrapper.submit", "wrapper.command",
-        "native.cull", "native.submit", "native.execute-command-buffer",
-        "pipeline.initialize-rendering-data", "pipeline.add-render-passes",
-        "pipeline.pre-cull-passes", "ui.draw-base"};
-
-    void CountSrpNative(std::size_t index, void* caller) noexcept {
-        auto& c = srpNativeCounts[index];
-        const auto tid = GetCurrentThreadId();
-        c.calls.fetch_add(1, std::memory_order_relaxed);
-        if (srpPerformance.active) c.sampled.fetch_add(1, std::memory_order_relaxed);
-        unsigned long zeroTid = 0;
-        c.firstTid.compare_exchange_strong(zeroTid, tid, std::memory_order_relaxed);
-        c.lastTid.store(tid, std::memory_order_relaxed);
-        std::uintptr_t zero = 0;
-        c.firstCaller.compare_exchange_strong(zero,
-            reinterpret_cast<std::uintptr_t>(caller), std::memory_order_relaxed);
-    }
-
-    void DumpSrpBytes(const char* name, const void* address, std::size_t count) {
-        if (!Config::vrDiagnosticsStartupEnabled || !address) return;
-        // Bounded code evidence, SEH-guarded read; no field writes or calls.
-        std::array<unsigned char, 256> bytes{};
-        for (std::size_t offset = 0; offset < (std::min)(count, std::size_t{8192}); offset += bytes.size()) {
-            const auto size = (std::min)(bytes.size(), count - offset);
-            const auto* p = static_cast<const unsigned char*>(address) + offset;
-            const bool ok = TryCopyNativeBytes(p, bytes.data(), size);
-            std::ostringstream line;
-            line.imbue(std::locale::classic());
-            line << "[VR][perf] SRP_PERF_BYTES name=" << name << " address=0x"
-                 << std::hex << reinterpret_cast<std::uintptr_t>(p)
-                 << " readable=" << ok << " raw=" << std::setfill('0');
-            if (ok) for (std::size_t i = 0; i < size; ++i) line << std::setw(2) << unsigned(bytes[i]);
-            WriteUnityCameraDiagnosticEvent(line.str());
-            if (!ok) break;
-        }
-    }
-
-    void EmitSrpNativeCounts() {
-        static std::array<bool, 10> callerDumped{}; // owner-thread flush only
-        for (std::size_t i = 0; i < srpNativeCounts.size(); ++i) {
-            auto& c = srpNativeCounts[i];
-            const auto caller = c.firstCaller.load(std::memory_order_relaxed);
-            char line[384]{};
-            std::snprintf(line, sizeof(line),
-                "[VR][perf] SRP_PERF_HITS name=%s calls=%llu sampled=%llu firstTid=%lu lastTid=%lu firstCaller=0x%llx",
-                srpNativeNames[i], static_cast<unsigned long long>(c.calls.load()),
-                static_cast<unsigned long long>(c.sampled.load()), c.firstTid.load(), c.lastTid.load(),
-                static_cast<unsigned long long>(caller));
-            WriteUnityCameraDiagnosticEvent(line);
-            if (caller && !callerDumped[i]) {
-                callerDumped[i] = true;
-                DumpSrpBytes(srpNativeNames[i], reinterpret_cast<void*>(caller - 64), 256);
-            }
-        }
-    }
-
-    // Native icall ABI: no MethodInfo. Argument registers are forwarded intact.
-    // These signatures are evidenced by the exact UnityPlayer/PDB disassembly
-    // and current live managed signature; binding and bytes are checked below.
-    DEFINE_HOOK(void, SrpNativeCull, (void* parameters, void* context, void* results)) {
-        auto* caller = _ReturnAddress();
-        CountSrpNative(3, caller);
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.cull", reinterpret_cast<std::uintptr_t>(caller));
-        SrpNativeCull_Orig(parameters, context, results);
-    }
-    DEFINE_HOOK(void, SrpNativeSubmit, (void* context)) {
-        auto* caller = _ReturnAddress();
-        CountSrpNative(4, caller);
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.submit", reinterpret_cast<std::uintptr_t>(caller));
-        SrpNativeSubmit_Orig(context);
-    }
-    DEFINE_HOOK(void, SrpNativeCommand, (void* context, void* commandBuffer)) {
-        auto* caller = _ReturnAddress();
-        CountSrpNative(5, caller);
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "native.execute-command-buffer", reinterpret_cast<std::uintptr_t>(caller));
-        SrpNativeCommand_Orig(context, commandBuffer);
-    }
-
-    // Exact signatures and static/instance shape are checked against the live method
-    // table before installation. These only forward; no fields/state are changed.
-    DEFINE_HOOK(void, SrpPerfCull,
-                (void* parameters, void* context, void* results, void* method)) {
-        CountSrpNative(0, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.cull");
-        SrpPerfCull_Orig(parameters, context, results, method);
-    }
-    DEFINE_HOOK(void, SrpPerfSubmit, (void* context, void* method)) {
-        CountSrpNative(1, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.submit");
-        SrpPerfSubmit_Orig(context, method);
-    }
-    DEFINE_HOOK(void, SrpPerfExecuteCommandBuffer,
-                (void* context, void* commandBuffer, void* method)) {
-        CountSrpNative(2, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "wrapper.command");
-        SrpPerfExecuteCommandBuffer_Orig(context, commandBuffer, method);
-    }
-
-    // dev.398 live signatures + actual pipeline call sites are
-    // archived. Only observe/forward these existing pipeline calls.
-    DEFINE_HOOK(void, SrpInitializeRenderingData,
-                (void* settings, void* cameraData, void* cullResults, void* command,
-                 void* renderingData, void* method)) {
-        CountSrpNative(6, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.initialize-rendering-data");
-        SrpInitializeRenderingData_Orig(settings, cameraData, cullResults, command, renderingData, method);
-    }
-    DEFINE_HOOK(void, SrpAddRenderPasses, (void* self, void* renderingData, void* method)) {
-        CountSrpNative(7, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.add-render-passes");
-        SrpAddRenderPasses_Orig(self, renderingData, method);
-    }
-    DEFINE_HOOK(void, SrpPreCullPasses, (void* self, void* cameraData, void* method)) {
-        CountSrpNative(8, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "pipeline.pre-cull-passes");
-        SrpPreCullPasses_Orig(self, cameraData, method);
-    }
-    DEFINE_HOOK(void, SrpUiDrawBase,
-                (void* self, void* context, void* renderingData, void* method)) {
-        CountSrpNative(9, _ReturnAddress());
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "ui.draw-base");
-        SrpUiDrawBase_Orig(self, context, renderingData, method);
-    }
-
     DEFINE_HOOK(void, BeginContextRendering, (void* ctx, void* cameras, void* method)) {
         if (unityRenderPipelineGuardReady.load(std::memory_order_acquire) &&
             unityRenderPipelineDepth !=
@@ -3371,11 +2420,6 @@ namespace GakumasLocal::HookMain {
 
     DEFINE_HOOK(void, BeginCameraRendering, (void* ctx, void* camera, void* method)) {
 #ifdef GKMS_WINDOWS
-        if (srpPerformance.active) srpPerformance.BeginCamera(
-            reinterpret_cast<std::uintptr_t>(camera), unityStereoRenderer.ClassifyCamera(camera));
-#endif
-        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-begin");
-#ifdef GKMS_WINDOWS
         try {
             unityStereoRenderer.OnBeginCamera(camera);
             if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
@@ -3388,24 +2432,15 @@ namespace GakumasLocal::HookMain {
                 "left") {
                 ResetActorShadowLeftReuse();
             }
-            BeginEyeRenderPassTrace(camera);
-            gakumas::vr::GripTraceBeginCamera(camera, unityStereoRenderer);
         } catch (...) {
             ReportVrUnityHookException();
         }
 #endif
-        callback.Stop();
-        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-begin");
         BeginCameraRendering_Orig(ctx, camera, method);
     }
 
     DEFINE_HOOK(void, BeginCameraRenderingManager, (void* ctx, void* camera, void* method)) {
 #ifdef GKMS_WINDOWS
-        if (srpPerformance.active) srpPerformance.BeginCamera(
-            reinterpret_cast<std::uintptr_t>(camera), unityStereoRenderer.ClassifyCamera(camera));
-#endif
-        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-begin-manager");
-#ifdef GKMS_WINDOWS
         try {
             unityStereoRenderer.OnBeginCamera(camera);
             if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
@@ -3418,28 +2453,19 @@ namespace GakumasLocal::HookMain {
                 "left") {
                 ResetActorShadowLeftReuse();
             }
-            BeginEyeRenderPassTrace(camera);
-            gakumas::vr::GripTraceBeginCamera(camera, unityStereoRenderer);
         } catch (...) {
             ReportVrUnityHookException();
         }
 #endif
-        callback.Stop();
-        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-begin-manager");
         BeginCameraRenderingManager_Orig(ctx, camera, method);
     }
 
     DEFINE_HOOK(void, EndCameraRendering, (void* ctx, void* camera, void* method)) {
-        gakumas::vr::perf::SrpSpan original(srpPerformance, "event.camera-end");
         EndCameraRendering_Orig(ctx, camera, method);
-        original.Stop();
-        gakumas::vr::perf::SrpSpan callback(srpPerformance, "mod.camera-end");
 
         bool ownedByVrQueue = false;
 #ifdef GKMS_WINDOWS
         try {
-            EndEyeRenderPassTrace(camera);
-            gakumas::vr::GripTraceEndCamera(camera);
             ownedByVrQueue = unityStereoRenderer.OnEndCamera(camera);
             if (gakumas::vr::LiveSourcePhotoProtectionActive()) {
                 SetFpHeadColorSkip(gakumas::vr::camera::IsVrFreeCameraFirstPerson(),
@@ -3465,143 +2491,22 @@ namespace GakumasLocal::HookMain {
                 }
             }
         }
-        callback.Stop();
-        if (srpPerformance.active) srpPerformance.EndCamera(
-            reinterpret_cast<std::uintptr_t>(camera));
     }
 
     DEFINE_HOOK(void, ScriptableRenderer_ExecuteRenderPass,
                 (void* self, void* context, void* renderPass,
                   void* renderingData, void* method)) {
-        gakumas::vr::perf::SrpSpan pass(srpPerformance, "pass.unknown",
-            reinterpret_cast<std::uintptr_t>(renderPass));
-        gakumas::vr::perf::SrpSpan before(srpPerformance, "mod.pass-before");
-        if (srpPerformance.active && renderPass != nullptr) {
-            const auto* klass = Il2cppUtils::get_class_from_instance(renderPass);
-            pass.Describe(klass != nullptr ? klass->name : "pass.unknown",
-                ReadEyeRenderPassEvent(renderPass));
-        }
-#ifdef GKMS_WINDOWS
-        if (Config::vrDiagnosticsStartupEnabled) {
-            gakumas::vr::GripTracePass(self, renderPass, context,
-                ReadEyeRenderPassEvent(renderPass), false);
-        }
-        const EyeRenderPassExecutionContext previousExecution =
-            eyeRenderPassExecution;
-        try {
-            RecordEyeRenderPass(renderPass);
-            if (eyeRenderPassTraceActive && renderPass != nullptr) {
-                eyeRenderPassExecution = {
-                    renderPass,
-                    Il2cppUtils::get_class_from_instance(renderPass),
-                    ReadEyeRenderPassEvent(renderPass),
-                };
-            } else {
-                eyeRenderPassExecution = {};
-            }
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-#endif
-        before.Stop();
-        gakumas::vr::perf::SrpSpan original(srpPerformance, "pass.original");
+
         ScriptableRenderer_ExecuteRenderPass_Orig(
             self, context, renderPass, renderingData, method);
-        original.Stop();
-        gakumas::vr::perf::SrpSpan after(srpPerformance, "mod.pass-after");
 #ifdef GKMS_WINDOWS
-        if (Config::vrDiagnosticsStartupEnabled) {
-            gakumas::vr::perf::SrpSpan trace(srpPerformance, "mod.pass-after.grip-trace");
-            gakumas::vr::GripTracePass(self, renderPass, context,
-                ReadEyeRenderPassEvent(renderPass), true);
-        }
         try {
-            gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.pass-after.temporal-observe");
             gakumas::vr::ObserveSmaaT2xRenderPass(
                 renderPass,
                 context,
                 renderingData,
                 ReadEyeRenderPassEvent(renderPass),
                 unityStereoRenderer);
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-        eyeRenderPassExecution = previousExecution;
-#endif
-    }
-
-    DEFINE_HOOK(void, Blitter_DrawTriangle,
-                (void* cmd, void* material, int shaderPass, void* method)) {
-        Blitter_DrawTriangle_Orig(cmd, material, shaderPass, method);
-#ifdef GKMS_WINDOWS
-        try {
-            if (!eyeCommandDrawProceduralHookReady.load(
-                    std::memory_order_acquire)) {
-                ObserveEyeFullscreenDraw(
-                    EyeFullscreenDrawApi::BlitterTriangle,
-                    material, shaderPass, 0, 3, 1);
-            }
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-#endif
-    }
-
-    DEFINE_HOOK(void, Blitter_DrawQuad,
-                (void* cmd, void* material, int shaderPass, void* method)) {
-        Blitter_DrawQuad_Orig(cmd, material, shaderPass, method);
-#ifdef GKMS_WINDOWS
-        try {
-            if (!eyeCommandDrawProceduralHookReady.load(
-                    std::memory_order_acquire)) {
-                ObserveEyeFullscreenDraw(
-                    EyeFullscreenDrawApi::BlitterQuad,
-                    material, shaderPass, 2, 4, 1);
-            }
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-#endif
-    }
-
-    DEFINE_HOOK(void, CommandBuffer_DrawProcedural,
-                (void* self, void* matrix, void* material, int shaderPass,
-                 int topology, int vertexCount, int instanceCount,
-                 void* properties, void* method)) {
-        CommandBuffer_DrawProcedural_Orig(
-            self, matrix, material, shaderPass, topology, vertexCount,
-            instanceCount, properties, method);
-        gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.draw-procedural-observe");
-#ifdef GKMS_WINDOWS
-        try {
-            const bool fullScreenShape = instanceCount == 1 &&
-                ((topology == 0 && vertexCount == 3) ||
-                 (topology == 2 && vertexCount == 4));
-            if (fullScreenShape) {
-                gakumas::vr::GripTraceFullscreen(material, shaderPass);
-                ObserveEyeFullscreenDraw(
-                    EyeFullscreenDrawApi::CommandDrawProcedural,
-                    material, shaderPass, topology, vertexCount,
-                    instanceCount);
-            }
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-#endif
-    }
-
-    DEFINE_HOOK(void, CommandBuffer_Blit,
-                (void* self, void* source, void* destination, void* material,
-                 int shaderPass, void* method)) {
-        CommandBuffer_Blit_Orig(
-            self, source, destination, material, shaderPass, method);
-        gakumas::vr::perf::SrpSpan observe(srpPerformance, "mod.blit-observe");
-#ifdef GKMS_WINDOWS
-        gakumas::vr::GripTraceFullscreen(material, shaderPass);
-        try {
-            ObserveEyeFullscreenDraw(
-                EyeFullscreenDrawApi::CommandBlit,
-                material, shaderPass, -1, -1, -1);
         } catch (...) {
             ReportVrUnityHookException();
         }
@@ -3612,7 +2517,6 @@ namespace GakumasLocal::HookMain {
                 (void* self, void* context, void* renderingData, void* method)) {
 #ifdef GKMS_WINDOWS
         try {
-            ObserveEyeRenderObjectsPass(self);
             void* camera = unityStereoRenderer.CurrentCamera();
             const bool isEye = unityStereoRenderer.IsEyeCamera(camera);
             const char* role = unityStereoRenderer.ClassifyCamera(camera);
@@ -3628,19 +2532,6 @@ namespace GakumasLocal::HookMain {
         }
 #endif
         RenderObjectsPass_Execute_Orig(self, context, renderingData, method);
-    }
-
-    DEFINE_HOOK(void, ProFlareRenderingSystem_ComputeAndRenderFlares,
-                (void* self, void* cmd, void* camera, void* method)) {
-#ifdef GKMS_WINDOWS
-        try {
-            LogProFlareRender(camera);
-        } catch (...) {
-            ReportVrUnityHookException();
-        }
-#endif
-        ProFlareRenderingSystem_ComputeAndRenderFlares_Orig(
-            self, cmd, camera, method);
     }
 
     DEFINE_HOOK(void, DoRenderLoopInternal,
@@ -3683,34 +2574,10 @@ namespace GakumasLocal::HookMain {
             Config::vrDiagnosticsStartupEnabled && outerNormalLoop,
             "unity.render-loop-original",
             [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
-        bool traceSelected = false;
-#ifdef GKMS_WINDOWS
-        if (outerNormalLoop && Config::vrDiagnosticsStartupEnabled) {
-            traceSelected = srpPerformance.Select(true);
-            if (traceSelected) {
-                gakumas::vr::pose::PoseAdmission admission{};
-                (void)gakumas::vr::VrRuntime::Instance().CurrentPoseAdmission(admission);
-                srpPerformance.Begin(admission.frameId, admission.sessionGeneration,
-                    admission.inputEpoch);
-            }
-        }
-#endif
         DoRenderLoopInternal_Orig(pipelineAsset, loopPtr, renderRequest, method);
-        if (traceSelected) srpPerformance.End();
         renderScope.Stop();
 #ifdef GKMS_WINDOWS
-        if (traceSelected) {
-            const auto begin = gakumas::vr::perf::SrpTrace::Clock::now();
-            srpPerformance.Emit(GetCurrentThreadId(),
-                [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
-            EmitSrpNativeCounts();
-            char line[192]{};
-            std::snprintf(line, sizeof(line),
-                "[VR][perf] SRP_PERF_FLUSH tid=%lu loop=%llu wallMs=%.6f",
-                GetCurrentThreadId(), static_cast<unsigned long long>(srpPerformance.loop),
-                gakumas::vr::perf::SrpTrace::Ms(begin, gakumas::vr::perf::SrpTrace::Clock::now()));
-            WriteUnityCameraDiagnosticEvent(line);
-        }
+
 #endif
         if (unityRenderLoopDepth != 0U) {
             --unityRenderLoopDepth;
@@ -3819,9 +2686,6 @@ namespace GakumasLocal::HookMain {
     DEFINE_HOOK(void, CanvasRenderer_SetTexture, (void* self, void* texture, void* method)) {
         void* selected = LocalizationActive() ? ReplaceTextureOrSpriteByObjectName(texture) : texture;
         CanvasRenderer_SetTexture_Orig(self, selected, method);
-#ifdef GKMS_WINDOWS
-        gakumas::vr::GripTraceCanvasTexture(self, selected);
-#endif
     }
 
     DEFINE_HOOK(void, SpriteRenderer_set_sprite, (void* self, void* sprite)) {
@@ -5229,7 +4093,6 @@ namespace GakumasLocal::HookMain {
     }
 
     void PrepareActorShadowFeatureCall() noexcept {
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "mod.shadow-feature-prepare");
         const std::string_view role = unityStereoRenderer.ClassifyCamera(
             unityStereoRenderer.CurrentCamera());
         if (role == "left") {
@@ -5238,7 +4101,6 @@ namespace GakumasLocal::HookMain {
     }
 
     void CaptureActorShadowLeftData(void* feature) noexcept {
-        gakumas::vr::perf::SrpSpan span(srpPerformance, "mod.shadow-left-capture");
         auto& reuse = actorShadowStereoReuse;
         const std::string_view role = unityStereoRenderer.ClassifyCamera(
             unityStereoRenderer.CurrentCamera());
@@ -5476,7 +4338,6 @@ namespace GakumasLocal::HookMain {
                 ReportVrUnityHookException();
             }
             try {
-                gakumas::vr::perf::SrpSpan original(srpPerformance, "feature.actor-shadow-original");
                 DrawActorShadowPass_AddRenderPasses_Orig(
                     self, renderer, renderingData, method);
             } catch (...) {
@@ -5514,24 +4375,7 @@ namespace GakumasLocal::HookMain {
                 ReportVrUnityHookException();
             }
         }
-        // Ungated forensic heartbeat (2 s), before any anchor/owner gate: the
-        // .90 log left mutually impossible readings behind (census starved
-        // while the compensation counter in the same call path kept rising),
-        // so this dumps the raw shared state from the hook entry itself.
-        {
-            static std::atomic<std::uint64_t> heartbeatLastMs{0};
-            const std::uint64_t nowMs = GetTickCount64();
-            std::uint64_t last = heartbeatLastMs.load(std::memory_order_relaxed);
-            if (nowMs - last >= 2000ULL &&
-                heartbeatLastMs.compare_exchange_strong(
-                    last, nowMs, std::memory_order_relaxed)) {
-                try {
-                    unityStereoRenderer.LogShadowHeartbeat();
-                } catch (...) {
-                    ReportVrUnityHookException();
-                }
-            }
-        }
+
 #endif
         RunWithActorShadowAnchor("campus-actor-param", [&] {
             CampusActorParameterPass_Execute_Orig(
@@ -5647,7 +4491,6 @@ namespace GakumasLocal::HookMain {
         }
 #endif
         {
-            gakumas::vr::perf::SrpSpan original(srpPerformance, "draw.actor-original");
             VLDeferredPass_RenderActor_Orig(self, context, renderingData, method);
         }
 #ifdef GKMS_WINDOWS
@@ -6486,28 +5329,7 @@ namespace GakumasLocal::HookMain {
                 gakumas::vr::pose::MonotonicNowNanoseconds();
             RecordVrCameraActorIndex(currIndex, nowNs);
 
-            // 1 Hz probe: proves on hardware whether this hook runs in a
-            // scene at all and which indices exist vs the follow target.
-            if (AreVrUnityCameraDiagnosticsEnabled()) {
-                static std::int64_t lastProbeNanoseconds = 0;
-                if (nowNs - lastProbeNanoseconds > 1'000'000'000LL) {
-                    lastProbeNanoseconds = nowNs;
-                    int seen[kVrCameraSeenActorCapacity];
-                    const std::size_t seenCount =
-                        CollectFreshVrCameraActorIndices(nowNs, seen);
-                    std::ostringstream stream;
-                    stream << "[VR][camera] FREECAM_ANCHOR_PROBE follow="
-                           << GKCamera::followCharaIndex
-                           << " anchorFresh=" << (IsVrCameraAnchorFresh(nowNs) ? 1 : 0)
-                           << " seen=";
-                    for (std::size_t i = 0; i < seenCount; ++i) {
-                        if (i > 0) stream << ',';
-                        stream << seen[i];
-                    }
-                    if (seenCount == 0) stream << '-';
-                    static_cast<void>(gakumas::vr::WriteVrLog(stream.str()));
-                }
-            }
+
         }
 
         if (currIndex == GKCamera::followCharaIndex) {
@@ -6620,20 +5442,16 @@ namespace GakumasLocal::HookMain {
     // onto that branch while transparency is armed; disarmed it is a no-op.
     DEFINE_HOOK(void, UIRenderPass_Execute,
                 (void* self, void* context, void* renderingData, void* mtd)) {
-        gakumas::vr::perf::SrpSpan policy(srpPerformance, "mod.ui-policy-enter");
         gakumas::vr::UnityStereoRenderer::GripUiPassExecState saved{};
         const bool modified =
             gakumas::vr::GripUiPassExecuteEnter(self, saved);
         void* camera = unityStereoRenderer.CurrentCamera();
-        policy.Stop();
         gakumas::vr::GripBlurSourceScope blurScope(self,
             modified && camera && !unityStereoRenderer.IsEyeCamera(camera));
         {
-            gakumas::vr::perf::SrpSpan original(srpPerformance, "ui.execute-original");
             UIRenderPass_Execute_Orig(self, context, renderingData, mtd);
         }
         if (modified) {
-            gakumas::vr::perf::SrpSpan restore(srpPerformance, "mod.ui-policy-restore");
             gakumas::vr::GripUiPassExecuteExit(self, saved);
         }
     }
@@ -7447,15 +6265,7 @@ namespace GakumasLocal::HookMain {
             // proven in campus-submodule.Runtime.dll by the .224 run.
             auto* uiExecute = Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer",
                                                            "UIRenderPass", "Execute");
-            if (Config::vrDiagnosticsStartupEnabled) {
-                auto* pass = Il2cppUtils::GetClass("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer", "UIRenderPass");
-                if (pass) for (const auto* m : pass->methods) {
-                    if (m && (m->name == "Execute" || m->name == "DrawBlur" || m->name == "OnDrawBaseUI")) {
-                        const auto label = std::string("UIRenderPass.pre-hook.") + m->name;
-                        DumpSrpBytes(label.c_str(), m->function, 8192);
-                    }
-                }
-            }
+
             ADD_HOOK(UIRenderPass_Execute, uiExecute);
 
             const auto* cameraMainMethod = Il2cppUtils::GetMethod(
@@ -7484,10 +6294,6 @@ namespace GakumasLocal::HookMain {
                 gakumas::vr::InstallGripBlurSource();
                 gakumas::vr::input::InstallUnityAnalogScrollHook();
                 gakumas::vr::input::InstallUnityPointerInput();
-                if (Config::vrDiagnosticsStartupEnabled) {
-                    gakumas::vr::input::InstallScrollInputDiagnosticHooks();
-                    gakumas::vr::InstallGripTransparencyTrace();
-                }
                 // Photo-scene lifecycle for the right-A shutter: must install
                 // under the frozen VR runtime gate (the VR package ships
                 // Config::enabled=false, so translation-block hooks never run).
@@ -7557,7 +6363,6 @@ namespace GakumasLocal::HookMain {
                     static_cast<void>(
                         gakumas::vr::WriteVrLog(photoHooks.str()));
                 }
-                LogProduceTransitionLayoutForDiagnostics();
                 EnsureProFlareProjectionLayout();
                 ADD_HOOK(
                     ProFlare_UpdateElementJobData,
@@ -7690,225 +6495,7 @@ namespace GakumasLocal::HookMain {
                 DoRenderLoopInternal,
                 doRenderLoopShape ? doRenderLoopMethod->function : nullptr);
 
-            if (Config::vrDiagnosticsStartupEnabled) {
-                auto* contextClass = Il2cppUtils::GetClass(
-                    "UnityEngine.CoreModule.dll", "UnityEngine.Rendering",
-                    "ScriptableRenderContext");
-                // Persist the actual class table (including misses) before any
-                // diagnostic hook. No historical RVA or guessed field offset.
-                if (contextClass != nullptr) {
-                    for (const auto* m : contextClass->methods) {
-                        if (m == nullptr) continue;
-                        std::ostringstream line;
-                        line << "[VR][perf] SRP_PERF_METHOD type=ScriptableRenderContext name="
-                             << m->name << " static=" << m->static_function
-                             << " return=" << (m->return_type ? m->return_type->name : "?")
-                             << " function=" << m->function << " info=" << m->address;
-                        for (std::size_t i = 0; i < m->args.size(); ++i) {
-                            line << " arg" << i << '='
-                                 << (m->args[i] && m->args[i]->pType ? m->args[i]->pType->name : "?");
-                        }
-                        WriteUnityCameraDiagnosticEvent(line.str());
-                    }
-                    for (const auto* f : contextClass->fields) {
-                        if (f == nullptr) continue;
-                        std::ostringstream line;
-                        line << "[VR][perf] SRP_PERF_FIELD type=ScriptableRenderContext name="
-                             << f->name << " offset=" << f->offset;
-                        WriteUnityCameraDiagnosticEvent(line.str());
-                    }
-                }
-                auto exact = [&](const char* name,
-                                 std::initializer_list<const char*> args,
-                                 bool isStatic = true) -> void* {
-                    UnityResolve::Method* found = nullptr;
-                    if (contextClass == nullptr) return nullptr;
-                    for (auto* m : contextClass->methods) {
-                        if (!m || m->name != name || m->static_function != isStatic ||
-                            !m->function || !m->address || !m->return_type ||
-                            m->return_type->name != "System.Void" || m->args.size() != args.size()) continue;
-                        bool match = true;
-                        std::size_t i = 0;
-                        for (const char* arg : args) {
-                            if (!m->args[i] || !m->args[i]->pType || m->args[i]->pType->name != arg) match = false;
-                            ++i;
-                        }
-                        if (!match) continue;
-                        if (found) return nullptr;
-                        found = m;
-                    }
-                    if (found) DumpSrpBytes(name, found->function, 256);
-                    return found ? found->function : nullptr;
-                };
-                ADD_HOOK(SrpPerfCull, exact("Internal_Cull_Injected", {
-                    "UnityEngine.Rendering.ScriptableCullingParameters&",
-                    "UnityEngine.Rendering.ScriptableRenderContext&", "System.IntPtr"}));
-                // Current metadata has instance Submit_Internal(), with no
-                // Submit_Internal_Injected. Forward the opaque value-type this
-                // unchanged; the hook never reads/unboxes it or invokes it itself.
-                ADD_HOOK(SrpPerfSubmit, exact("Submit_Internal", {}, false));
-                ADD_HOOK(SrpPerfExecuteCommandBuffer, exact("ExecuteCommandBuffer_Internal_Injected", {
-                    "UnityEngine.Rendering.ScriptableRenderContext&", "System.IntPtr"}));
-                const auto ga = GetModuleHandleW(L"GameAssembly.dll");
-                const auto unity = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"UnityPlayer.dll"));
-                using ResolveIcall = void* (*)(const char*);
-                auto resolveIcall = reinterpret_cast<ResolveIcall>(GetProcAddress(ga, "il2cpp_resolve_icall"));
-                char bases[192]{};
-                std::snprintf(bases, sizeof(bases),
-                    "[VR][perf] SRP_PERF_MODULES GameAssembly=0x%llx UnityPlayer=0x%llx",
-                    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(ga)),
-                    static_cast<unsigned long long>(unity));
-                WriteUnityCameraDiagnosticEvent(bases);
-                // Exact current file/PDB identity and ABI bytes are persisted
-                // in evidence/srp-performance-dev398. A missing or changed
-                // binding is a diagnostic miss, never a guessed RVA hook.
-                auto native = [&](const char* signature, std::uintptr_t rva,
-                                  const char* expected, std::size_t size,
-                                  bool liveWrapperReady) -> void* {
-                    if (!liveWrapperReady || !resolveIcall || !unity) return nullptr;
-                    void* target = resolveIcall(signature);
-                    DumpSrpBytes(signature, target, 256);
-                    IMAGE_DOS_HEADER dos{};
-                    IMAGE_NT_HEADERS64 nt{};
-                    std::array<unsigned char, 16> code{};
-                    const bool imageOk = TryCopyNativeBytes(reinterpret_cast<void*>(unity), &dos, sizeof(dos)) &&
-                        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 && dos.e_lfanew < 4096 &&
-                        TryCopyNativeBytes(reinterpret_cast<void*>(unity + dos.e_lfanew), &nt, sizeof(nt)) &&
-                        nt.Signature == IMAGE_NT_SIGNATURE && nt.FileHeader.TimeDateStamp == 0x6a1fcfac &&
-                        nt.OptionalHeader.SizeOfImage == 0x21b6000;
-                    const bool ok = imageOk && reinterpret_cast<std::uintptr_t>(target) == unity + rva &&
-                        size <= code.size() && TryCopyNativeBytes(target, code.data(), size) &&
-                        std::memcmp(code.data(), expected, size) == 0;
-                    char record[512]{};
-                    std::snprintf(record, sizeof(record),
-                        "[VR][perf] SRP_PERF_BIND signature=%s target=0x%llx rva=0x%llx imageOk=%d bytesOk=%d",
-                        signature, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(target)),
-                        static_cast<unsigned long long>(rva), imageOk, ok);
-                    WriteUnityCameraDiagnosticEvent(record);
-                    return ok ? target : nullptr;
-                };
-                ADD_HOOK(SrpNativeCull, native("UnityEngine.Rendering.ScriptableRenderContext::Internal_Cull_Injected",
-                    0xe5fa0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x57\x48\x83\xec\x20\x48", 16,
-                    SrpPerfCull_Orig != nullptr));
-                ADD_HOOK(SrpNativeSubmit, native("UnityEngine.Rendering.ScriptableRenderContext::Submit_Internal",
-                    0xe6210, "\x48\x8b\x09\xe9\xf8\x06\x41\x00", 8,
-                    SrpPerfSubmit_Orig != nullptr));
-                ADD_HOOK(SrpNativeCommand, native("UnityEngine.Rendering.ScriptableRenderContext::ExecuteCommandBuffer_Internal_Injected",
-                    0xe64d0, "\x48\x83\xec\x58\x48\x89\x5c\x24\x60\x48\x8d\x05\x8a\x12\xa5\x01", 16,
-                    SrpPerfExecuteCommandBuffer_Orig != nullptr));
-                // Capture verified classes' real member tables and bounded
-                // current method bytes to avoid another extract-only run.
-                for (const auto& type : {
-                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", "ScriptableRenderer"},
-                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "UnityEngine.Rendering.Universal", "UniversalRenderPipeline"},
-                        std::array<const char*, 3>{"Unity.RenderPipelines.Universal.Runtime.dll", "VL.Rendering", "VLSRPRenderer"},
-                        std::array<const char*, 3>{"campus-submodule.Runtime.dll", "Campus.Common.UIRenderer", "UIRenderPass"},
-                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "Resources"},
-                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPI"},
-                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "ResourcesAPIInternal"},
-                        std::array<const char*, 3>{"UnityEngine.CoreModule.dll", "UnityEngine", "Object"}}) {
-                    auto* klass = Il2cppUtils::GetClass(type[0], type[1], type[2]);
-                    if (!klass) continue;
-                    for (const auto* m : klass->methods) {
-                        if (!m) continue;
-                        std::ostringstream record;
-                        record.imbue(std::locale::classic());
-                        record << "[VR][perf] SRP_PERF_CLASS_METHOD type=" << type[2] << " name=" << m->name
-                               << " static=" << m->static_function << " return=" << (m->return_type ? m->return_type->name : "?")
-                               << " function=" << m->function << " info=" << m->address;
-                        for (std::size_t i = 0; i < m->args.size(); ++i)
-                            record << " arg" << i << '=' << (m->args[i] && m->args[i]->pType ? m->args[i]->pType->name : "?");
-                        WriteUnityCameraDiagnosticEvent(record.str());
-                        if (std::string_view(type[0]) == "UnityEngine.CoreModule.dll") {
-                            // dev.405: read-only evidence for the remaining native
-                            // inventory cost. Do not invoke or hook these entries.
-                            if (m->name == "FindObjectsOfTypeAll" || m->name == "FindObjectsByType" ||
-                                m->name == "FindObjectsOfType" || m->name == "get_ActiveAPI" ||
-                                m->name == "get_overrideAPI") {
-                                const auto label = std::string(type[2]) + "." + m->name;
-                                DumpSrpBytes(label.c_str(), m->function, 512);
-                            }
-                            continue;
-                        }
-                        if (std::string_view(type[2]) == "UIRenderPass") continue; // pre-hook bytes already captured
-                        if (m->name == "RenderSingleCamera" || m->name == "RenderCameraStack" ||
-                            m->name == "Execute" || m->name == "ExecuteRenderPass" || m->name == "InternalStartRendering" ||
-                            m->name == "InternalFinishRendering" || m->name == "InitializeRenderingData" ||
-                            m->name == "AddRenderPasses" || m->name == "OnPreCullRenderPasses" ||
-                            m->name == "OnDrawBaseUI" || m->name == "DrawBlur" ||
-                            m->name == "Setup" || m->name == "SetupLights" || m->name == "SetupCullingParameters") {
-                            const auto label = std::string(type[2]) + "." + m->name;
-                            DumpSrpBytes(label.c_str(), m->function, 8192);
-                        }
-                    }
-                    for (const auto* f : klass->fields) {
-                        if (!f) continue;
-                        std::ostringstream record;
-                        record.imbue(std::locale::classic());
-                        record << "[VR][perf] SRP_PERF_CLASS_FIELD type=" << type[2] << " name=" << f->name
-                               << " offset=" << f->offset;
-                        WriteUnityCameraDiagnosticEvent(record.str());
-                    }
-                }
-                // New observation hooks are installed only after the class
-                // census above. Reject missing/ambiguous signatures and shared
-                // bodies; never hook a name-only match or a historical RVA.
-                auto stage = [&](const char* assembly, const char* space, const char* type,
-                                 const char* name, bool isStatic,
-                                 std::initializer_list<const char*> args) -> void* {
-                    auto* klass = Il2cppUtils::GetClass(assembly, space, type);
-                    UnityResolve::Method* found = nullptr;
-                    if (klass) for (auto* m : klass->methods) {
-                        if (!m || m->name != name || m->static_function != isStatic ||
-                            !m->function || !m->address || !m->return_type ||
-                            m->return_type->name != "System.Void" || m->args.size() != args.size()) continue;
-                        bool match = true;
-                        std::size_t i = 0;
-                        for (const char* arg : args) {
-                            if (!m->args[i] || !m->args[i]->pType || m->args[i]->pType->name != arg) match = false;
-                            ++i;
-                        }
-                        if (!match) continue;
-                        if (found) { found = nullptr; break; }
-                        found = m;
-                    }
-                    if (found) for (const auto* m : klass->methods) {
-                        if (m && m != found && m->function == found->function) { found = nullptr; break; }
-                    }
-                    std::ostringstream record;
-                    record.imbue(std::locale::classic());
-                    record << "[VR][perf] SRP_PERF_BIND stage=" << type << '.' << name
-                           << " exact=" << (found != nullptr) << " target=" << (found ? found->function : nullptr);
-                    WriteUnityCameraDiagnosticEvent(record.str());
-                    return found ? found->function : nullptr;
-                };
-                ADD_HOOK(SrpInitializeRenderingData, stage("Unity.RenderPipelines.Universal.Runtime.dll",
-                    "UnityEngine.Rendering.Universal", "UniversalRenderPipeline", "InitializeRenderingData", true,
-                    {"UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset", "UnityEngine.Rendering.Universal.CameraData&",
-                     "UnityEngine.Rendering.CullingResults&", "UnityEngine.Rendering.CommandBuffer", "UnityEngine.Rendering.Universal.RenderingData&"}));
-                ADD_HOOK(SrpAddRenderPasses, stage("Unity.RenderPipelines.Universal.Runtime.dll",
-                    "UnityEngine.Rendering.Universal", "ScriptableRenderer", "AddRenderPasses", false,
-                    {"UnityEngine.Rendering.Universal.RenderingData&"}));
-                ADD_HOOK(SrpPreCullPasses, stage("Unity.RenderPipelines.Universal.Runtime.dll",
-                    "UnityEngine.Rendering.Universal", "ScriptableRenderer", "OnPreCullRenderPasses", false,
-                    {"UnityEngine.Rendering.Universal.CameraData&"}));
-                ADD_HOOK(SrpUiDrawBase, stage("campus-submodule.Runtime.dll", "Campus.Common.UIRenderer",
-                    "UIRenderPass", "OnDrawBaseUI", false,
-                    {"UnityEngine.Rendering.ScriptableRenderContext", "UnityEngine.Rendering.Universal.RenderingData&"}));
-                std::ostringstream line;
-                line << "[VR][perf] SRP_PERF_READY cull=" << (SrpPerfCull_Orig != nullptr)
-                     << " submit=" << (SrpPerfSubmit_Orig != nullptr)
-                     << " command=" << (SrpPerfExecuteCommandBuffer_Orig != nullptr)
-                     << " nativeCull=" << (SrpNativeCull_Orig != nullptr)
-                     << " nativeSubmit=" << (SrpNativeSubmit_Orig != nullptr)
-                     << " nativeCommand=" << (SrpNativeCommand_Orig != nullptr)
-                     << " initializeData=" << (SrpInitializeRenderingData_Orig != nullptr)
-                     << " addPasses=" << (SrpAddRenderPasses_Orig != nullptr)
-                     << " preCullPasses=" << (SrpPreCullPasses_Orig != nullptr)
-                     << " uiDrawBase=" << (SrpUiDrawBase_Orig != nullptr)
-                     << " burstLoops=4 periodMs=2000 clock=cpu-wall gpuTiming=0";
-                WriteUnityCameraDiagnosticEvent(line.str());
-            }
+
 
             // Direct owned-eye render-path census. This hooks the exact URP
             // dispatcher that receives every classic ScriptableRenderPass,
@@ -7975,171 +6562,6 @@ namespace GakumasLocal::HookMain {
                 }
             }
 
-            // Census the real full-screen raster boundary reached by the
-            // currently dispatched eye ScriptableRenderPass. Blitter funnels
-            // its texture overloads through these exact private helpers, so
-            // material/shader/pass plus the captured GameAssembly call stack
-            // tells us which authored stage actually submitted pixels.
-            auto* blitterClass = Il2cppUtils::GetClass(
-                "Unity.RenderPipelines.Core.Runtime.dll",
-                "UnityEngine.Rendering", "Blitter");
-            const auto findExactBlitterPrimitive = [](
-                    UnityResolve::Class* klass,
-                    std::string_view methodName) -> UnityResolve::Method* {
-                if (klass == nullptr) {
-                    return nullptr;
-                }
-                constexpr std::array<std::string_view, 3> expectedArgs = {
-                    "UnityEngine.Rendering.CommandBuffer",
-                    "UnityEngine.Material",
-                    "System.Int32",
-                };
-                UnityResolve::Method* exact = nullptr;
-                for (auto* candidate : klass->methods) {
-                    if (candidate == nullptr || candidate->name != methodName ||
-                        !candidate->static_function || candidate->function == nullptr ||
-                        candidate->address == nullptr ||
-                        candidate->return_type == nullptr ||
-                        candidate->return_type->name != "System.Void" ||
-                        candidate->args.size() != expectedArgs.size()) {
-                        continue;
-                    }
-                    bool argsMatch = true;
-                    for (std::size_t index = 0U; index < expectedArgs.size(); ++index) {
-                        if (candidate->args[index] == nullptr ||
-                            candidate->args[index]->pType == nullptr ||
-                            std::string_view(candidate->args[index]->pType->name) !=
-                                expectedArgs[index]) {
-                            argsMatch = false;
-                            break;
-                        }
-                    }
-                    if (!argsMatch) {
-                        continue;
-                    }
-                    if (exact != nullptr) {
-                        return nullptr;
-                    }
-                    exact = candidate;
-                }
-                return exact;
-            };
-            auto* blitterDrawTriangle = findExactBlitterPrimitive(
-                blitterClass, "DrawTriangle");
-            auto* blitterDrawQuad = findExactBlitterPrimitive(
-                blitterClass, "DrawQuad");
-
-            auto* commandBufferClass = Il2cppUtils::GetClass(
-                "UnityEngine.CoreModule.dll",
-                "UnityEngine.Rendering", "CommandBuffer");
-            const auto findExactInstanceVoid = [](
-                    UnityResolve::Class* klass,
-                    std::string_view methodName,
-                    const auto& expectedArgs) -> UnityResolve::Method* {
-                if (klass == nullptr) {
-                    return nullptr;
-                }
-                UnityResolve::Method* exact = nullptr;
-                for (auto* candidate : klass->methods) {
-                    if (candidate == nullptr || candidate->name != methodName ||
-                        candidate->static_function || candidate->function == nullptr ||
-                        candidate->address == nullptr ||
-                        candidate->return_type == nullptr ||
-                        candidate->return_type->name != "System.Void" ||
-                        candidate->args.size() != expectedArgs.size()) {
-                        continue;
-                    }
-                    bool argsMatch = true;
-                    for (std::size_t index = 0U; index < expectedArgs.size(); ++index) {
-                        if (candidate->args[index] == nullptr ||
-                            candidate->args[index]->pType == nullptr ||
-                            std::string_view(candidate->args[index]->pType->name) !=
-                                expectedArgs[index]) {
-                            argsMatch = false;
-                            break;
-                        }
-                    }
-                    if (!argsMatch) {
-                        continue;
-                    }
-                    if (exact != nullptr) {
-                        return nullptr;
-                    }
-                    exact = candidate;
-                }
-                return exact;
-            };
-            // The current metadata contains exactly one instance-void method at
-            // each ActorShadow name/arity below. Runtime parameter names and ref
-            // value-type spellings are diagnostic only: both proved unstable in
-            // `.277`/`.278` despite the methods remaining in the live table.
-            const auto findUniqueInstanceVoidByArity = [](
-                    UnityResolve::Class* klass,
-                    std::string_view methodName,
-                    std::size_t expectedArgCount) -> UnityResolve::Method* {
-                if (klass == nullptr) {
-                    return nullptr;
-                }
-                UnityResolve::Method* exact = nullptr;
-                for (auto* candidate : klass->methods) {
-                    if (candidate == nullptr || candidate->name != methodName ||
-                        candidate->static_function || candidate->function == nullptr ||
-                        candidate->address == nullptr ||
-                        candidate->return_type == nullptr ||
-                        candidate->return_type->name != "System.Void" ||
-                        candidate->args.size() != expectedArgCount) {
-                        continue;
-                    }
-                    if (exact != nullptr) {
-                        return nullptr;
-                    }
-                    exact = candidate;
-                }
-                return exact;
-            };
-            constexpr std::array<std::string_view, 7> drawProceduralArgs = {
-                "UnityEngine.Matrix4x4",
-                "UnityEngine.Material",
-                "System.Int32",
-                "UnityEngine.MeshTopology",
-                "System.Int32",
-                "System.Int32",
-                "UnityEngine.MaterialPropertyBlock",
-            };
-            constexpr std::array<std::string_view, 4> commandBlitArgs = {
-                "UnityEngine.Rendering.RenderTargetIdentifier",
-                "UnityEngine.Rendering.RenderTargetIdentifier",
-                "UnityEngine.Material",
-                "System.Int32",
-            };
-            auto* commandDrawProcedural = findExactInstanceVoid(
-                commandBufferClass, "DrawProcedural", drawProceduralArgs);
-            auto* commandBlit = findExactInstanceVoid(
-                commandBufferClass, "Blit", commandBlitArgs);
-
-            auto* materialClass = Il2cppUtils::GetClass(
-                "UnityEngine.CoreModule.dll", "UnityEngine", "Material");
-            if (materialClass != nullptr) {
-                for (auto* candidate : materialClass->methods) {
-                    if (candidate == nullptr || candidate->name != "get_shader" ||
-                        candidate->static_function || candidate->function == nullptr ||
-                        candidate->address == nullptr ||
-                        candidate->return_type == nullptr ||
-                        candidate->return_type->name != "UnityEngine.Shader" ||
-                        !candidate->args.empty()) {
-                        continue;
-                    }
-                    if (eyeMaterialGetShader != nullptr) {
-                        eyeMaterialGetShader = nullptr;
-                        break;
-                    }
-                    eyeMaterialGetShader = candidate;
-                }
-            }
-
-            // `.149` captured this exact late pass on hardware. Resolve its
-            // concrete Execute override and every inspected field from the
-            // live metadata table before the eyes-only A/B is allowed to run.
             auto* renderObjectsPassClass = Il2cppUtils::GetClass(
                 "Unity.RenderPipelines.Universal.Runtime.dll",
                 "UnityEngine.Experimental.Rendering.Universal",
@@ -8247,153 +6669,7 @@ namespace GakumasLocal::HookMain {
                         ? executeRenderPassMethod->function
                         : nullptr);
             }
-            if (Config::vrDiagnosticsStartupEnabled) {
-                ADD_HOOK(
-                    Blitter_DrawTriangle,
-                    blitterDrawTriangle != nullptr
-                        ? blitterDrawTriangle->function
-                        : nullptr);
-                ADD_HOOK(
-                    Blitter_DrawQuad,
-                    blitterDrawQuad != nullptr ? blitterDrawQuad->function : nullptr);
-                ADD_HOOK(
-                    CommandBuffer_DrawProcedural,
-                    commandDrawProcedural != nullptr
-                        ? commandDrawProcedural->function
-                        : nullptr);
-                eyeCommandDrawProceduralHookReady.store(
-                    CommandBuffer_DrawProcedural_Orig != nullptr,
-                    std::memory_order_release);
-                ADD_HOOK(
-                    CommandBuffer_Blit,
-                    commandBlit != nullptr ? commandBlit->function : nullptr);
-#ifdef GKMS_WINDOWS
-                {
-                std::ostringstream traceApi;
-                traceApi << "[VR][eye-pass] EYE_PASS_TRACE_API execute="
-                         << (executeRenderPassMethod != nullptr ? 1 : 0)
-                         << " eventGetter=" << (eyePassEventGetter != nullptr ? 1 : 0)
-                         << " executeFn="
-                         << (executeRenderPassMethod != nullptr
-                                 ? executeRenderPassMethod->function
-                                 : nullptr)
-                         << " executeInfo="
-                         << (executeRenderPassMethod != nullptr
-                                 ? executeRenderPassMethod->address
-                                 : nullptr)
-                         << " eventFn="
-                         << (eyePassEventGetter != nullptr
-                                 ? eyePassEventGetter->function
-                                 : nullptr);
-                WriteUnityCameraDiagnosticEvent(traceApi.str());
-                WriteUnityCameraDiagnosticEvent(
-                    "[VR][eye-pass] EYE_PASS_TRACE_METHOD signature=\"instance "
-                    "System.Void UnityEngine.Rendering.Universal."
-                    "ScriptableRenderer.ExecuteRenderPass("
-                    "UnityEngine.Rendering.ScriptableRenderContext,"
-                    "UnityEngine.Rendering.Universal.ScriptableRenderPass,"
-                    "UnityEngine.Rendering.Universal.RenderingData&)\"");
 
-                std::ostringstream fullscreenApi;
-                fullscreenApi
-                    << "[VR][eye-pass] EYE_FULLSCREEN_API triangle="
-                    << (blitterDrawTriangle != nullptr ? 1 : 0)
-                    << " quad=" << (blitterDrawQuad != nullptr ? 1 : 0)
-                    << " procedural=" << (commandDrawProcedural != nullptr ? 1 : 0)
-                    << " blit=" << (commandBlit != nullptr ? 1 : 0)
-                    << " getShader=" << (eyeMaterialGetShader != nullptr ? 1 : 0)
-                    << " triangleFn="
-                    << (blitterDrawTriangle != nullptr
-                            ? blitterDrawTriangle->function
-                            : nullptr)
-                    << " triangleInfo="
-                    << (blitterDrawTriangle != nullptr
-                            ? blitterDrawTriangle->address
-                            : nullptr)
-                    << " quadFn="
-                    << (blitterDrawQuad != nullptr
-                            ? blitterDrawQuad->function
-                            : nullptr)
-                    << " quadInfo="
-                    << (blitterDrawQuad != nullptr
-                            ? blitterDrawQuad->address
-                            : nullptr)
-                    << " proceduralFn="
-                    << (commandDrawProcedural != nullptr
-                            ? commandDrawProcedural->function
-                            : nullptr)
-                    << " proceduralInfo="
-                    << (commandDrawProcedural != nullptr
-                            ? commandDrawProcedural->address
-                            : nullptr)
-                    << " blitFn="
-                    << (commandBlit != nullptr
-                            ? commandBlit->function
-                            : nullptr)
-                    << " blitInfo="
-                    << (commandBlit != nullptr
-                            ? commandBlit->address
-                            : nullptr);
-                WriteUnityCameraDiagnosticEvent(fullscreenApi.str());
-                WriteUnityCameraDiagnosticEvent(
-                    "[VR][eye-pass] EYE_FULLSCREEN_METHOD signatures=\"static "
-                    "System.Void UnityEngine.Rendering.Blitter.DrawTriangle|"
-                    "DrawQuad(UnityEngine.Rendering.CommandBuffer,"
-                    "UnityEngine.Material,System.Int32); instance System.Void "
-                    "UnityEngine.Rendering.CommandBuffer.DrawProcedural("
-                    "UnityEngine.Matrix4x4,UnityEngine.Material,System.Int32,"
-                    "UnityEngine.MeshTopology,System.Int32,System.Int32,"
-                    "UnityEngine.MaterialPropertyBlock); Blit("
-                    "UnityEngine.Rendering.RenderTargetIdentifier,"
-                    "UnityEngine.Rendering.RenderTargetIdentifier,"
-                    "UnityEngine.Material,System.Int32)\"");
-
-                const bool inspectedFieldsReady =
-                    eyeRenderObjectsPassFields.Ready();
-                std::ostringstream renderObjectsApi;
-                renderObjectsApi
-                    << "[VR][eye-pass] EYE_RENDER_OBJECTS_API class="
-                    << (renderObjectsPassClass != nullptr ? 1 : 0)
-                    << " execute="
-                    << (renderObjectsExecuteMethod != nullptr ? 1 : 0)
-                    << " fields=" << (inspectedFieldsReady ? 1 : 0)
-                    << " executeFn="
-                    << (renderObjectsExecuteMethod != nullptr
-                            ? renderObjectsExecuteMethod->function
-                            : nullptr)
-                    << " executeInfo="
-                    << (renderObjectsExecuteMethod != nullptr
-                            ? renderObjectsExecuteMethod->address
-                            : nullptr);
-                WriteUnityCameraDiagnosticEvent(renderObjectsApi.str());
-
-                const auto logLiveFields = [](UnityResolve::Class* klass) {
-                    if (klass == nullptr) {
-                        return;
-                    }
-                    for (const auto* field : klass->fields) {
-                        if (field == nullptr) {
-                            continue;
-                        }
-                        std::ostringstream line;
-                        line << "[VR][eye-pass] EYE_RENDER_OBJECTS_FIELD owner="
-                             << klass->namespaze << '.' << klass->name
-                             << " name=\"" << field->name << "\" type=\""
-                             << (field->type != nullptr
-                                     ? field->type->name
-                                     : std::string("?"))
-                             << "\" offset=0x" << std::hex << field->offset
-                             << std::dec
-                             << " static=" << (field->static_field ? 1 : 0);
-                        WriteUnityCameraDiagnosticEvent(line.str());
-                    }
-                };
-                logLiveFields(renderObjectsPassClass);
-                logLiveFields(filteringSettingsClass);
-                logLiveFields(renderQueueRangeClass);
-                }
-#endif
-            }
 
             // OverlayCanvas skip installs independently of diagnostics.
             ADD_HOOK(
@@ -8420,67 +6696,30 @@ namespace GakumasLocal::HookMain {
             }
 #endif
 
-            UnityResolve::Method* computeAndRenderFlaresMethod = nullptr;
-            if (auto* proFlareAssembly =
-                    UnityResolve::Get("ProFlare.Runtime.dll")) {
-                auto* renderingSystem =
-                    proFlareAssembly->Get("ProFlareRenderingSystem", "");
-                if (renderingSystem == nullptr) {
-                    renderingSystem =
-                        proFlareAssembly->Get("ProFlareRenderingSystem");
+            const auto findUniqueInstanceVoidByArity = [](
+                    UnityResolve::Class* klass,
+                    std::string_view methodName,
+                    std::size_t expectedArgCount) -> UnityResolve::Method* {
+                if (klass == nullptr) {
+                    return nullptr;
                 }
-                if (renderingSystem != nullptr) {
-                    for (auto* candidate : renderingSystem->methods) {
-                        if (candidate == nullptr ||
-                            candidate->name != "ComputeAndRenderFlares" ||
-                            candidate->static_function ||
-                            candidate->function == nullptr ||
-                            candidate->address == nullptr ||
-                            candidate->return_type == nullptr ||
-                            candidate->return_type->name != "System.Void" ||
-                            candidate->args.size() != 2U ||
-                            candidate->args[0] == nullptr ||
-                            candidate->args[0]->pType == nullptr ||
-                            candidate->args[0]->pType->name.find(
-                                "CommandBuffer") == std::string::npos ||
-                            candidate->args[1] == nullptr ||
-                            candidate->args[1]->pType == nullptr ||
-                            candidate->args[1]->pType->name.find("Camera") ==
-                                std::string::npos ||
-                            candidate->args[1]->pType->name.find(
-                                "Cinemachine") != std::string::npos) {
-                            continue;
-                        }
-                        if (computeAndRenderFlaresMethod != nullptr) {
-                            computeAndRenderFlaresMethod = nullptr;
-                            break;
-                        }
-                        computeAndRenderFlaresMethod = candidate;
+                UnityResolve::Method* exact = nullptr;
+                for (auto* candidate : klass->methods) {
+                    if (candidate == nullptr || candidate->name != methodName ||
+                        candidate->static_function || candidate->function == nullptr ||
+                        candidate->address == nullptr ||
+                        candidate->return_type == nullptr ||
+                        candidate->return_type->name != "System.Void" ||
+                        candidate->args.size() != expectedArgCount) {
+                        continue;
                     }
+                    if (exact != nullptr) {
+                        return nullptr;
+                    }
+                    exact = candidate;
                 }
-            }
-            ADD_HOOK(
-                ProFlareRenderingSystem_ComputeAndRenderFlares,
-                computeAndRenderFlaresMethod != nullptr
-                    ? computeAndRenderFlaresMethod->function
-                    : nullptr);
-#ifdef GKMS_WINDOWS
-            {
-                std::ostringstream flareHook;
-                flareHook << "[VR][fov] PRO_FLARE_RENDER_HOOK ready="
-                          << (computeAndRenderFlaresMethod != nullptr ? 1 : 0)
-                          << " installed="
-                          << (ProFlareRenderingSystem_ComputeAndRenderFlares_Orig !=
-                                      nullptr
-                                  ? 1
-                                  : 0)
-                          << " signature=System.Void ComputeAndRenderFlares("
-                          << "UnityEngine.Rendering.CommandBuffer,"
-                          << "UnityEngine.Camera)";
-                static_cast<void>(gakumas::vr::WriteVrLog(flareHook.str()));
-            }
-#endif
-
+                return exact;
+            };
             // Actor-lighting passes all override
             // ScriptableRenderPass.Execute(ScriptableRenderContext,
             // ref RenderingData). Accept only that exact shape, resolved on

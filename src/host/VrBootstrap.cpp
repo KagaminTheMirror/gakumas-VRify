@@ -140,6 +140,15 @@ void readProgramConfig() {
 }
 
 namespace {
+    bool install_vr_hook_batch(void*, const gakumas::vr::HookRegistrar::Request* requests, std::size_t count) {
+        std::vector<GakumasVR::Hooks::Request> batch;
+        batch.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& r = requests[i];
+            batch.push_back({r.target, r.detour, r.original, r.diagnosticName});
+        }
+        return GakumasVR::Hooks::CreateAndEnableBatch(batch.data(), batch.size());
+    }
 	bool install_vr_hook(
 		void*,
 		void* target,
@@ -220,6 +229,7 @@ namespace {
 
 					gakumas::vr::HookRegistrar registrar;
 					registrar.install = install_vr_hook;
+					registrar.batch = install_vr_hook_batch;
 					if (!gakumas::vr::StartVrRuntime(std::move(runtime_config), registrar)) {
 						OutputDebugStringA("Gakumas VR runtime failed to start.");
 					}

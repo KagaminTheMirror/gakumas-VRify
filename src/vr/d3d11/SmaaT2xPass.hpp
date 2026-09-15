@@ -59,57 +59,12 @@ public:
         std::uint32_t mismatchMask = MotionVectorMismatchNone;
     };
 
-    struct MotionVectorValueDiagnostics {
-        UINT sampleCount = 0;
-        UINT finiteSampleCount = 0;
-        UINT nonFiniteSampleCount = 0;
-        float minimumX = 0.0F;
-        float maximumX = 0.0F;
-        float minimumY = 0.0F;
-        float maximumY = 0.0F;
-        float meanMagnitude = 0.0F;
-        float maximumMagnitude = 0.0F;
-        float minimumZ = 0.0F;
-        float maximumZ = 0.0F;
-        float minimumW = 0.0F;
-        float maximumW = 0.0F;
-    };
-
-    static constexpr std::size_t ReprojectionCandidateCount = 4;
-    enum class ProbeGroup : std::size_t {
-        Source = 0,
-        Age,
-        Jitter,
-        Resolve,
-        Output,
-        Count,
-    };
-    static constexpr std::size_t ProbeGroupCount =
-        static_cast<std::size_t>(ProbeGroup::Count);
-
-    struct ReprojectionAlignmentEyeDiagnostics {
-        std::array<UINT, ReprojectionCandidateCount> validSampleCount{};
-        std::array<float, ReprojectionCandidateCount> minimumValue{};
-        std::array<float, ReprojectionCandidateCount> meanValue{};
-        std::array<float, ReprojectionCandidateCount> maximumValue{};
-    };
-
-    struct ReprojectionAlignmentDiagnostics {
-        std::array<
-            std::array<ReprojectionAlignmentEyeDiagnostics, 2>,
-            ProbeGroupCount> groups{};
-    };
-
     struct EyeResourceDiagnostics {
         std::uintptr_t motion = 0;
-        std::uintptr_t currentMotionProbe = 0;
-        std::uintptr_t previousMotionProbe = 0;
         std::uintptr_t currentSpatial = 0;
         std::uintptr_t previousSpatial = 0;
         std::uintptr_t resolved = 0;
         std::uint64_t motionPairToken = 0;
-        std::uint64_t currentMotionProbePairToken = 0;
-        std::uint64_t previousMotionProbePairToken = 0;
         std::uint32_t nextSpatialWriteIndex = 0;
         bool historyValid = false;
     };
@@ -117,6 +72,8 @@ public:
     struct ResourceDiagnostics {
         std::array<EyeResourceDiagnostics, 2> eyes{};
     };
+
+    [[nodiscard]] ResourceDiagnostics GetResourceDiagnostics() const noexcept;
 
     SmaaT2xPass() = default;
     ~SmaaT2xPass();
@@ -143,10 +100,6 @@ public:
 
     // Diagnostics-only sparse readback. It samples distributed scan lines from
     // the immutable per-eye copy, never from the shared Unity RTHandle.
-    [[nodiscard]] bool ReadMotionVectorValues(
-        ID3D11DeviceContext* immediateContext,
-        std::size_t eye,
-        MotionVectorValueDiagnostics& diagnostics) const noexcept;
 
     // quality is 0=low, 1=medium, 2=high. phase is 0 or 1. Returned textures
     // are owned by this pass and remain valid until Reset()/resource rebuild.
@@ -157,16 +110,10 @@ public:
         int quality,
         std::uint32_t phase,
         std::uint64_t pairToken,
-        bool collectReprojectionAlignment,
         std::array<ID3D11Texture2D*, 2>& outputs) noexcept;
 
     // Diagnostics-only GPU score covering MV source/age, jitter compensation,
     // official resolve telemetry and resolved/current output delta.
-    [[nodiscard]] bool ReadReprojectionAlignment(
-        ID3D11DeviceContext* immediateContext,
-        ReprojectionAlignmentDiagnostics& diagnostics) noexcept;
-    [[nodiscard]] ResourceDiagnostics GetResourceDiagnostics() const noexcept;
-    [[nodiscard]] static const char* ProbeGroupName(ProbeGroup group) noexcept;
 
     void ResetHistory() noexcept;
     void Reset() noexcept;
@@ -189,12 +136,6 @@ private:
         ID3D11VertexShader* neighborhoodVs = nullptr;
         ID3D11PixelShader* neighborhoodPs = nullptr;
         ID3D11PixelShader* resolvePs = nullptr;
-        ID3D11PixelShader* sourceProbePs = nullptr;
-        ID3D11PixelShader* ageProbePs = nullptr;
-        ID3D11PixelShader* jitterProbePs = nullptr;
-        ID3D11PixelShader* resolveProbePs = nullptr;
-        ID3D11PixelShader* outputProbePs = nullptr;
-        ID3D11PixelShader* motionProbePs = nullptr;
     };
 
     struct ColorTarget {
@@ -217,7 +158,6 @@ private:
         const char* profile,
         ID3DBlob** blob) noexcept;
     [[nodiscard]] bool CreateFixedResources() noexcept;
-    [[nodiscard]] bool CreateAlignmentResources() noexcept;
     [[nodiscard]] bool CreateSizeResources(
         const D3D11_TEXTURE2D_DESC& colorDescription,
         bool srgb) noexcept;
@@ -252,14 +192,7 @@ private:
         std::size_t eye,
         ID3D11Texture2D* color,
         int quality,
-        std::uint32_t phase,
-        bool collectReprojectionAlignment) noexcept;
-    void RecordProbeGroup(
-        std::size_t eye,
-        ProbeGroup group,
-        ID3D11PixelShader* shader,
-        const std::array<ID3D11ShaderResourceView*, 6>& inputs) noexcept;
-    void RecordMotionProbe(std::size_t eye, ID3D11PixelShader* shader) noexcept;
+        std::uint32_t phase) noexcept;
     void BindFullscreenState() noexcept;
     void SetViewport(UINT width, UINT height) noexcept;
     void UnbindShaderResources() noexcept;
@@ -279,16 +212,6 @@ private:
     ID3D11ShaderResourceView* areaSrv_ = nullptr;
     ID3D11Texture2D* searchTexture_ = nullptr;
     ID3D11ShaderResourceView* searchSrv_ = nullptr;
-    std::array<ID3D11Texture2D*, 2> alignmentTexture_{};
-    std::array<ID3D11RenderTargetView*, 2> alignmentRtv_{};
-    std::array<std::array<ID3D11Texture2D*, ProbeGroupCount>, 2>
-        alignmentStaging_{};
-    std::array<bool, 2> alignmentPending_{};
-    std::array<std::array<ColorTarget, 2>, 2> motionProbe_{};
-    std::array<std::uint32_t, 2> motionProbeCurrentIndex_{};
-    std::array<bool, 2> motionProbeValid_{};
-    std::array<std::array<std::uint64_t, 2>, 2> motionProbePairTokens_{};
-
     ID3D11Texture2D* edgeTexture_ = nullptr;
     ID3D11ShaderResourceView* edgeSrv_ = nullptr;
     ID3D11RenderTargetView* edgeRtv_ = nullptr;

@@ -32,7 +32,6 @@ Texture2D<float4> motionVectors : register(t2);
 Texture2D<uint> workingEdges : register(t3);
 Texture2D<float4> sourceColor : register(t4);
 Texture2D<float4> resolvedColor : register(t5);
-RWByteAddressBuffer temporalStats : register(u0);
 SamplerState LinearSampler : register(s0);
 SamplerState PointSampler : register(s1);
 
@@ -173,35 +172,7 @@ float4 TscmaaTemporalPS(FullscreenOutput input) : SV_Target {
 // the applied weight sum and the resolved-vs-current output delta so hardware
 // logs can distinguish "correctly subtle" from "temporal work too small".
 // Dispatched only on sparse diagnostic pairs; counters are 1/1000 fixed point.
-[numthreads(8, 8, 1)]
-void TscmaaTemporalStatsCS(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= uint(tscmaaMetrics.z) || id.y >= uint(tscmaaMetrics.w))
-        return;
-    const int2 pixel = int2(id.xy);
-    const uint baseOffset = tscmaaFrame.x * 16U;
-    const uint packedEdges = workingEdges.Load(
-        int3(uint2(id.x >> 1, id.y), 0));
-    const uint edgeNibble = (packedEdges >> ((id.x & 1U) * 4U)) & 0x0fU;
-    if (edgeNibble == 0U) return;
-    temporalStats.InterlockedAdd(baseOffset + 0U, 1U);
-    if (tscmaaFrame.y == 0U) return;
-    const float2 motionUv = motionVectors.Load(int3(pixel, 0)).xy;
-    if (any(isnan(motionUv)) || any(isinf(motionUv))) return;
-    const float historyWeight = TscmaaTemporalHistoryWeight(motionUv);
-    const float2 uv = (float2(pixel) + 0.5) * tscmaaMetrics.xy;
-    const float2 historyUv = uv - motionUv;
-    if (historyWeight <= 0.0 || any(historyUv < 0.0) || any(historyUv > 1.0))
-        return;
-    temporalStats.InterlockedAdd(baseOffset + 4U, 1U);
-    temporalStats.InterlockedAdd(
-        baseOffset + 8U, uint(historyWeight * 1000.0 + 0.5));
-    const float3 current = inputColor.Load(int3(pixel, 0)).rgb;
-    const float3 resolved = resolvedColor.Load(int3(pixel, 0)).rgb;
-    const float delta = dot(
-        abs(resolved - current), float3(0.299, 0.587, 0.114));
-    temporalStats.InterlockedAdd(
-        baseOffset + 12U, uint(delta * 1000.0 + 0.5));
-}
+
 )TSCMAA";
 
 template <typename T>
@@ -292,26 +263,7 @@ UINT MotionVectorBytesPerPixel(DXGI_FORMAT format) noexcept {
     }
 }
 
-float HalfToFloat(std::uint16_t bits) noexcept {
-    const bool negative = (bits & 0x8000U) != 0U;
-    const unsigned int exponent = (bits >> 10U) & 0x1fU;
-    const unsigned int mantissa = bits & 0x3ffU;
-    float value = 0.0F;
-    if (exponent == 0U) {
-        value = mantissa == 0U
-            ? 0.0F
-            : std::ldexp(static_cast<float>(mantissa), -24);
-    } else if (exponent == 0x1fU) {
-        value = mantissa == 0U
-            ? std::numeric_limits<float>::infinity()
-            : std::numeric_limits<float>::quiet_NaN();
-    } else {
-        value = std::ldexp(
-            1.0F + static_cast<float>(mantissa) / 1024.0F,
-            static_cast<int>(exponent) - 15);
-    }
-    return negative ? -value : value;
-}
+
 
 std::uint64_t TextureBytes(
     UINT width, UINT height, UINT bytesPerPixel, UINT count = 1U) noexcept {
@@ -348,10 +300,8 @@ bool TscmaaPass::Prepare(
     }
     const bool partialCore = deferredContext_ != nullptr &&
         (fullscreenVs_ == nullptr || copyPs_ == nullptr || temporalPs_ == nullptr ||
-         temporalStatsCs_ == nullptr ||
          rasterizerState_ == nullptr || depthStencilState_ == nullptr ||
-         linearSampler_ == nullptr || pointSampler_ == nullptr || constants_ == nullptr ||
-         temporalStats_.uav == nullptr || temporalStatsStaging_ == nullptr);
+         linearSampler_ == nullptr || pointSampler_ == nullptr || constants_ == nullptr);
     if (partialCore) {
         Reset();
         device->AddRef();
@@ -417,136 +367,7 @@ bool TscmaaPass::HasFreshMotionVectors(std::uint64_t pairToken) const noexcept {
            motion_[1].pairToken == pairToken;
 }
 
-bool TscmaaPass::ReadMotionVectorValues(
-    ID3D11DeviceContext* immediateContext,
-    std::size_t eye,
-    MotionVectorValueDiagnostics& diagnostics) const noexcept {
-    diagnostics = {};
-    if (immediateContext == nullptr || eye >= motion_.size() ||
-        motion_[eye].texture == nullptr) {
-        return false;
-    }
-    D3D11_TEXTURE2D_DESC source{};
-    motion_[eye].texture->GetDesc(&source);
-    const UINT componentCount =
-        source.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
-                source.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
-            ? 4U
-            : source.Format == DXGI_FORMAT_R16G16_FLOAT ? 2U : 0U;
-    if (componentCount == 0U || source.Width == 0U || source.Height == 0U ||
-        source.MipLevels != 1U || source.ArraySize != 1U ||
-        source.SampleDesc.Count != 1U) {
-        return false;
-    }
 
-    constexpr UINT kMaximumSampleWidth = 64U;
-    constexpr UINT kMaximumSampleRows = 8U;
-    const UINT sampleWidth = (std::min)(source.Width, kMaximumSampleWidth);
-    const UINT sampleRows = (std::min)(source.Height, kMaximumSampleRows);
-    D3D11_TEXTURE2D_DESC stagingDescription{};
-    stagingDescription.Width = sampleWidth;
-    stagingDescription.Height = sampleRows;
-    stagingDescription.MipLevels = 1;
-    stagingDescription.ArraySize = 1;
-    stagingDescription.Format = source.Format;
-    stagingDescription.SampleDesc.Count = 1;
-    stagingDescription.Usage = D3D11_USAGE_STAGING;
-    stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Device* contextDevice = nullptr;
-    immediateContext->GetDevice(&contextDevice);
-    if (contextDevice == nullptr) return false;
-    ID3D11Texture2D* staging = nullptr;
-    const HRESULT createResult = contextDevice->CreateTexture2D(
-        &stagingDescription, nullptr, &staging);
-    contextDevice->Release();
-    if (FAILED(createResult) || staging == nullptr) return false;
-    for (UINT row = 0; row < sampleRows; ++row) {
-        const UINT sourceY = sampleRows == 1U
-            ? source.Height / 2U
-            : static_cast<UINT>(
-                  (static_cast<std::uint64_t>(source.Height - 1U) * row) /
-                  (sampleRows - 1U));
-        const UINT maximumX = source.Width - sampleWidth;
-        const UINT sourceX = sampleRows == 1U
-            ? maximumX / 2U
-            : static_cast<UINT>(
-                  (static_cast<std::uint64_t>(maximumX) * row) /
-                  (sampleRows - 1U));
-        const D3D11_BOX box{
-            sourceX, sourceY, 0U, sourceX + sampleWidth, sourceY + 1U, 1U};
-        immediateContext->CopySubresourceRegion(
-            staging, 0, 0, row, 0, motion_[eye].texture, 0, &box);
-    }
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT mapResult = immediateContext->Map(
-        staging, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(mapResult) || mapped.pData == nullptr) {
-        staging->Release();
-        return false;
-    }
-
-    diagnostics.sampleCount = sampleWidth * sampleRows;
-    float minimumX = std::numeric_limits<float>::infinity();
-    float maximumX = -std::numeric_limits<float>::infinity();
-    float minimumY = std::numeric_limits<float>::infinity();
-    float maximumY = -std::numeric_limits<float>::infinity();
-    float minimumZ = std::numeric_limits<float>::infinity();
-    float maximumZ = -std::numeric_limits<float>::infinity();
-    float minimumW = std::numeric_limits<float>::infinity();
-    float maximumW = -std::numeric_limits<float>::infinity();
-    double magnitudeSum = 0.0;
-    for (UINT row = 0; row < sampleRows; ++row) {
-        const auto* rowBytes = static_cast<const std::uint8_t*>(mapped.pData) +
-            static_cast<std::size_t>(mapped.RowPitch) * row;
-        for (UINT column = 0; column < sampleWidth; ++column) {
-            const auto* components = reinterpret_cast<const std::uint16_t*>(
-                rowBytes + static_cast<std::size_t>(column) * componentCount * 2U);
-            const float x = HalfToFloat(components[0]);
-            const float y = HalfToFloat(components[1]);
-            if (!std::isfinite(x) || !std::isfinite(y)) {
-                ++diagnostics.nonFiniteSampleCount;
-                continue;
-            }
-            ++diagnostics.finiteSampleCount;
-            minimumX = (std::min)(minimumX, x);
-            maximumX = (std::max)(maximumX, x);
-            minimumY = (std::min)(minimumY, y);
-            maximumY = (std::max)(maximumY, y);
-            const float magnitude = std::hypot(x, y);
-            magnitudeSum += magnitude;
-            diagnostics.maximumMagnitude =
-                (std::max)(diagnostics.maximumMagnitude, magnitude);
-            if (componentCount == 4U) {
-                const float z = HalfToFloat(components[2]);
-                const float w = HalfToFloat(components[3]);
-                if (std::isfinite(z)) {
-                    minimumZ = (std::min)(minimumZ, z);
-                    maximumZ = (std::max)(maximumZ, z);
-                }
-                if (std::isfinite(w)) {
-                    minimumW = (std::min)(minimumW, w);
-                    maximumW = (std::max)(maximumW, w);
-                }
-            }
-        }
-    }
-    immediateContext->Unmap(staging, 0);
-    staging->Release();
-    if (diagnostics.finiteSampleCount == 0U) return false;
-    diagnostics.minimumX = minimumX;
-    diagnostics.maximumX = maximumX;
-    diagnostics.minimumY = minimumY;
-    diagnostics.maximumY = maximumY;
-    diagnostics.meanMagnitude = static_cast<float>(
-        magnitudeSum / diagnostics.finiteSampleCount);
-    if (componentCount == 4U) {
-        diagnostics.minimumZ = std::isfinite(minimumZ) ? minimumZ : 0.0F;
-        diagnostics.maximumZ = std::isfinite(maximumZ) ? maximumZ : 0.0F;
-        diagnostics.minimumW = std::isfinite(minimumW) ? minimumW : 0.0F;
-        diagnostics.maximumW = std::isfinite(maximumW) ? maximumW : 0.0F;
-    }
-    return true;
-}
 
 bool TscmaaPass::ResolveStereo(
     ID3D11DeviceContext* immediateContext,
@@ -554,10 +375,8 @@ bool TscmaaPass::ResolveStereo(
     bool srgb,
     int quality,
     std::uint64_t pairToken,
-    std::array<ID3D11Texture2D*, 2>& outputs,
-    TemporalStats* stats) noexcept {
+    std::array<ID3D11Texture2D*, 2>& outputs) noexcept {
     outputs.fill(nullptr);
-    if (stats != nullptr) *stats = {};
     if (!IsPrepared() || immediateContext == nullptr || colors[0] == nullptr ||
         colors[1] == nullptr || quality < 0 || quality > 2) {
         SetFailure(Status::InvalidArgument, E_INVALIDARG);
@@ -587,13 +406,9 @@ bool TscmaaPass::ResolveStereo(
     const auto originalHistory = historyValid_;
     deferredContext_->ClearState();
     BindFullscreenState();
-    if (stats != nullptr) {
-        const UINT zeros[4]{};
-        deferredContext_->ClearUnorderedAccessViewUint(
-            temporalStats_.uav, zeros);
-    }
+
     for (std::size_t eye = 0; eye < colors.size(); ++eye) {
-        if (!RecordEye(eye, quality, stats != nullptr)) {
+        if (!RecordEye(eye, quality)) {
             nextResolvedWriteIndex_ = originalNextIndices;
             lastResolvedOutputIndex_ = originalOutputIndices;
             historyValid_ = originalHistory;
@@ -619,26 +434,7 @@ bool TscmaaPass::ResolveStereo(
     for (std::size_t eye = 0; eye < outputs.size(); ++eye) {
         outputs[eye] = resolved_[eye][lastResolvedOutputIndex_[eye]].texture;
     }
-    if (stats != nullptr && temporalStatsStaging_ != nullptr) {
-        immediateContext->CopyResource(
-            temporalStatsStaging_, temporalStats_.buffer);
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(immediateContext->Map(
-                temporalStatsStaging_, 0, D3D11_MAP_READ, 0, &mapped)) &&
-            mapped.pData != nullptr) {
-            const auto* values =
-                static_cast<const std::uint32_t*>(mapped.pData);
-            for (std::size_t eye = 0; eye < stats->eyes.size(); ++eye) {
-                auto& output = stats->eyes[eye];
-                output.edgeCandidatePixels = values[eye * 4U + 0U];
-                output.blendedPixels = values[eye * 4U + 1U];
-                output.weightMilliSum = values[eye * 4U + 2U];
-                output.deltaMilliSum = values[eye * 4U + 3U];
-            }
-            immediateContext->Unmap(temporalStatsStaging_, 0);
-            stats->valid = true;
-        }
-    }
+
     lastStatus_ = Status::Ready;
     lastHresult_ = S_OK;
     return true;
@@ -670,10 +466,6 @@ void TscmaaPass::ResetHistory() noexcept {
 
 void TscmaaPass::Reset() noexcept {
     ReleaseSizeResources();
-    ReleaseObject(temporalStatsStaging_);
-    ReleaseObject(temporalStats_.uav);
-    ReleaseObject(temporalStats_.buffer);
-    temporalStats_.byteWidth = 0U;
     ReleaseObject(constants_);
     ReleaseObject(pointSampler_);
     ReleaseObject(linearSampler_);
@@ -709,8 +501,6 @@ bool TscmaaPass::IsPrepared() const noexcept {
         });
     return device_ != nullptr && deferredContext_ != nullptr &&
            fullscreenVs_ != nullptr && copyPs_ != nullptr && temporalPs_ != nullptr &&
-           temporalStatsCs_ != nullptr && temporalStats_.uav != nullptr &&
-           temporalStatsStaging_ != nullptr &&
            rasterizerState_ != nullptr && depthStencilState_ != nullptr &&
            linearSampler_ != nullptr && pointSampler_ != nullptr && constants_ != nullptr &&
            workingEdges_ != nullptr && workingEdgesSrv_ != nullptr &&
@@ -816,12 +606,7 @@ bool TscmaaPass::LoadAndCompileShaders() noexcept {
         ReleaseShaders();
         return false;
     }
-    if (!CompileComputeShader(
-            std::string(kFullscreenHlsl), "TscmaaTemporalStatsCS",
-            &temporalStatsCs_)) {
-        ReleaseShaders();
-        return false;
-    }
+
     return true;
 }
 
@@ -980,23 +765,6 @@ bool TscmaaPass::CreateFixedResources() noexcept {
     if (FAILED(result) || deferredContext_ == nullptr ||
         rasterizerState_ == nullptr || depthStencilState_ == nullptr ||
         linearSampler_ == nullptr || pointSampler_ == nullptr || constants_ == nullptr) {
-        SetFailure(Status::DeviceResourceFailed, result);
-        return false;
-    }
-    // Two eyes x four diagnostic counters, plus a same-size staging mirror
-    // for the sparse blocking readback.
-    std::array<UINT, 8> zeroStats{};
-    if (!CreateRawBuffer(
-            sizeof(UINT) * 8U, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS,
-            zeroStats.data(), temporalStats_)) {
-        return false;
-    }
-    D3D11_BUFFER_DESC staging{};
-    staging.ByteWidth = sizeof(UINT) * 8U;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    result = device_->CreateBuffer(&staging, nullptr, &temporalStatsStaging_);
-    if (FAILED(result) || temporalStatsStaging_ == nullptr) {
         SetFailure(Status::DeviceResourceFailed, result);
         return false;
     }
@@ -1363,15 +1131,13 @@ void TscmaaPass::UpdateAllocationBytes() noexcept {
         workingDeferredLocations_.byteWidth +
         workingDeferredItems_.byteWidth +
         workingControl_.byteWidth + workingIndirect_.byteWidth +
-        temporalStats_.byteWidth +
         TextureBytes(
             width, height, motionBytesPerPixel_[0] + motionBytesPerPixel_[1]);
 }
 
 bool TscmaaPass::RecordEye(
     std::size_t eye,
-    int quality,
-    bool collectStats) noexcept {
+    int quality) noexcept {
     auto& spatial = spatial_[eye];
 
     // Unity color surfaces are never assumed to expose UAV_BIND. Copy through
@@ -1464,31 +1230,7 @@ bool TscmaaPass::RecordEye(
     deferredContext_->Draw(3, 0);
     UnbindGraphicsResources();
 
-    if (collectStats) {
-        // Counter pass must run before the shared workingEdges texture is
-        // overwritten by the other eye. The resolved output RTV was unbound
-        // above, so it can bind as t5 here.
-        const std::array<ID3D11ShaderResourceView*, 6> statsInputs{
-            spatial.srv,
-            nullptr,
-            motion_[eye].srv,
-            workingEdgesSrv_,
-            nullptr,
-            output.srv,
-        };
-        deferredContext_->CSSetConstantBuffers(0, 1, &constants_);
-        deferredContext_->CSSetShaderResources(
-            0, static_cast<UINT>(statsInputs.size()), statsInputs.data());
-        deferredContext_->CSSetUnorderedAccessViews(
-            0, 1, &temporalStats_.uav, nullptr);
-        deferredContext_->CSSetShader(temporalStatsCs_, nullptr, 0);
-        deferredContext_->Dispatch(
-            (colorDescription_.Width + 7U) / 8U,
-            (colorDescription_.Height + 7U) / 8U, 1U);
-        UnbindComputeResources();
-        ID3D11Buffer* nullConstants = nullptr;
-        deferredContext_->CSSetConstantBuffers(0, 1, &nullConstants);
-    }
+
 
     lastResolvedOutputIndex_[eye] = writeIndex;
     nextResolvedWriteIndex_[eye] = writeIndex ^ 1U;
@@ -1582,7 +1324,6 @@ void TscmaaPass::ReleaseSizeResources() noexcept {
 }
 
 void TscmaaPass::ReleaseShaders() noexcept {
-    ReleaseObject(temporalStatsCs_);
     ReleaseObject(temporalPs_);
     ReleaseObject(copyPs_);
     ReleaseObject(fullscreenVs_);

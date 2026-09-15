@@ -1,4 +1,4 @@
-#include "ScrollInputDiagnostics.hpp"
+#include "UnityAnalogScroll.hpp"
 #include "ScrollAxisRouter.hpp"
 #include "ThumbstickScroll.hpp"
 #include "../frame/SingleFrameLoopContracts.hpp"
@@ -33,37 +33,19 @@ struct Il2CppVec2 {
 
 using InputScrollDeltaFn = Il2CppVec2 (*)(void* methodInfo);
 using OnScrollFn = void (*)(void* self, void* eventData, void* methodInfo);
-using GetFlickFn = std::int32_t (*)(Il2CppVec2 velocity, void* methodInfo);
 
 InputScrollDeltaFn g_inputScrollDeltaOrig = nullptr;
-OnScrollFn g_scrollRectOnScrollOrig = nullptr;
 OnScrollFn g_campusScrollRectOnScrollOrig = nullptr;
-OnScrollFn g_scrollGestureOnScrollOrig = nullptr;
-OnScrollFn g_scrollFlickOnScrollOrig = nullptr;
-OnScrollFn g_executeScrollHandlerOrig = nullptr;
-GetFlickFn g_scrollFlickGetFlickOrig = nullptr;
 
-std::atomic<std::uint64_t> g_sourceSerial{0};
-std::atomic<std::uint64_t> g_sourceTotalUnits{0};
-std::atomic<std::uint64_t> g_sourceLatestDelta{0};
-std::atomic<std::uint64_t> g_sourceTickMs{0};
 std::atomic<std::uint64_t> g_pendingAnalogDelta{0};
 std::atomic<bool> g_inputHookReady{false};
 std::atomic<bool> g_campusHookReady{false};
-std::atomic<std::uint64_t> g_unityPollSerial{0};
-std::atomic<float> g_unityLatestX{0.0F};
-std::atomic<float> g_unityLatestY{0.0F};
-std::atomic<std::uint64_t> g_inputLogs{0};
-std::atomic<std::uint64_t> g_handlerLogs{0};
-std::atomic<std::uint64_t> g_flickLogs{0};
 
 std::int32_t g_pointerScrollDeltaOffset = -1;
 std::int32_t g_scrollHorizontalOffset = -1;
 std::int32_t g_scrollVerticalOffset = -1;
 std::int32_t g_scrollSensitivityOffset = -1;
-std::int32_t g_flickTotalDeltaOffset = -1;
 bool g_inputInstallAttempted = false;
-bool g_diagnosticInstallAttempted = false;
 
 constexpr float kMaximumQueuedAnalogDelta = frame::kScrollMaxUnityUnitsPerTicket;
 
@@ -88,10 +70,7 @@ ScrollVector UnpackScrollVector(std::uint64_t packed) noexcept {
     return value;
 }
 
-bool ShouldLog(std::atomic<std::uint64_t>& counter) noexcept {
-    const std::uint64_t sample = counter.fetch_add(1U, std::memory_order_relaxed) + 1U;
-    return sample <= 120U || (sample % 30U) == 0U;
-}
+
 
 void Log(std::string_view message) noexcept {
     static_cast<void>(WriteVrLog(message));
@@ -199,20 +178,7 @@ bool ReadRuntimeClassIdentity(
     }
 }
 
-std::string RuntimeClassName(void* instance) {
-    if (instance == nullptr) {
-        return "<null>";
-    }
-    const char* namespaze = nullptr;
-    const char* name = nullptr;
-    if (!ReadRuntimeClassIdentity(instance, &namespaze, &name)) {
-        return "<unreadable>";
-    }
-    if (namespaze == nullptr || namespaze[0] == '\0') {
-        return name;
-    }
-    return std::string(namespaze) + "." + name;
-}
+
 
 UnityResolve::Method* FindExactMethod(
     const char* assemblyName,
@@ -276,63 +242,7 @@ bool Install(
             method->function, detour, original, name);
 }
 
-void LogHandler(
-    const char* kind,
-    void* self,
-    void* eventData,
-    bool includeSensitivity,
-    const Il2CppVec2* totalAfter = nullptr) noexcept {
-    Il2CppVec2 eventDelta{};
-    const bool eventReady = ReadVec2(
-        eventData, g_pointerScrollDeltaOffset, &eventDelta);
-    float sensitivity = 0.0F;
-    const bool sensitivityReady = includeSensitivity &&
-        ReadFloat(self, g_scrollSensitivityOffset, &sensitivity);
-    bool horizontal = false;
-    bool vertical = false;
-    const bool axesReady = includeSensitivity &&
-        ReadBool(self, g_scrollHorizontalOffset, &horizontal) &&
-        ReadBool(self, g_scrollVerticalOffset, &vertical);
-    const std::uint64_t sourceSerial =
-        g_sourceSerial.load(std::memory_order_acquire);
-    const std::uint64_t unityPoll =
-        g_unityPollSerial.load(std::memory_order_acquire);
 
-    if (!ShouldLog(g_handlerLogs)) {
-        return;
-    }
-    std::ostringstream stream;
-    stream << "[VR][scroll-probe] HANDLER kind=" << kind
-           << " class=" << RuntimeClassName(self)
-           << " self=" << self
-           << " sourceSerial=" << sourceSerial
-           << " unityPoll=" << unityPoll
-           << " unity=(" << std::fixed << std::setprecision(4)
-           << g_unityLatestX.load(std::memory_order_relaxed) << ','
-           << g_unityLatestY.load(std::memory_order_relaxed) << ')';
-    if (eventReady) {
-        stream << " event=(" << eventDelta.x << ',' << eventDelta.y << ')';
-    } else {
-        stream << " event=<unreadable>";
-    }
-    if (includeSensitivity) {
-        if (sensitivityReady) {
-            stream << " sensitivity=" << sensitivity;
-        } else {
-            stream << " sensitivity=<unreadable>";
-        }
-        if (axesReady) {
-            stream << " horizontal=" << horizontal
-                   << " vertical=" << vertical;
-        } else {
-            stream << " axes=<unreadable>";
-        }
-    }
-    if (totalAfter != nullptr) {
-        stream << " totalAfter=(" << totalAfter->x << ',' << totalAfter->y << ')';
-    }
-    Log(stream.str());
-}
 
 Il2CppVec2 InputScrollDeltaDetour(void* methodInfo) {
     const Il2CppVec2 physicalResult = g_inputScrollDeltaOrig != nullptr
@@ -347,58 +257,10 @@ Il2CppVec2 InputScrollDeltaDetour(void* methodInfo) {
         result.y += injectedDelta.y;
     }
 
-    static thread_local std::uint64_t previousSourceSerial = 0;
-    static thread_local ScrollVector previousSourceUnits{};
-    const std::uint64_t sourceSerial =
-        g_sourceSerial.load(std::memory_order_acquire);
-    const ScrollVector sourceUnits = UnpackScrollVector(
-        g_sourceTotalUnits.load(std::memory_order_relaxed));
-    const std::uint64_t sourceMessages = sourceSerial - previousSourceSerial;
-    const ScrollVector unitsSincePoll{
-        sourceUnits.x - previousSourceUnits.x,
-        sourceUnits.y - previousSourceUnits.y,
-    };
-    previousSourceSerial = sourceSerial;
-    previousSourceUnits = sourceUnits;
-
-    g_unityLatestX.store(result.x, std::memory_order_relaxed);
-    g_unityLatestY.store(result.y, std::memory_order_relaxed);
-    const std::uint64_t unityPoll =
-        g_unityPollSerial.fetch_add(1U, std::memory_order_release) + 1U;
-
-    const bool interesting = sourceMessages != 0U || unitsSincePoll.x != 0.0F ||
-        unitsSincePoll.y != 0.0F ||
-        result.x != 0.0F || result.y != 0.0F;
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled && interesting &&
-        ShouldLog(g_inputLogs)) {
-        const std::uint64_t sourceTick =
-            g_sourceTickMs.load(std::memory_order_relaxed);
-        const std::uint64_t now = GetTickCount64();
-        std::ostringstream stream;
-        stream << "[VR][scroll-probe] UNITY_INPUT sourceSerial=" << sourceSerial
-               << " sourceMessages=" << sourceMessages
-               << " sourceUnits=(" << std::fixed << std::setprecision(4)
-               << unitsSincePoll.x << ',' << unitsSincePoll.y << ')'
-               << " latestDelta=(";
-        const ScrollVector latestDelta = UnpackScrollVector(
-            g_sourceLatestDelta.load(std::memory_order_relaxed));
-        stream << latestDelta.x << ',' << latestDelta.y << ')'
-               << " ageMs=" << (sourceTick <= now ? now - sourceTick : 0U)
-               << " unityPoll=" << unityPoll
-               << " physical=(" << physicalResult.x << ',' << physicalResult.y << ')'
-               << " injected=(" << injectedDelta.x << ',' << injectedDelta.y << ')'
-               << " delta=(" << result.x << ',' << result.y << ')';
-        Log(stream.str());
-    }
     return result;
 }
 
-void ScrollRectOnScrollDetour(void* self, void* eventData, void* methodInfo) {
-    LogHandler("ScrollRect", self, eventData, true);
-    if (g_scrollRectOnScrollOrig != nullptr) {
-        g_scrollRectOnScrollOrig(self, eventData, methodInfo);
-    }
-}
+
 
 void CampusScrollRectOnScrollDetour(void* self, void* eventData, void* methodInfo) {
     const ScrollVector injected = g_threadInjectedDelta;
@@ -426,57 +288,18 @@ void CampusScrollRectOnScrollDetour(void* self, void* eventData, void* methodInf
         // let its VR component leak into a later physical event on this thread.
         g_threadInjectedDelta = {};
     }
-    LogHandler("CampusScrollRect", self, eventData, true);
     if (g_campusScrollRectOnScrollOrig != nullptr) {
         g_campusScrollRectOnScrollOrig(self, eventData, methodInfo);
     }
 }
 
-void ScrollGestureOnScrollDetour(void* self, void* eventData, void* methodInfo) {
-    LogHandler("ScrollGesture", self, eventData, false);
-    if (g_scrollGestureOnScrollOrig != nullptr) {
-        g_scrollGestureOnScrollOrig(self, eventData, methodInfo);
-    }
-}
 
-void ScrollFlickOnScrollDetour(void* self, void* eventData, void* methodInfo) {
-    if (g_scrollFlickOnScrollOrig != nullptr) {
-        g_scrollFlickOnScrollOrig(self, eventData, methodInfo);
-    }
-    Il2CppVec2 total{};
-    const bool totalReady = ReadVec2(self, g_flickTotalDeltaOffset, &total);
-    LogHandler(
-        "ScrollFlickGesture", self, eventData, false,
-        totalReady ? &total : nullptr);
-}
 
-void ExecuteScrollHandlerDetour(void* handler, void* eventData, void* methodInfo) {
-    // This exact non-generic IL2CPP instantiation is the common dispatch point
-    // for every IScrollHandler. It names the real target even when the target
-    // has a game-specific OnScroll override that is not in the known set below.
-    LogHandler("ExecuteEvents<IScrollHandler>", handler, eventData, false);
-    if (g_executeScrollHandlerOrig != nullptr) {
-        g_executeScrollHandlerOrig(handler, eventData, methodInfo);
-    }
-}
 
-std::int32_t ScrollFlickGetFlickDetour(Il2CppVec2 velocity, void* methodInfo) {
-    const std::int32_t result = g_scrollFlickGetFlickOrig != nullptr
-        ? g_scrollFlickGetFlickOrig(velocity, methodInfo)
-        : 0;
-    if (ShouldLog(g_flickLogs)) {
-        std::ostringstream stream;
-        stream << "[VR][scroll-probe] FLICK_CLASSIFY velocity=("
-               << std::fixed << std::setprecision(4)
-               << velocity.x << ',' << velocity.y << ") result=" << result
-               << " sourceSerial="
-               << g_sourceSerial.load(std::memory_order_acquire)
-               << " unityPoll="
-               << g_unityPollSerial.load(std::memory_order_acquire);
-        Log(stream.str());
-    }
-    return result;
-}
+
+
+
+
 
 } // namespace
 
@@ -548,16 +371,7 @@ bool QueueUnityAnalogScrollDelta(float x, float y) noexcept {
         {x, y},
         kMaximumQueuedAnalogDelta);
 
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        AtomicAddClamped(
-            g_sourceTotalUnits,
-            {x, y},
-            1'000'000.0F);
-        g_sourceLatestDelta.store(
-            PackScrollVector({x, y}), std::memory_order_relaxed);
-        g_sourceTickMs.store(GetTickCount64(), std::memory_order_relaxed);
-        g_sourceSerial.fetch_add(1U, std::memory_order_release);
-    }
+
     return true;
 }
 
@@ -565,75 +379,6 @@ void ResetUnityAnalogScroll() noexcept {
     g_pendingAnalogDelta.store(0, std::memory_order_release);
 }
 
-void InstallScrollInputDiagnosticHooks() noexcept {
-    if (!GakumasLocal::Config::vrDiagnosticsStartupEnabled ||
-        g_diagnosticInstallAttempted) {
-        return;
-    }
-    g_diagnosticInstallAttempted = true;
 
-    auto* scrollFlick = Il2cppUtils::GetClass(
-        "Assembly-CSharp.dll", "Campus.Common", "ScrollFlickGesture");
-    g_flickTotalDeltaOffset = FindInstanceFieldOffset(
-        scrollFlick, "_totalScrollDelta");
-
-    auto* scrollRectMethod = FindExactMethod(
-        "UnityEngine.UI.dll", "UnityEngine.UI", "ScrollRect", "OnScroll",
-        false, {"UnityEngine.EventSystems.PointerEventData"});
-    auto* scrollGestureMethod = FindExactMethod(
-        "Assembly-CSharp.dll", "Campus.Common", "ScrollGesture", "OnScroll",
-        false, {"UnityEngine.EventSystems.PointerEventData"});
-    auto* scrollFlickMethod = FindExactMethod(
-        "Assembly-CSharp.dll", "Campus.Common", "ScrollFlickGesture", "OnScroll",
-        false, {"UnityEngine.EventSystems.PointerEventData"});
-    auto* getFlickMethod = FindExactMethod(
-        "Assembly-CSharp.dll", "Campus.Common", "ScrollFlickGesture", "GetFlick",
-        true, {"UnityEngine.Vector2"});
-    auto* executeScrollHandlerMethod = FindExactMethod(
-        "UnityEngine.UI.dll", "UnityEngine.EventSystems", "ExecuteEvents", "Execute",
-        true,
-        {"UnityEngine.EventSystems.IScrollHandler",
-         "UnityEngine.EventSystems.BaseEventData"});
-
-    const bool inputReady = g_inputHookReady.load(std::memory_order_acquire);
-    const bool scrollRectReady = Install(
-        scrollRectMethod, reinterpret_cast<void*>(&ScrollRectOnScrollDetour),
-        reinterpret_cast<void**>(&g_scrollRectOnScrollOrig),
-        "UnityEngine.UI.ScrollRect.OnScroll");
-    const bool campusScrollRectReady =
-        g_campusHookReady.load(std::memory_order_acquire);
-    const bool scrollGestureReady = Install(
-        scrollGestureMethod, reinterpret_cast<void*>(&ScrollGestureOnScrollDetour),
-        reinterpret_cast<void**>(&g_scrollGestureOnScrollOrig),
-        "Campus.Common.ScrollGesture.OnScroll");
-    const bool scrollFlickReady = Install(
-        scrollFlickMethod, reinterpret_cast<void*>(&ScrollFlickOnScrollDetour),
-        reinterpret_cast<void**>(&g_scrollFlickOnScrollOrig),
-        "Campus.Common.ScrollFlickGesture.OnScroll");
-    const bool getFlickReady = Install(
-        getFlickMethod, reinterpret_cast<void*>(&ScrollFlickGetFlickDetour),
-        reinterpret_cast<void**>(&g_scrollFlickGetFlickOrig),
-        "Campus.Common.ScrollFlickGesture.GetFlick");
-    const bool executeScrollHandlerReady = Install(
-        executeScrollHandlerMethod,
-        reinterpret_cast<void*>(&ExecuteScrollHandlerDetour),
-        reinterpret_cast<void**>(&g_executeScrollHandlerOrig),
-        "UnityEngine.EventSystems.ExecuteEvents.Execute<IScrollHandler>");
-
-    std::ostringstream stream;
-    stream << "[VR][scroll-probe] SCROLL_PROBE_API input=" << inputReady
-           << " scrollRect=" << scrollRectReady
-           << " campusScrollRect=" << campusScrollRectReady
-           << " scrollGesture=" << scrollGestureReady
-           << " scrollFlick=" << scrollFlickReady
-           << " getFlick=" << getFlickReady
-           << " executeScrollHandler=" << executeScrollHandlerReady
-           << " scrollDeltaOffset=" << g_pointerScrollDeltaOffset
-           << " horizontalOffset=" << g_scrollHorizontalOffset
-           << " verticalOffset=" << g_scrollVerticalOffset
-           << " sensitivityOffset=" << g_scrollSensitivityOffset
-           << " flickTotalOffset=" << g_flickTotalDeltaOffset;
-    Log(stream.str());
-}
 
 } // namespace gakumas::vr::input

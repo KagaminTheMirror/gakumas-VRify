@@ -118,6 +118,7 @@ bool VrLog::Open(
         stream_.close();
     }
     path_.clear();
+    health_ = {};
     fileEnabled_ = fileEnabled;
     opened_ = true;
 
@@ -198,8 +199,11 @@ bool VrLog::Write(std::string_view message) noexcept {
             return false;
         }
 
+        const auto health = health_.Observe(message, DiagnosticHealth::Clock::now());
+        if (!health.emit) return true;
         stream_ << Timestamp() << ' ';
         stream_.write(message.data(), static_cast<std::streamsize>(message.size()));
+        if (health.suppressed != 0) stream_ << " suppressed=" << health.suppressed;
         stream_ << '\n';
         stream_.flush();
 

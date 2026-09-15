@@ -4,7 +4,7 @@
 #include <Windows.h>
 #include <string>
 
-// Existing call sites only: inclusive wall time, one summary/second per
+// Existing call sites only: inclusive wall time, one summary/ten seconds per
 // site/thread. Sinks run after Stop, never on every frame. Nested totals overlap.
 #define VR_PERF_SCOPE(variable, label, sink) \
     static thread_local gakumas::vr::perf::Accumulator variable##Timing; \

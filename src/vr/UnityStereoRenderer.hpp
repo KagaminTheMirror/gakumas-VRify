@@ -41,25 +41,6 @@ struct UnityStereoCameraFrame {
 // the VR head-pose write. The hook resolves and validates the live CameraState
 // and LensSettings layouts before filling this structure; no guessed field is
 // consumed by the renderer.
-struct UnitySourceCameraStateDiagnostic {
-    std::uint64_t sample = 0;
-    bool valid = false;
-    bool hasLookAt = false;
-    bool physical = false;
-    float fieldOfViewDegrees = 0.0F;
-    float focalLengthMillimeters = 0.0F;
-    float sensorWidthMillimeters = 0.0F;
-    float sensorHeightMillimeters = 0.0F;
-    float lensShiftX = 0.0F;
-    float lensShiftY = 0.0F;
-    float rawPositionX = 0.0F;
-    float rawPositionY = 0.0F;
-    float rawPositionZ = 0.0F;
-    float referenceLookAtX = 0.0F;
-    float referenceLookAtY = 0.0F;
-    float referenceLookAtZ = 0.0F;
-    float lookAtDistance = 0.0F;
-};
 
 // One-shot, high-information ladder through Unity's ordinary top-level Camera
 // queue. No recursive/manual render entry point is ever called:
@@ -87,8 +68,6 @@ public:
         void* sourceCamera,
         const UnityStereoCameraFrame& frame,
         bool pipelineIdle) noexcept;
-    void ObserveSourceCameraStateForDiagnostics(
-        const UnitySourceCameraStateDiagnostic& sample) noexcept;
     void OnBeginContext() noexcept;
     void OnBeginCamera(void* camera) noexcept;
     [[nodiscard]] bool OnEndCamera(void* camera) noexcept;
@@ -131,7 +110,6 @@ public:
     // vectors stay constant while the shading visibly swings, the direction is
     // authored in view space and the swing comes from the shader's view
     // matrix, which no camera-transform bracket can fix.
-    void RecordActorLightDiagnostics(const pose::Pose& headPose) noexcept;
     // Volume-trigger source anchor (`.229` / `.266`): keep a proxy
     // transform at the authored Cinemachine pose (`cinematicPose`) and
     // point the source camera's volumeTrigger at it. Never follows the
@@ -142,7 +120,6 @@ public:
         void* sourceCamera, const UnityStereoCameraFrame& frame) noexcept;
     void RestoreVolumeTriggerAnchor(const char* reason) noexcept;
     [[nodiscard]] bool EnsureVolumeTriggerProxy() noexcept;
-    [[nodiscard]] pose::Pose ReadCurrentCameraPoseForDiagnostics() noexcept;
     // Resolves Shader.GetGlobalVector/Matrix and the passes' cached
     // Shader.PropertyToID static ints, rate-limited to one attempt per
     // second. Decoupled from diagnostics: the .89 run proved the diagnostic
@@ -212,7 +189,6 @@ public:
     // counted 10800 executions while the census in the same call path
     // recorded ~1% of the expected calls and every periodic log line went
     // missing); this measures instead of guessing.
-    void LogShadowHeartbeat() noexcept;
     [[nodiscard]] void* CurrentCamera() const noexcept;
     [[nodiscard]] const char* ClassifyCamera(void* camera) const noexcept;
     [[nodiscard]] bool SourceCameraSuppressed() const noexcept {
@@ -286,29 +262,9 @@ private:
         Failed,
     };
 
-    enum class LifetimeWriteCategory : std::uint8_t {
-        EyeGameObject,
-        EyeCamera,
-        SourceCamera,
-        TargetTexture,
-        MainCameraTag,
-        RenderTarget,
-        OutlineMaterial,
-        ProFlare,
-        UiTextureOverlay,
-        LiveCameraOverlay,
-        CmovParticle,
-        Count,
-    };
 
-    struct LifetimeWriteRecord {
-        std::uint64_t serial = 0;
-        std::uint64_t sceneReadyEpoch = 0;
-        const char* action = "-";
-        void* object = nullptr;
-        void* related = nullptr;
-        std::intptr_t value = 0;
-    };
+
+
 
     struct ManagedApi {
         MethodRef internalCreateGameObject{};
@@ -352,8 +308,6 @@ private:
         MethodRef cameraGetGateFittedLensShiftInjected{};
         MethodRef cameraGetLensShiftInjected{};
         MethodRef cameraSetLensShiftInjected{};
-        MethodRef cameraGetProjectionMatrixInjected{};
-        MethodRef cameraGetNonJitteredProjectionMatrixInjected{};
         MethodRef cameraSetProjectionMatrixInjected{};
         MethodRef behaviourSetEnabled{};
         MethodRef behaviourGetEnabled{};
@@ -436,8 +390,6 @@ private:
         MethodRef volumeComponentSetActive{};
         bool lensShiftGetterUsesNativeSelf = false;
         bool lensShiftSetterUsesNativeSelf = false;
-        bool projectionGetterUsesNativeSelf = false;
-        bool nonJitteredProjectionGetterUsesNativeSelf = false;
         bool projectionUsesNativeSelf = false;
         bool nonJitteredProjectionUsesNativeSelf = false;
         bool transformUsesNativeSelf = false;
@@ -575,9 +527,6 @@ private:
         std::size_t eye,
         void* sourceCamera,
         void* target) noexcept;
-    void LogSmaaT2xProjectionReadback(
-        std::size_t eye,
-        const char* stage) noexcept;
     [[nodiscard]] bool CaptureSmaaT2xMotionVectorTexture(
         std::size_t eye,
         ID3D11Texture2D* texture,
@@ -631,18 +580,7 @@ private:
     void DropCmovParticleCache(const char* reason) noexcept;
     void EnsureOutlineMaterialApi() noexcept;
     void EnsureSceneManagerApi() noexcept;
-    void RecordLifetimeWrite(
-        LifetimeWriteCategory category,
-        const char* action,
-        void* object,
-        void* related = nullptr,
-        std::intptr_t value = 0) noexcept;
-    void LogLifetimeSnapshot(const char* phase, const char* where) noexcept;
-    void ObserveLifetimeSceneReadyEdges(const char* where) noexcept;
     void RefreshSceneIdentity(const char* where) noexcept;
-    void RequestVirtualCameraCensus(const char* reason) noexcept;
-    void RunVirtualCameraCensusIfDue() noexcept;
-    void RunVirtualCameraCensus(const char* phase) noexcept;
     void RequestHeavyDiscover() noexcept;
     void RequestActorOutlineDiscover(const char* reason) noexcept;
     void HoldEyeArm(const char* reason) noexcept;
@@ -655,7 +593,6 @@ private:
     void WriteOutlineMaterialsForGrip() noexcept;
     void DropOutlineMaterialCache(const char* reason) noexcept;
     void RestoreOutlineMaterials() noexcept;
-    void DumpActorOutlineMaterials() noexcept;
     void DeactivateBoundEyeDepthOfField() noexcept;
     [[nodiscard]] void* GetVolumeComponent(
         void* stack,
@@ -767,7 +704,6 @@ private:
         StereoGpuPublishMode mode = StereoGpuPublishMode::MailboxOnly;
         bool srgb = false;
         bool resolveTemporal = false;
-        bool comprehensiveProbe = false;
         int quality = 0;
         std::uint32_t phase = 0;
         std::uint64_t token = 0;
@@ -807,8 +743,6 @@ private:
     void Log(std::string_view message) const noexcept;
 
     [[nodiscard]] static const char* StageName(LadderStage stage) noexcept;
-    [[nodiscard]] static const char* LifetimeWriteCategoryName(
-        LifetimeWriteCategory category) noexcept;
     [[nodiscard]] std::uint8_t ExpectedMask() const noexcept;
     [[nodiscard]] std::size_t ExpectedCameraCount() const noexcept;
     [[nodiscard]] bool IsOwnerThread() noexcept;
@@ -848,8 +782,6 @@ private:
     bool renderLoopBoundaryLogged_ = false;
     bool ownedEyeOutsideContextLogged_ = false;
     bool verboseFrameLog_ = true;
-    std::array<std::uint64_t, 2> sourceFingerprints_{};
-    std::array<bool, 2> sourceFingerprintValid_{};
     std::array<bool, 2> gameObjectActive_{};
     std::array<bool, 2> cameraEnabled_{};
     std::array<void*, 2> eyeGameObjects_{};
@@ -887,8 +819,6 @@ private:
     bool smaaT2xActiveForPair_ = false;
     bool tscmaaRequestedForPair_ = false;
     bool tscmaaActiveForPair_ = false;
-    bool smaaT2xComprehensiveProbeForPair_ = false;
-    bool tscmaaComprehensiveProbeForPair_ = false;
     bool smaaT2xReady_ = false;
     bool tscmaaReady_ = false;
     int lastNativeTemporalAaMode_ = 0;
@@ -1077,18 +1007,13 @@ private:
     std::int32_t actorLightWorldToActorShadowId_ = 0;
     MethodRef shaderGetGlobalVector_{};
     MethodRef shaderGetGlobalMatrix_{};
-    bool actorLightDiagnosticResolved_ = false;
-    std::uint64_t actorLightDiagnosticTicks_ = 0;
-    std::uint64_t actorLightDiagnosticCalls_ = 0;
+    bool actorLightShaderApiResolved_ = false;
     std::chrono::steady_clock::time_point actorLightIdRetryAt_{};
-    std::chrono::steady_clock::time_point actorLightDiagnosticNextAt_{};
     // Per-window pass-execution counters, indexed [pass][camera class]:
     // pass 0=campus-actor-param 1=vl-actor-param 2=actor-shadow 3=other;
     // camera 0=source 1=left 2=right 3=other/none. Printed and reset every
     // ~10 s so a single hardware run shows which passes actually execute in
     // which scene on which cameras.
-    std::array<std::array<std::uint32_t, 4>, 4> passActivityCounts_{};
-    std::chrono::steady_clock::time_point passActivityPrintAt_{};
     bool matcapCompResolved_ = false;
     void* vlActorParameterType_ = nullptr;
     void* campusLitActorType_ = nullptr;
@@ -1144,7 +1069,6 @@ private:
     bool matcapCompSpaceSkipLogged_ = false;
     bool matcapCompGateLogged_ = false;
     bool matcapCompExecLogged_ = false;
-    bool actorLightDiagnosticEnterLogged_ = false;
     // Wall-clock throttle for MATCAP_COMP_APPLIED: the .90 run proved the
     // modulo-based sample (%900) can vanish wholesale, so sample on time.
     std::chrono::steady_clock::time_point matcapCompLogAt_{};
@@ -1152,11 +1076,6 @@ private:
     // {0=Fixed,1=Matcap,2=ShadowLight} decides how the virtual directional
     // light is derived; Matcap uses the camera rotation, matching the user's
     // "projection follows head angle, not position" report.
-    bool actorShadowVolumeResolved_ = false;
-    void* vlActorShadowType_ = nullptr;
-    std::int32_t actorShadowDirectionalTypeOffset_ = -1;
-    std::int32_t actorShadowLightDirectionalOffset_ = -1;
-    std::int32_t volumeParameterVector3ValueOffset_ = -1;
     // cameraData view-matrix patch around DrawActorShadowPass.AddRenderPasses.
     // Offsets are struct-relative (il2cpp field offsets minus the 0x10 boxed
     // header).
@@ -1236,15 +1155,9 @@ private:
     // enumerate live Graphics and log the opaque near-black / near-white
     // ones with class, color, sprite/texture and parent path — the plate
     // signature hunt for the black/white screens.
-    void MaybeRunGripPlateCensus() noexcept;
-    void RunGripPlateCensus(const char* phase) noexcept;
-    void RunGripCameraCensus(const char* phase) noexcept;
     // .257: frozen-frame family census — active RawImages whose texture is
     // a Texture2D (point-in-time snapshot displays, the CaptureUtility
     // family) plus every VLSRPTargetImage with its Target/Captured type.
-    void RunGripSnapshotCensus(const char* phase) noexcept;
-    int gripPlateCensusRuns_ = 0;
-    int gripPlateCensusDelay_ = 0;
     // .236: census-identified backdrop plates hidden while armed. First
     // target: the ADV engine's opaque black "Background" RawImage (the
     // 初星コミュ black); the ADV 3D itself arrives through a "Render
@@ -1372,7 +1285,6 @@ private:
     float lastOutlineWidthScale_ = -1.0F;
     float loggedOutlineWidthScale_ = -1.0F;
     float outlineEyeLoggedW_ = -1.0F;
-    bool outlineMaterialDumpLogged_ = false;
     bool materialGetVectorUsesOutParam_ = false;
     int outlineParamId_ = 0;
     const char* outlineGetVectorName_ = "-";
@@ -1414,14 +1326,6 @@ private:
     MethodRef sceneManagerGetActiveSceneInjected_{};
     bool sceneManagerApiReady_ = false;
     bool sceneIdentityValid_ = false;
-    std::array<
-        LifetimeWriteRecord,
-        static_cast<std::size_t>(LifetimeWriteCategory::Count)>
-        lifetimeWrites_{};
-    std::uint64_t lifetimeWriteSerial_ = 0;
-    std::uint64_t lifetimeSnapshotSerial_ = 0;
-    std::uint64_t observedSceneReadyRevokeSerial_ = 0;
-    std::uint64_t observedSceneReadyReleaseSerial_ = 0;
     bool outlineEmptyDiscoverLogged_ = false;
     bool sceneReadyParked_ = false;
     bool eyeArmHeld_ = false;
@@ -1430,16 +1334,6 @@ private:
     int sceneCount_ = 0;
     int loadedSceneCount_ = 0;
     int activeSceneHandle_ = 0;
-    bool virtualCameraCensusIdentityObserved_ = false;
-    bool virtualCameraCensusPending_ = false;
-    bool virtualCameraCensusApiLogged_ = false;
-    int virtualCameraCensusSceneCount_ = 0;
-    int virtualCameraCensusLoadedSceneCount_ = 0;
-    int virtualCameraCensusActiveSceneHandle_ = 0;
-    std::uint32_t virtualCameraCensusDelayTicks_ = 0;
-    std::uint32_t virtualCameraCensusRunsRemaining_ = 0;
-    std::uint64_t virtualCameraCensusSerial_ = 0;
-    const char* virtualCameraCensusReason_ = "startup";
     const char* eyeArmHoldReason_ = nullptr;
     std::atomic<bool> projectionEquivalentProFlareReady_{false};
     float bloomSourceFovDegrees_ = 29.9F;
@@ -1468,11 +1362,6 @@ private:
     float sourceSensorWidthMillimeters_ = 0.0F;
     float sourceSensorHeightMillimeters_ = 0.0F;
     float lastLoggedSourceFovDegrees_ = 0.0F;
-    UnitySourceCameraStateDiagnostic sourceCameraStateDiagnostic_{};
-    float fovDiagnosticLastProjectionM11_ = 0.0F;
-    float fovDiagnosticLastLookAtDistance_ = 0.0F;
-    std::uint64_t fovDiagnosticLastStateSample_ = 0;
-    std::uint64_t fovDiagnosticLogs_ = 0;
     bool sourcePhysicalProperties_ = false;
     std::uint64_t sourceLensSamples_ = 0;
     std::array<camera::ProjectionMap, 2> sourceToEyeProjectionMaps_{};

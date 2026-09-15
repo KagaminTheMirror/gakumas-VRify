@@ -1,6 +1,5 @@
 #include "OpenXrContext.hpp"
 #include "OpenXrApiLayers.hpp"
-#include "../d3d11/TextureFingerprint.hpp"
 #include "../SceneReadyGate.hpp"
 #include "../VrPhotoShutter.hpp"
 #include "../LivePause.hpp"
@@ -3006,7 +3005,6 @@ bool OpenXrContext::DestroyMirrorSwapchainForRebuild(VrLog& log) {
     mirrorSourceFormat_ = DXGI_FORMAT_UNKNOWN;
     mirrorSwapchainFormat_ = 0;
     ReleasePortraitLatch();
-    endGpuMarker_.Reset();
     hitchReadyLogged_ = false;
     if (sessionContext_ != nullptr) {
         sessionContext_->Release();
@@ -3112,7 +3110,6 @@ bool OpenXrContext::EnsureMirrorLayout(
 
 bool OpenXrContext::RenderMirrorFrame(
     ID3D11Texture2D* sourceFrame,
-    std::uint64_t sourceFrameGeneration,
     const std::array<PointerState, 2>& pointers,
     VrLog& log) {
     if (sourceFrame == nullptr || mirrorSwapchain_ == XR_NULL_HANDLE ||
@@ -3211,27 +3208,7 @@ bool OpenXrContext::RenderMirrorFrame(
         }
     }
     sessionContext_->CopyResource(mirrorImages_[imageIndex].texture, copySource);
-    if (sourceFrameGeneration != lastMirrorFingerprintGeneration_ &&
-        sourceFrameGeneration <= 2U) {
-        lastMirrorFingerprintGeneration_ = sourceFrameGeneration;
-        std::uint64_t fingerprint = 0;
-        const bool sampled = d3d11::ComputeTextureFingerprint(
-            sessionContext_, sourceFrame, 0, fingerprint);
-        std::ostringstream content;
-        content << "[VR][display] MIRROR_SOURCE_FINGERPRINT generation="
-                << sourceFrameGeneration << " value=";
-        if (sampled) {
-            content << "0x" << std::hex << fingerprint << std::dec
-                    << " changed="
-                    << (!mirrorFingerprintValid_ ||
-                        mirrorFingerprint_ != fingerprint);
-            mirrorFingerprint_ = fingerprint;
-            mirrorFingerprintValid_ = true;
-        } else {
-            content << "unavailable";
-        }
-        log.Write(content.str());
-    }
+
     OverlayPointerCursors(mirrorImages_[imageIndex].texture, pointers);
 
     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -3704,34 +3681,7 @@ bool OpenXrContext::RenderProjectionFrame(
                 projectionVerticalFlip_.ViewFormat())));
     }
     flipScope.Stop();
-    if (stereoFrame.generation != lastProjectionFingerprintGeneration_ &&
-        stereoFrame.generation <= 2U) {
-        lastProjectionFingerprintGeneration_ = stereoFrame.generation;
-        std::array<std::uint64_t, 2> fingerprints{};
-        std::array<bool, 2> sampled{};
-        for (UINT eye = 0; eye < 2; ++eye) {
-            sampled[eye] = d3d11::ComputeTextureFingerprint(
-                sessionContext_, destination, D3D11CalcSubresource(0, eye, 1),
-                fingerprints[eye]);
-        }
-        std::ostringstream content;
-        content << "[VR][stereo] PROJECTION_DESTINATION_FINGERPRINT generation="
-                << stereoFrame.generation;
-        for (std::size_t eye = 0; eye < fingerprints.size(); ++eye) {
-            content << ' ' << (eye == 0U ? "left=" : "right=");
-            if (sampled[eye]) {
-                content << "0x" << std::hex << fingerprints[eye] << std::dec
-                        << " changed="
-                        << (!projectionFingerprintValid_[eye] ||
-                            projectionFingerprints_[eye] != fingerprints[eye]);
-                projectionFingerprints_[eye] = fingerprints[eye];
-                projectionFingerprintValid_[eye] = true;
-            } else {
-                content << "unavailable";
-            }
-        }
-        log.Write(content.str());
-    }
+
     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     lastResult_ = dispatch_.ReleaseSwapchainImage()(projectionSwapchain_, &releaseInfo);
     if (XR_FAILED(lastResult_)) {
@@ -4111,10 +4061,6 @@ void OpenXrContext::ResetMirrorSwapchain() noexcept {
     mirrorLayoutGeneration_ = 0;
     mirrorSourceFormat_ = DXGI_FORMAT_UNKNOWN;
     mirrorSwapchainFormat_ = 0;
-    lastMirrorFingerprintGeneration_ = 0;
-    mirrorFingerprint_ = 0;
-    mirrorFingerprintValid_ = false;
-    endGpuMarker_.Reset();
     hitchReadyLogged_ = false;
     if (sessionContext_ != nullptr) {
         sessionContext_->Release();
@@ -4132,9 +4078,6 @@ void OpenXrContext::ResetProjectionSwapchain() noexcept {
     projectionSwapchain_ = XR_NULL_HANDLE;
     projectionSwapchainFormat_ = 0;
     projectionSourceDescription_ = {};
-    lastProjectionFingerprintGeneration_ = 0;
-    projectionFingerprints_.fill(0);
-    projectionFingerprintValid_.fill(false);
     lastSubmittedStereoGeneration_ = 0;
     lastSubmittedStereoTrackingSample_ = {};
     lastSubmittedStereoHostPublishTimeNanoseconds_ = 0;

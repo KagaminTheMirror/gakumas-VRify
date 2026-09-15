@@ -2,8 +2,7 @@
 #include "GripBlurDiscoverPolicy.hpp"
 #include "GripFullscreenBlurClassifier.hpp"
 #include "GripBlurTextureWrite.hpp"
-#include "GripTraceFieldReader.hpp"
-#include "SrpPerformanceTrace.hpp"
+#include "UnityInstanceFieldReader.hpp"
 #include "UnityStereoRenderer.hpp"
 #include "VrRuntime.hpp"
 #include "config/VrifyConfig.hpp"
@@ -43,7 +42,7 @@ thread_local void* cachedDefault = nullptr;
 thread_local unsigned submitLogs = 0;
 thread_local unsigned readbackFailures = 0;
 thread_local unsigned long long submitCalls = 0, blurSubmits = 0, fullscreenSubmits = 0;
-thread_local unsigned long long nextSubmitCensus = 0;
+thread_local unsigned long long nextSubmitHealth = 0;
 Method *alive{}, *findObjects{}, *active{}, *getGraphic{}, *rectTransform{}, *getCanvas{};
 Method *rootCanvas{}, *getTransform{}, *getRect{}, *transformPoint{}, *inversePoint{};
 Method *getParent{}, *getComponent{}, *getRenderer{}, *materialCount{}, *getMaterial{};
@@ -146,7 +145,6 @@ bool Assignable(Class* klass, void* object) {
         UnityResolve::Invoke<bool>("il2cpp_class_is_assignable_from", klass->address, actual);
 }
 std::vector<void*> Objects(Class* klass) {
-    perf::SrpSpan span(perf::srpPerformance, "mod.blur-discover");
     if (!klass || !findObjects) return {};
     void* type = klass->GetType(); void* args[]{type}; void* array = nullptr;
     if (!type || !Invoke(findObjects, nullptr, args, &array) || !array) return {};
@@ -320,7 +318,6 @@ void RestoreAll(const char* reason) {
     if (count) { restores += count; Log("RESTORE count=" + std::to_string(count) + " reason=" + reason); }
 }
 bool ApplySelective(void* pass) {
-    perf::SrpSpan span(perf::srpPerformance, "mod.blur-selective");
     void* fallback = DefaultTexture(pass);
     if (!fallback) return false;
     if (Target(cachedDefault) != fallback) {
@@ -371,10 +368,8 @@ bool ApplySelective(void* pass) {
 }
 void DrawBlurHook(void* self, void* cmd, void* cameraData, void* method) {
     {
-        perf::SrpSpan span(perf::srpPerformance, "ui.draw-blur-original");
         original(self, cmd, cameraData, method);
     }
-    perf::SrpSpan span(perf::srpPerformance, "mod.blur-postfix");
     if (!installed.load(std::memory_order_acquire) || scopedPass != self || !self ||
         !GakumasLocal::Config::vrRuntimeStartupEnabled) return;
     try {
@@ -387,7 +382,6 @@ void DrawBlurHook(void* self, void* cmd, void* cameraData, void* method) {
 // (including all modifiers), then calls this exact SetMaterial overload.
 // Patch its argument BEFORE native submission, including pre-Execute rebuilds.
 void SubmitMaterialHook(void* self, void* material, int index, void* method) {
-    perf::SrpSpan span(perf::srpPerformance, "mod.blur-submit-material");
     try {
         if (installed.load(std::memory_order_acquire) &&
             GakumasLocal::Config::vrRuntimeStartupEnabled) {
@@ -404,9 +398,9 @@ void SubmitMaterialHook(void* self, void* material, int index, void* method) {
                 if (hasBlur) ++blurSubmits;
                 if (fullscreen) ++fullscreenSubmits;
                 const auto now = GetTickCount64();
-                if (now >= nextSubmitCensus) {
-                    nextSubmitCensus = now + 5000;
-                    Log("SUBMIT_CENSUS calls=" + std::to_string(submitCalls) +
+                if (now >= nextSubmitHealth) {
+                    nextSubmitHealth = now + 5000;
+                    Log("SUBMIT_HEALTH calls=" + std::to_string(submitCalls) +
                         " blur=" + std::to_string(blurSubmits) +
                         " fullscreen=" + std::to_string(fullscreenSubmits));
                 }
@@ -431,7 +425,6 @@ void SubmitMaterialHook(void* self, void* material, int index, void* method) {
             }
         }
     } catch (...) { ++skips; Log("SKIP reason=material-submit-exception original-global-and-local-retained"); }
-    span.Stop();
     originalSubmitMaterial(self, material, index, method);
 }
 } // namespace
@@ -443,7 +436,6 @@ void InvalidateGripBlurDiscover(const char* reason) noexcept {
 
 GripBlurSourceScope::GripBlurSourceScope(void* pass, bool allowed) noexcept
     : previous_(std::exchange(scopedPass, allowed ? pass : nullptr)) {
-    perf::SrpSpan span(perf::srpPerformance, "mod.blur-scope-enter");
     if (!allowed && !owned.empty()) {
         try { RestoreAll("scope-not-authorized"); }
         catch (...) { Log("RESTORE_SKIP reason=exception"); }

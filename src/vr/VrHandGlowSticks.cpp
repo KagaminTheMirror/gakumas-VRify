@@ -301,7 +301,6 @@ struct GlowState {
     int stickySlot = -1;
     int stickySubmesh = -1;
     int liveShapeCount = 1;
-    bool mobShapeCensusLogged = false;
     std::vector<MobSource> mobSources{};
     bool useColorProjection = false;
     void* penlightController = nullptr;
@@ -340,7 +339,6 @@ struct GlowState {
     bool crowdDrawActive = false;
     std::uint32_t lastCrowdDrawTick = 0;
     std::uint32_t crowdDrawFailureTick = 0;
-    ULONGLONG lastCrowdColorProbeMs = 0;
 };
 
 GlowState g_state;
@@ -2335,55 +2333,7 @@ bool SetMpbVector(
         g_state.api.mpbSetVectorInjected, block, arguments, &ignored);
 }
 
-void LogShaderProperties(void* material) noexcept {
-    if (material == nullptr || !g_state.api.getPropertyCount.Ready() ||
-        !g_state.api.getPropertyName.Ready()) {
-        return;
-    }
-    void* shader = GetShader(material);
-    if (shader == nullptr) {
-        return;
-    }
-    using CountFn = std::int32_t (*)(void*, void*);
-    std::int32_t count = 0;
-    if (!InvokeManagedResult<std::int32_t, CountFn>(
-            g_state.api.getPropertyCount, &count, shader) ||
-        count <= 0) {
-        return;
-    }
-    const int colorId = PenlightColorId();
-    const int logged = (std::min)(count, 32);
-    auto line = ClassicLine();
-    line << "[VR][stereo] HAND_GLOW list kind=shader"
-         << " n=" << count << " id=" << colorId
-         << " has=" << (HasMaterialProperty(material, colorId) ? 1 : 0);
-    UnityColor official(0.0F, 0.0F, 0.0F, 0.0F);
-    if (GetMaterialColor(material, colorId, &official)) {
-        line << " official=" << official.r << "," << official.g << ","
-             << official.b << "," << official.a;
-    }
-    for (int i = 0; i < logged; ++i) {
-        using NameFn = void* (*)(void*, std::int32_t, void*);
-        void* nameObject = nullptr;
-        if (!InvokeManagedResult<void*, NameFn>(
-                g_state.api.getPropertyName, &nameObject, shader, i) ||
-            nameObject == nullptr) {
-            continue;
-        }
-        const std::string name = ManagedIl2CppString(nameObject);
-        if (name.empty()) {
-            continue;
-        }
-        const int id = ShaderPropertyToID(name.c_str());
-        UnityColor color(0.0F, 0.0F, 0.0F, 0.0F);
-        const bool got = GetMaterialColor(material, id, &color);
-        line << " p" << i << "=" << name << "@" << id;
-        if (got && ColorLuma(color) > 0.01F) {
-            line << ":" << color.r << "," << color.g << "," << color.b;
-        }
-    }
-    LogHandGlow(line.str());
-}
+
 
 bool ReadRendererMpbColor(void* renderer, UnityColor* color) noexcept {
     if (renderer == nullptr || color == nullptr || !EnsurePropertyBlock() ||
@@ -3410,7 +3360,6 @@ void ClearAudienceColors(const char* reason) noexcept {
     g_state.stickySlot = -1;
     g_state.stickySubmesh = -1;
     g_state.liveShapeCount = 1;
-    g_state.mobShapeCensusLogged = false;
     g_state.stickyColor = UnityColor(0.0F, 0.0F, 0.0F, 0.0F);
     g_state.paletteReady = false;
 }
@@ -3651,7 +3600,6 @@ void ClearOfficialAssets() noexcept {
     g_state.stickySlot = -1;
     g_state.stickySubmesh = -1;
     g_state.liveShapeCount = 1;
-    g_state.mobShapeCensusLogged = false;
     g_state.paletteReady = false;
     g_state.penlightController = nullptr;
     g_state.registeredSetting = nullptr;
@@ -3699,206 +3647,11 @@ void* ApplyDrawableAssets(
     return renderer;
 }
 
-void AuditMobPenlightMeshes() noexcept {
-    if (g_state.mobShapeCensusLogged || !EnsureApi()) {
-        return;
-    }
-    g_state.mobShapeCensusLogged = true;
-    auto* controllerClass = FindCampusClass(
-        "Campus.MobAudience", "MobAudiencePenlightController");
-    if (controllerClass == nullptr) {
-        LogHandGlow("[VR][stereo] HAND_GLOW mob-shape census controllers=0");
-        return;
-    }
-    const auto controllers = FindAllOfClass(controllerClass);
-    int liveControllers = 0;
-    int listed = 0;
-    for (void* controller : controllers) {
-        if (controller == nullptr || !IsUnityManagedObjectAlive(controller)) {
-            continue;
-        }
-        ++liveControllers;
-        void* settings = ReadNamedRef(controller, "penlightSettings");
-        if (settings == nullptr) {
-            continue;
-        }
-        auto settingItems =
-            reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(settings)
-                ->ToVector();
-        for (void* setting : settingItems) {
-            if (setting == nullptr || listed >= 8) {
-                continue;
-            }
-            void* renderers = ReadNamedRef(setting, "PenlightRenderers");
-            if (renderers == nullptr) {
-                continue;
-            }
-            auto rendererItems =
-                reinterpret_cast<UnityResolve::UnityType::Array<void*>*>(
-                    renderers)
-                    ->ToVector();
-            for (void* renderer : rendererItems) {
-                if (renderer == nullptr ||
-                    !IsUnityManagedObjectAlive(renderer) || listed >= 8) {
-                    continue;
-                }
-                void* sourceObject = GetGameObject(renderer);
-                void* filter = GetComponent(
-                    sourceObject, g_state.api.meshFilterClass);
-                void* mesh = GetSharedMesh(filter);
-                void* material = GetSharedMaterial(renderer);
-                UnityVector3 meshSize{};
-                if (mesh != nullptr && IsUnityManagedObjectAlive(mesh)) {
-                    static_cast<void>(GetMeshSize(mesh, &meshSize));
-                }
-                auto line = ClassicLine();
-                line << "[VR][stereo] HAND_GLOW mob-shape mesh="
-                     << ManagedObjectName(mesh)
-                     << " size=" << meshSize.x << "," << meshSize.y << ","
-                     << meshSize.z
-                     << " shader="
-                     << ManagedObjectName(GetShader(material));
-                LogHandGlow(line.str());
-                ++listed;
-            }
-        }
-    }
-    auto summary = ClassicLine();
-    summary << "[VR][stereo] HAND_GLOW mob-shape census controllers="
-            << liveControllers << " listed=" << listed;
-    LogHandGlow(summary.str());
-}
 
-bool CrowdAuditAlreadySeen(void* crowdSystem, void* penlightSystem) noexcept {
-    const auto pair = std::make_pair(crowdSystem, penlightSystem);
-    if (std::find(
-            g_state.crowdAuditPairs.begin(),
-            g_state.crowdAuditPairs.end(), pair) !=
-        g_state.crowdAuditPairs.end()) {
-        return true;
-    }
-    if (g_state.crowdAuditPairs.size() >= 32U) {
-        g_state.crowdAuditPairs.clear();
-    }
-    g_state.crowdAuditPairs.push_back(pair);
-    return false;
-}
 
-void AuditCrowdRenderSystem(void* crowdSystem, int eventType) noexcept {
-    // CrowdSystem.EventType.GBuffer == 1. Audit one complete draw path per
-    // live system, after the game has populated counters and parameters.
-    if (crowdSystem == nullptr || eventType != 1) {
-        return;
-    }
-    void* penlightSystem =
-        ReadNamedRef(crowdSystem, "_penlightMeshRenderSystem");
-    if (CrowdAuditAlreadySeen(crowdSystem, penlightSystem)) {
-        return;
-    }
 
-    static_cast<void>(EnsureApi());
-    void* crowdVolume = ReadNamedRef(crowdSystem, "_crowdVolume");
-    void* crowdData = ReadNamedRef(crowdVolume, "crowdData");
-    void* people = ReadNamedRef(crowdData, "personInfos");
-    void* crowdSystemData =
-        ReadNamedRef(crowdSystem, "_crowdSystemData");
-    void* personBytes =
-        ReadNamedRef(crowdSystemData, "_personInfoBytesBuffer");
-    void* crowdMeshSystem =
-        ReadNamedRef(crowdSystem, "_crowdMeshRenderSystem");
-    void* handMatrices = ReadNamedRef(crowdMeshSystem, "_handMatrices");
 
-    void* meshData = ReadNamedRef(penlightSystem, "_meshData");
-    void* sourceMesh = ReadNamedRef(meshData, "mesh");
-    void* renderMesh = ReadNamedRef(penlightSystem, "_mesh");
-    void* subMeshes = ReadNamedRef(meshData, "subMeshes");
-    const int subMeshCount =
-        ReadNamedInt(penlightSystem, "_subMeshCount");
-    void* indirectArgs =
-        ReadNamedRef(penlightSystem, "_indirectArgsBuffer");
-    void* instanceBufferArray =
-        ReadNamedRef(penlightSystem, "_penlightInfoBytesBuffers");
 
-    void* audienceVolume =
-        ReadNamedRef(crowdSystem, "_audiencePenlightVolume");
-    void* audience = ReadNamedRef(audienceVolume, "_audiencePenlight");
-    if (audience == nullptr) {
-        audience = ReadNamedRef(crowdSystem, "_defaultAudiencePenlight");
-    }
-    void* colorTable =
-        ReadNamedRef(audience, "<ColorTable>k__BackingField");
-
-    UnityVector3 sourceSize{};
-    UnityVector3 renderSize{};
-    if (sourceMesh != nullptr && IsUnityManagedObjectAlive(sourceMesh)) {
-        static_cast<void>(GetMeshSize(sourceMesh, &sourceSize));
-    }
-    if (renderMesh != nullptr && IsUnityManagedObjectAlive(renderMesh)) {
-        static_cast<void>(GetMeshSize(renderMesh, &renderSize));
-    }
-
-    auto header = ClassicLine();
-    header << "[VR][stereo] HAND_GLOW crowd audit"
-           << " ownership=read-only"
-           << " event=GBuffer"
-           << " system=" << crowdSystem
-           << " penlightSystem=" << penlightSystem
-           << " volume=" << ManagedObjectName(crowdVolume)
-           << " people=" << ManagedArrayLength(people)
-           << " sourceMesh=" << ManagedObjectName(sourceMesh)
-           << " sourceSize=" << sourceSize.x << "," << sourceSize.y << ","
-           << sourceSize.z
-           << " renderMesh=" << ManagedObjectName(renderMesh)
-           << " renderSize=" << renderSize.x << "," << renderSize.y << ","
-           << renderSize.z
-           << " subMeshes=" << subMeshCount
-           << " handMatrices=" << ManagedArrayLength(handMatrices)
-           << " audience=" << ManagedClassName(audience)
-           << " colors=" << ManagedArrayLength(colorTable)
-           << " passes=predepth:2,gbuffer:1";
-    AppendBufferDescriptor(header, "personBytes", personBytes);
-    AppendBufferDescriptor(header, "indirectArgs", indirectArgs);
-    LogHandGlow(header.str());
-
-    std::vector<void*> subMeshItems{};
-    if (subMeshes != nullptr) {
-        subMeshItems = reinterpret_cast<
-            UnityResolve::UnityType::Array<void*>*>(subMeshes)->ToVector();
-    }
-    std::vector<void*> instanceBuffers{};
-    if (instanceBufferArray != nullptr) {
-        instanceBuffers = reinterpret_cast<
-            UnityResolve::UnityType::Array<void*>*>(instanceBufferArray)
-                              ->ToVector();
-    }
-    const std::size_t count =
-        std::max(subMeshItems.size(), instanceBuffers.size());
-    for (std::size_t index = 0; index < count; ++index) {
-        void* subMesh = index < subMeshItems.size()
-            ? subMeshItems[index]
-            : nullptr;
-        void* material = ReadNamedRef(subMesh, "material");
-        void* shader = material != nullptr &&
-                IsUnityManagedObjectAlive(material)
-            ? GetShader(material)
-            : nullptr;
-        auto line = ClassicLine();
-        line << "[VR][stereo] HAND_GLOW crowd submesh=" << index
-             << " penlightType=" << (index + 1U)
-             << " indexCount=" << ReadNamedInt(subMesh, "indexCount")
-             << " indexStart=" << ReadNamedInt(subMesh, "indexStart")
-             << " vertexStart=" << ReadNamedInt(subMesh, "vertexStart")
-             << " vertexCount=" << ReadNamedInt(subMesh, "vertexCount")
-             << " material=" << ManagedObjectName(material)
-             << " shader=" << ManagedObjectName(shader)
-             << " argsOffset=" << (index * 20U);
-        AppendBufferDescriptor(
-            line, "instances",
-            index < instanceBuffers.size() ? instanceBuffers[index] : nullptr);
-        LogHandGlow(line.str());
-    }
-    AuditMobPenlightMeshes();
-}
 
 bool CrowdGraphicsBufferValid(void* buffer) noexcept {
     if (buffer == nullptr ||
@@ -4616,44 +4369,7 @@ void DrawControllerSticksThroughCrowd(
     }
     const bool firstDraw =
         !CrowdDrawAlreadySeen(crowdSystem, renderMesh, eventType);
-    const ULONGLONG probeNow = GetTickCount64();
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled &&
-        eventType == 1 &&
-        (firstDraw || probeNow - g_state.lastCrowdColorProbeMs >= 2000U)) {
-        g_state.lastCrowdColorProbeMs = probeNow;
-        void* volume = ReadNamedRef(crowdSystem, "_audiencePenlightVolume");
-        void* audience = ReadNamedRef(volume, "_audiencePenlight");
-        if (audience == nullptr) {
-            audience = ReadNamedRef(crowdSystem, "_defaultAudiencePenlight");
-        }
-        auto probe = ClassicLine();
-        probe << "[VR][stereo] HAND_GLOW color-probe system=" << crowdSystem
-              << " audience=" << audience
-              << " audienceType=" << ManagedClassName(audience)
-              << " selected=" << g_state.colorTableInstance
-              << " selectedType=" << ManagedClassName(g_state.colorTableInstance)
-              << " sameSource=" << (audience == g_state.colorTableInstance)
-              << " slot=" << colorSlot
-              << " shape=" << selected
-              << " type=" << penlightType
-              << " unique=" << g_state.uniqueColors.size()
-              << " intensity=" << intensity;
-        // Persist the resolved live entry alongside the values. This is a
-        // diagnostic observation of the existing getter, not a new callable.
-        auto* getter = FindNamedInstance(
-            g_state.colorTableClass, "get_ColorTable", 0U);
-        if (getter != nullptr) {
-            probe << " getter=" << getter->name
-                  << " function=" << getter->function
-                  << " methodInfo=" << getter->address;
-        }
-        for (unsigned int i = 0; i < 8U; ++i) {
-            const auto& value = colors->At(i);
-            probe << " uploaded" << i << "=" << value.x << ","
-                  << value.y << "," << value.z << "," << value.w;
-        }
-        LogHandGlow(probe.str());
-    }
+
     if (firstDraw) {
         auto line = ClassicLine();
         line << "[VR][stereo] HAND_GLOW crowd draw ownership=mod"
@@ -5142,8 +4858,6 @@ bool TryDiscoverMobPenlight(bool logList) noexcept {
     }
     g_state.meshSize = crowdSize;
     if (logList || !hadAssets) {
-        LogShaderProperties(g_state.officialBaseMaterial);
-        LogShaderProperties(g_state.officialMaterial);
         auto line = ClassicLine();
         line << "[VR][stereo] HAND_GLOW discover source=mob"
              << " pick=" << best.shader
@@ -5596,9 +5310,7 @@ void AfterOfficialCrowdRender(
     if (!GakumasLocal::Config::vrRuntimeStartupEnabled) {
         return;
     }
-    if (GakumasLocal::Config::vrDiagnosticsStartupEnabled) {
-        AuditCrowdRenderSystem(crowdSystem, eventType);
-    }
+
     DrawControllerSticksThroughCrowd(
         crowdSystem, commandBuffer, eventType);
 }

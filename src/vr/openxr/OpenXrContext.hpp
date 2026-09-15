@@ -400,7 +400,6 @@ private:
         VrLog& log);
     bool RenderMirrorFrame(
         ID3D11Texture2D* sourceFrame,
-        std::uint64_t sourceFrameGeneration,
         const std::array<PointerState, 2>& pointers,
         VrLog& log);
     void OverlayPointerCursors(
@@ -690,12 +689,6 @@ private:
     std::int64_t projectionSwapchainFormat_ = 0;
     D3D11_TEXTURE2D_DESC projectionSourceDescription_{};
     std::vector<XrSwapchainImageD3D11KHR> projectionImages_;
-    std::uint64_t lastMirrorFingerprintGeneration_ = 0;
-    std::uint64_t mirrorFingerprint_ = 0;
-    bool mirrorFingerprintValid_ = false;
-    std::uint64_t lastProjectionFingerprintGeneration_ = 0;
-    std::array<std::uint64_t, 2> projectionFingerprints_{};
-    std::array<bool, 2> projectionFingerprintValid_{};
     std::uint64_t lastSubmittedStereoGeneration_ = 0;
     pose::StereoPoseSample lastSubmittedStereoTrackingSample_{};
     std::int64_t lastSubmittedStereoHostPublishTimeNanoseconds_ = 0;
@@ -706,7 +699,6 @@ private:
     d3d11::VerticalFlipPass projectionVerticalFlip_;
     ID3D11DeviceContext* sessionContext_ = nullptr;
     ID3D11Device* sessionDevice_ = nullptr;
-    perf::EndGpuMarker endGpuMarker_;
     bool hitchReadyLogged_ = false;
     std::atomic<XrResult> lastResult_{XR_SUCCESS};
 };

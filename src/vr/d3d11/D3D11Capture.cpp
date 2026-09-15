@@ -1,5 +1,4 @@
 #include "D3D11Capture.hpp"
-#include "../GripTransparencyTrace.hpp"
 #include "../PerformanceTiming.hpp"
 #include "../PerformanceProbe.hpp"
 #include "../frame/FrameLoopDriver.hpp"
@@ -209,6 +208,8 @@ bool D3D11Capture::InstallPresentFallback(HMODULE d3d11Module, const HookRegistr
     if (!CreateBootstrapSwapChain(d3d11Module, &bootstrapSwapChain) || bootstrapSwapChain == nullptr) {
         return false;
     }
+
+
 
     void** swapChainVtable = *reinterpret_cast<void***>(bootstrapSwapChain);
     if (swapChainVtable != nullptr) {
@@ -447,6 +448,8 @@ HRESULT STDMETHODCALLTYPE D3D11Capture::Present1Detour(
     return result;
 }
 
+
+
 void D3D11Capture::CaptureUnitySwapChain(IDXGISwapChain* swapChain) noexcept {
     if (swapChain == nullptr) {
         return;
@@ -561,10 +564,10 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
             return;
         }
 
+
         if (capturedFrame_ != nullptr &&
             IsSameFrameLayout(capturedFrameDescription_, sourceDescription)) {
             VR_PERF_SCOPE(trace, "present.grip-trace", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
-        GripTracePresent(capturedContext_, backBuffer);
             trace.Stop();
             ResetFrameCandidateLocked();
             VR_PERF_SCOPE(copy, "present.copy-resource", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
@@ -608,7 +611,6 @@ void D3D11Capture::CaptureUnityFrame(IDXGISwapChain* swapChain) noexcept {
             }
         }
         VR_PERF_SCOPE(probe, "present.transparency-probe", [](std::string_view line) noexcept { (void)WriteVrLog(line); });
-        MaybeRunTransparencyProbeLocked(backBuffer, sourceDescription);
     }
     backBuffer->Release();
     if (layoutPublished) {
@@ -698,26 +700,10 @@ void D3D11Capture::SetTransparentBackbufferClear(bool enabled) noexcept {
     if (enabled && !was) {
         transparentClearCount_.store(0, std::memory_order_relaxed);
         transparentClearLastError_.store(0, std::memory_order_relaxed);
-        // ~2s at 60fps: late enough for the game-thread camera clear
-        // override to land, so the probe records the steady state.
-        transparencyProbeCountdown_.store(120, std::memory_order_release);
-    } else if (!enabled && was) {
-        transparencyProbeCountdown_.store(-1, std::memory_order_release);
     }
 }
 
-bool D3D11Capture::ConsumeTransparencyProbe(TransparencyProbe* probe) noexcept {
-    if (probe == nullptr) {
-        return false;
-    }
-    std::lock_guard lock(captureMutex_);
-    if (!transparencyProbeReady_) {
-        return false;
-    }
-    *probe = transparencyProbe_;
-    transparencyProbeReady_ = false;
-    return true;
-}
+
 
 namespace {
 
@@ -901,81 +887,7 @@ bool D3D11Capture::ConsumeClearTargetReport(
     return true;
 }
 
-void D3D11Capture::MaybeRunTransparencyProbeLocked(
-    ID3D11Texture2D* backBuffer,
-    const D3D11_TEXTURE2D_DESC& description) noexcept {
-    // Caller holds captureMutex_ on Unity's Present thread, so
-    // capturedDevice_ / capturedContext_ are valid and single-threaded here.
-    if (!transparentBackbufferClear_.load(std::memory_order_acquire)) {
-        return;
-    }
-    const std::int32_t countdown =
-        transparencyProbeCountdown_.load(std::memory_order_acquire);
-    if (countdown < 0) {
-        return;
-    }
-    if (countdown > 0) {
-        transparencyProbeCountdown_.store(
-            countdown - 1, std::memory_order_release);
-        return;
-    }
-    transparencyProbeCountdown_.store(-1, std::memory_order_release);
-    TransparencyProbe probe{};
-    probe.clearCount =
-        transparentClearCount_.load(std::memory_order_relaxed);
-    probe.lastClearError =
-        transparentClearLastError_.load(std::memory_order_relaxed);
-    probe.format = static_cast<std::uint32_t>(description.Format);
-    probe.width = description.Width;
-    probe.height = description.Height;
-    D3D11_TEXTURE2D_DESC stagingDescription{};
-    stagingDescription.Width = 1;
-    stagingDescription.Height = 1;
-    stagingDescription.MipLevels = 1;
-    stagingDescription.ArraySize = 1;
-    stagingDescription.Format = description.Format;
-    stagingDescription.SampleDesc.Count = 1;
-    stagingDescription.Usage = D3D11_USAGE_STAGING;
-    stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D* staging = nullptr;
-    const HRESULT createResult =
-        capturedDevice_->CreateTexture2D(&stagingDescription, nullptr, &staging);
-    if (FAILED(createResult) || staging == nullptr) {
-        probe.sampleError = static_cast<std::uint32_t>(createResult);
-    } else {
-        const std::uint32_t width = description.Width;
-        const std::uint32_t height = description.Height;
-        const std::uint32_t xs[4] = {
-            8U, width > 9U ? width - 9U : 0U, width / 2U, 8U};
-        const std::uint32_t ys[4] = {
-            8U, 8U, height / 2U, height > 9U ? height - 9U : 0U};
-        for (std::size_t index = 0; index < probe.pixels.size(); ++index) {
-            D3D11_BOX box{};
-            box.left = xs[index];
-            box.right = xs[index] + 1U;
-            box.top = ys[index];
-            box.bottom = ys[index] + 1U;
-            box.front = 0;
-            box.back = 1;
-            capturedContext_->CopySubresourceRegion(
-                staging, 0, 0, 0, 0, backBuffer, 0, &box);
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            const HRESULT mapResult =
-                capturedContext_->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-            if (SUCCEEDED(mapResult) && mapped.pData != nullptr) {
-                std::uint32_t value = 0;
-                std::memcpy(&value, mapped.pData, sizeof(value));
-                probe.pixels[index] = value;
-                capturedContext_->Unmap(staging, 0);
-            } else {
-                probe.sampleError = static_cast<std::uint32_t>(mapResult);
-            }
-        }
-        staging->Release();
-    }
-    transparencyProbe_ = probe;
-    transparencyProbeReady_ = true;
-}
+
 
 bool D3D11Capture::IsSameFrameLayout(
     const D3D11_TEXTURE2D_DESC& left,

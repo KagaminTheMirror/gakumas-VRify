@@ -3,12 +3,11 @@
 #include "StereoGpuPublish.hpp"
 #include "PerformanceProbe.hpp"
 #include "VrVersion.hpp"
-#include "GripTransparencyTrace.hpp"
 #include "VrAaMenu.hpp"
 #include "VrFreeCamera.hpp"
 #include "frame/FrameLoopDriver.hpp"
 #include "frame/SingleFrameLoopContracts.hpp"
-#include "input/ScrollInputDiagnostics.hpp"
+#include "input/UnityAnalogScroll.hpp"
 #include "input/UnityPointerInput.hpp"
 #include "config/VrifyConfig.hpp"
 
@@ -1135,7 +1134,6 @@ void VrRuntime::WorkerMainImpl() {
             }
             openxr::OpenXrContext::EventResult eventResult =
                 sessionEventSnapshot_.load(std::memory_order_acquire);
-            PumpGripTraceOutput();
             if (eventResult == openxr::OpenXrContext::EventResult::SessionExiting) {
                 confirmedMirrorLayout_.store(0, std::memory_order_release);
                 if (restartGraphicsSession && !graphicsRestartExitRequested) {
@@ -1979,7 +1977,12 @@ bool VrRuntime::PublishUnityStereoFrame(
     ID3D11Texture2D* right,
     const pose::StereoPoseSample& trackingSample,
     d3d11::StereoRenderMailbox::PublishDiagnostics* diagnostics) noexcept {
-    if (!config_.stereoProjectionEnabled || State() != VrRuntimeState::PoseReady) {
+    const auto publishState = State();
+    if (!config_.stereoProjectionEnabled || publishState != VrRuntimeState::PoseReady) {
+        if (config_.diagnosticsEnabled) {
+            log_.Write(std::string("[VR][runtime] MAILBOX_RUNTIME_REJECTED state=") +
+                VrRuntimeStateName(publishState) + " stereo=" + std::to_string(config_.stereoProjectionEnabled));
+        }
         return false;
     }
     return stereoRenderMailbox_.Publish(left, right, trackingSample, diagnostics);

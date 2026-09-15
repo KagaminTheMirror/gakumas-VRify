@@ -11,12 +11,5 @@ void ObserveSmaaT2xRenderPass(
     void* renderingData,
     int renderPassEvent,
     UnityStereoRenderer& renderer) noexcept;
-void NoteBeginEyeSky(void* camera) noexcept;
-void ResetSkyTaaSamples() noexcept;
-void LogTaaForensics(
-    void* camera,
-    void* additionalData,
-    const char* role,
-    bool suppressed) noexcept;
 
 } // namespace gakumas::vr

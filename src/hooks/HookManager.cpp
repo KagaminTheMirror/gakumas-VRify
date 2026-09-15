@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 namespace {
     std::mutex g_hookManagerMutex;
@@ -11,6 +12,50 @@ namespace {
 }
 
 namespace GakumasVR::Hooks {
+    bool CreateAndEnableBatch(const Request* requests, std::size_t count) {
+        std::scoped_lock lock(g_hookManagerMutex);
+        if (!g_hookManagerInitialized.load(std::memory_order_acquire)) return false;
+        if (count == 0) return true;
+        if (!requests) return false;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!requests[i].target || !requests[i].detour || !requests[i].original) return false;
+            *requests[i].original = nullptr;
+        }
+        std::vector<void*> created;
+        created.reserve(count);
+        const auto rollback = [&] {
+            for (std::size_t i = 0; i < created.size(); ++i) {
+                const auto status = MH_RemoveHook(created[i]);
+                if (status == MH_OK) *requests[i].original = nullptr;
+                else GakumasLocal::Log::ErrorFmt("Hook batch rollback failed: %s", MH_StatusToString(status));
+            }
+        };
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& r = requests[i];
+            const auto status = MH_CreateHook(r.target, r.detour, r.original);
+            if (status != MH_OK) {
+                GakumasLocal::Log::ErrorFmt("Hook batch create failed (%s): %s", r.name, MH_StatusToString(status));
+                rollback();
+                return false;
+            }
+            created.push_back(r.target);
+        }
+        // All trampolines exist before any detour can run. MinHook freezes the
+        // process threads once for ApplyQueued, rather than once per hook.
+        for (void* target : created) {
+            if (MH_QueueEnableHook(target) != MH_OK) {
+                rollback();
+                return false;
+            }
+        }
+        const auto status = MH_ApplyQueued();
+        if (status != MH_OK) {
+            // ApplyQueued may have enabled a prefix. Keep its trampolines alive;
+            // the caller disables collection, and installed detours pass through.
+            GakumasLocal::Log::ErrorFmt("Hook batch enable failed: %s", MH_StatusToString(status));
+        }
+        return status == MH_OK;
+    }
     bool Initialize() {
         std::scoped_lock lock(g_hookManagerMutex);
         if (g_hookManagerInitialized.load(std::memory_order_acquire)) {
