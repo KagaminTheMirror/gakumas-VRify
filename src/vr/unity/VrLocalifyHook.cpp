@@ -185,6 +185,11 @@ namespace GakumasLocal::HookMain {
     std::unordered_map<void*, UnityCameraDiagnosticRecord> unityCameraDiagnosticRecords{};
     std::mutex vrCameraStateMutex{};
     void* vrSourceCamera = nullptr;
+    std::atomic<std::uint64_t> sourceAdmissionMainCalls = 0;
+    std::atomic<std::uint64_t> sourceAdmissionMainNonNull = 0;
+    std::atomic<void*> sourceAdmissionLastMain = nullptr;
+    std::atomic<void*> sourceCameraMainMethod = nullptr;
+    thread_local bool sourceCameraQueryActive = false;
     std::uint64_t unityCameraRenderCallbacks = 0;
     std::atomic<std::uint64_t> cinemachinePoseSamples = 0;
     std::atomic<std::uint64_t> cinemachineInvalidPoseSamples = 0;
@@ -1682,6 +1687,45 @@ namespace GakumasLocal::HookMain {
         }
     }
 
+    bool InvokeSourceCameraMain(void* method, void** result, void** exception) noexcept {
+        using Invoke = void* (*)(void*, void*, void**, void**);
+        static const auto invoke = reinterpret_cast<Invoke>(GetProcAddress(
+            GetModuleHandleW(L"GameAssembly.dll"), "il2cpp_runtime_invoke"));
+        if (!invoke || !method) return false;
+        __try {
+            *result = invoke(method, nullptr, nullptr, exception);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    void BootstrapVrSourceCamera() {
+        if (!IsVrUnityRuntimeEnabled()) return;
+        {
+            std::lock_guard lock(vrCameraStateMutex);
+            if (vrSourceCamera != nullptr) return;
+        }
+        // A game-side cached main camera may never call our get_main hook.
+        // Query the same public API only while unselected; never disturb the
+        // existing source identity while the eye/restore heartbeat owns it.
+        static thread_local ULONGLONG lastQuery = 0;
+        const auto now = GetTickCount64();
+        if (lastQuery != 0 && now - lastQuery < 1000U) return;
+        lastQuery = now;
+        void* result = nullptr;
+        void* exception = nullptr;
+        sourceCameraQueryActive = true;
+        const bool invoked = InvokeSourceCameraMain(
+            sourceCameraMainMethod.load(std::memory_order_acquire), &result, &exception);
+        sourceCameraQueryActive = false;
+        if (invoked && !exception) TrackVrSourceCamera(result);
+        std::ostringstream query;
+        query << "[VR][stereo] SOURCE_CAMERA_BOOTSTRAP invoked=" << invoked
+              << " exception=" << exception << " result=" << result;
+        static_cast<void>(gakumas::vr::WriteVrLog(query.str()));
+    }
+
     void ObserveUnityCameraRender(void* camera) {
         if (!AreVrUnityCameraDiagnosticsEnabled()) {
             return;
@@ -1909,6 +1953,11 @@ namespace GakumasLocal::HookMain {
     DEFINE_HOOK(UnityResolve::UnityType::Camera*, Camera_get_main, (void* mtd)) {
         auto ret = Camera_get_main_Orig(mtd);
 #ifdef GKMS_WINDOWS
+        if (AreVrUnityCameraDiagnosticsEnabled() && !sourceCameraQueryActive) {
+            sourceAdmissionMainCalls.fetch_add(1U, std::memory_order_relaxed);
+            if (ret) sourceAdmissionMainNonNull.fetch_add(1U, std::memory_order_relaxed);
+            sourceAdmissionLastMain.store(ret, std::memory_order_relaxed);
+        }
         try {
             TrackVrSourceCamera(ret);
         } catch (...) {
@@ -2046,12 +2095,41 @@ namespace GakumasLocal::HookMain {
         // only while no SRP context is active. No render API is called manually.
         try {
             void* outputCamera = ReadCinemachineOutputCamera(self);
+            if (outputCamera != nullptr) BootstrapVrSourceCamera();
             const bool selectedSource =
                 outputCamera != nullptr && IsSelectedVrMainCamera(outputCamera);
             const bool pipelineIdle = IsUnityRenderPipelineIdle();
             const bool queueDiagnosticHooksReady =
                 unityCameraRenderHookReady.load(std::memory_order_acquire) &&
                 unityRenderPipelineGuardReady.load(std::memory_order_acquire);
+            if (AreVrUnityCameraDiagnosticsEnabled()) {
+                // Observe the existing admission inputs; never call get_main
+                // ourselves or select a different camera in this probe.
+                static thread_local ULONGLONG lastAdmissionLog = 0;
+                const auto now = GetTickCount64();
+                if (lastAdmissionLog == 0 || now - lastAdmissionLog >= 5000U) {
+                    lastAdmissionLog = now;
+                    void* tracked = nullptr;
+                    {
+                        std::lock_guard lock(vrCameraStateMutex);
+                        tracked = vrSourceCamera;
+                    }
+                    const auto frame = ReadVrStereoCameraFrame();
+                    std::ostringstream admission;
+                    admission << "[VR][stereo] SOURCE_ADMISSION_STATE brain=" << self
+                              << " output=" << outputCamera << " tracked=" << tracked
+                              << " selected=" << selectedSource << " pipelineIdle=" << pipelineIdle
+                              << " hooksReady=" << queueDiagnosticHooksReady
+                              << " mainCalls=" << sourceAdmissionMainCalls.load(std::memory_order_relaxed)
+                              << " mainNonNull=" << sourceAdmissionMainNonNull.load(std::memory_order_relaxed)
+                              << " lastMain=" << sourceAdmissionLastMain.load(std::memory_order_relaxed)
+                              << " outputIsEye=" << unityStereoRenderer.IsEyeCamera(outputCamera)
+                              << " poseValid=" << frame.trackingSample.valid
+                              << " poseRevision=" << frame.trackingSample.revision
+                              << " stereo=" << Config::vrStereoEnabled;
+                    static_cast<void>(gakumas::vr::WriteVrLog(admission.str()));
+                }
+            }
             if (queueDiagnosticHooksReady && selectedSource) {
                 unityStereoRenderer.Tick(
                     outputCamera,
@@ -6271,7 +6349,23 @@ namespace GakumasLocal::HookMain {
             const auto* cameraMainMethod = Il2cppUtils::GetMethod(
                 "UnityEngine.CoreModule.dll", "UnityEngine", "Camera", "get_main");
             const bool cameraMainShape = cameraMainMethod != nullptr &&
-                cameraMainMethod->static_function && cameraMainMethod->args.empty();
+                cameraMainMethod->static_function && cameraMainMethod->args.empty() &&
+                cameraMainMethod->return_type != nullptr &&
+                cameraMainMethod->return_type->name == "UnityEngine.Camera" &&
+                cameraMainMethod->function != nullptr && cameraMainMethod->address != nullptr;
+#ifdef GKMS_WINDOWS
+            sourceCameraMainMethod.store(
+                cameraMainShape ? cameraMainMethod->address : nullptr,
+                std::memory_order_release);
+            if (Config::vrDiagnosticsStartupEnabled) {
+                std::ostringstream binding;
+                binding << "[VR][stereo] SOURCE_CAMERA_MAIN_API ready=" << cameraMainShape
+                        << " signature=static UnityEngine.Camera UnityEngine.Camera.get_main()"
+                        << " method=" << (cameraMainShape ? cameraMainMethod->address : nullptr)
+                        << " function=" << (cameraMainShape ? cameraMainMethod->function : nullptr);
+                static_cast<void>(gakumas::vr::WriteVrLog(binding.str()));
+            }
+#endif
             ADD_HOOK(Camera_get_main,
                      cameraMainShape ? cameraMainMethod->function : nullptr);
 
