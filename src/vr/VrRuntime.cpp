@@ -3,6 +3,7 @@
 #include "StereoGpuPublish.hpp"
 #include "PerformanceProbe.hpp"
 #include "VrVersion.hpp"
+#include "GripBackgroundTransparency.hpp"
 #include "VrAaMenu.hpp"
 #include "VrFreeCamera.hpp"
 #include "frame/FrameLoopDriver.hpp"

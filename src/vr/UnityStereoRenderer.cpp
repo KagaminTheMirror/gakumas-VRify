@@ -4,6 +4,7 @@
 #include "StereoGpuPublish.hpp"
 #include "LivePause.hpp"
 #include "GripBlurSource.hpp"
+#include "GripBackgroundTransparency.hpp"
 #include "SceneReadyGate.hpp"
 #include "VrHandGlowSticks.hpp"
 #include "SkyRenderHooks.hpp"
@@ -3469,6 +3470,7 @@ void UnityStereoRenderer::PublishGripTransparency() noexcept {
     // clear override applied across pass recreation and restores it the
     // moment transparency disarms, including the Lift/Restore tail calls.
     SyncGripUiPassClear(armed);
+    SyncGripBackgroundTransparency(armed);
     if (armed == gripTransparencyArmed_.load(std::memory_order_relaxed)) {
         return;
     }
