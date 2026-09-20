@@ -5,11 +5,7 @@
 
 namespace I18nData {
     static const std::unordered_map<std::string, std::string> i18nData_default = {
-        { "hign", "High" },
         { "middle", "Medium" },
-        { "low", "Low" },
-        { "cancel", "Cancel" },
-        { "ok", "OK" },
         { "vr_menu_title", "VR Settings" },
         { "vr_menu_tab_picture", "Picture" },
         { "vr_menu_tab_taa", "Anti-aliasing" },

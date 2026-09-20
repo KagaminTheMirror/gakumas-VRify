@@ -5,11 +5,6 @@
 
 namespace I18nData {
     static const std::unordered_map<std::string, std::string> i18nData_ja = {
-        { "hign", "高" },
-        { "middle", "中" },
-        { "low", "低" },
-        { "cancel", "キャンセル" },
-        { "ok", "OK" },
         { "vr_menu_title", "VR設定" },
         { "vr_menu_tab_picture", "画質" },
         { "vr_menu_tab_taa", "アンチエイリアス" },

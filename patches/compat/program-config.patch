@@ -1,0 +1,71 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -22,7 +22,7 @@
+ std::filesystem::path ConfigJson = gakumasLocalPath / "localizationConfig.json";
+ 
+ bool g_has_config_file = false;
+-bool g_enable_console = true;
++bool g_enable_console = false;
+ bool g_useRemoteAssets = false;
+ bool g_useAPIAssets = false;
+ bool g_useAPITextureAssets = false;
+@@ -54,6 +54,11 @@
+ 
+ void readProgramConfig() {
+ 	std::vector<std::string> dicts{};
++	g_has_config_file = false;
++	g_enable_console = false;
++	g_useRemoteAssets = false;
++	g_useAPIAssets = false;
++	g_useAPITextureAssets = false;
+ 	std::ifstream config_stream{ ProgramConfigJson };
+ 
+ 	if (!config_stream.is_open())
+@@ -64,38 +69,38 @@
+ 
+ 	document.ParseStream(wrapper);
+ 
+-	if (!document.HasParseError())
++	if (!document.HasParseError() && document.IsObject())
+ 	{
+ 		g_has_config_file = true;
+-		if (document.HasMember("enableConsole")) {
++		if (document.HasMember("enableConsole") && document["enableConsole"].IsBool()) {
+ 			g_enable_console = document["enableConsole"].GetBool();
+ 		}
+ 
+-		if (document.HasMember("useRemoteAssets")) {
++		if (document.HasMember("useRemoteAssets") && document["useRemoteAssets"].IsBool()) {
+ 			g_useRemoteAssets = document["useRemoteAssets"].GetBool();
+ 		}
+ 
+-		if (document.HasMember("transRemoteZipUrl")) {
++		if (document.HasMember("transRemoteZipUrl") && document["transRemoteZipUrl"].IsString()) {
+ 			g_remoteResourceUrl = document["transRemoteZipUrl"].GetString();
+ 		}
+ 
+-		if (document.HasMember("useAPIAssets")) {
++		if (document.HasMember("useAPIAssets") && document["useAPIAssets"].IsBool()) {
+ 			g_useAPIAssets = document["useAPIAssets"].GetBool();
+ 		}
+ 
+-		if (document.HasMember("useAPIAssetsURL")) {
++		if (document.HasMember("useAPIAssetsURL") && document["useAPIAssetsURL"].IsString()) {
+ 			g_useAPIAssetsURL = document["useAPIAssetsURL"].GetString();
+ 		}
+ 
+-		if (document.HasMember("useAPITextureAssets")) {
++		if (document.HasMember("useAPITextureAssets") && document["useAPITextureAssets"].IsBool()) {
+ 			g_useAPITextureAssets = document["useAPITextureAssets"].GetBool();
+ 		}
+ 
+-		if (document.HasMember("useAPITextureAssetsURL")) {
++		if (document.HasMember("useAPITextureAssetsURL") && document["useAPITextureAssetsURL"].IsString()) {
+ 			g_useAPITextureAssetsURL = document["useAPITextureAssetsURL"].GetString();
+ 		}
+ 
+-		if (document.HasMember("delTextureRemoteAfterUpdate")) {
++		if (document.HasMember("delTextureRemoteAfterUpdate") && document["delTextureRemoteAfterUpdate"].IsBool()) {
+ 			g_delTextureRemoteAfterUpdate = document["delTextureRemoteAfterUpdate"].GetBool();
+ 		}
+ 

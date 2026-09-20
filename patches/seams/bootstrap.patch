@@ -1,0 +1,25 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -51,6 +51,8 @@
+ 		wprintf(L"%ls Loaded! - By chinosk\n", CONSOLE_TITLE);
+ 	}
+ }
++
++void create_localify_console() { create_debug_console(); }
+ 
+ void readProgramConfig() {
+ 	std::vector<std::string> dicts{};
+@@ -108,6 +110,7 @@
+ 	config_stream.close();
+ }
+ 
++#ifndef GAKUMAS_EXTERNAL_HOST
+ LONG WINAPI AddressExceptionHandler(EXCEPTION_POINTERS* ExceptionInfo) {
+ 	// Check if the exception is an access violation
+ 	if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+@@ -184,3 +187,5 @@
+ 	}
+ 	return 1;
+ }
++
++#endif

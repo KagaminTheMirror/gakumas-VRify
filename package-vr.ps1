@@ -44,6 +44,9 @@ if (-not (Test-Path -LiteralPath $versionDll)) {
     throw "Build output not found: $versionDll. Run build.ps1 first."
 }
 
+& python (Join-Path $projectRoot 'scripts/source-pipeline.py') verify-binary --binary $versionDll
+if ($LASTEXITCODE -ne 0) { throw 'Refusing to package an unverified or stale binary.' }
+
 New-Item -ItemType Directory -Path $toolsRoot -Force | Out-Null
 if (-not (Test-Path -LiteralPath $loaderArchive) -or
     (Get-FileHash -Algorithm SHA256 -LiteralPath $loaderArchive).Hash -ne $loaderArchiveSha256) {

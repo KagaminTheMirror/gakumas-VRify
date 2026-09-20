@@ -1,0 +1,205 @@
+{
+  "upstreamCommit": "098a41459e17b130be02353f26d0ab0a2ccad914",
+  "patches": [
+    {
+      "file": "compat/imgui.patch",
+      "purpose": "Thread-local font state and CJK word wrapping; retain upstream non-CJK behavior",
+      "checks": [
+        "test-settings-coexistence"
+      ],
+      "sha256": "f8a60743837716c9d498f0c7e0a469a16a7e93964fe9555d7fa089aafb8d2566",
+      "before": {
+        "src/imgui/imgui_draw.cpp": "cf4064234db18e0fe0c1592ad2fa1bc4c93701c11a6144a6f70907b83719fb6b"
+      },
+      "after": {
+        "src/imgui/imgui_draw.cpp": "a8b35d983577e092089d0475e10882e1d3a8eebf2d4f684519a40bf924522e66"
+      },
+      "inputBlobs": {
+        "src/imgui/imgui_draw.cpp": "031c3e7d58a35844c8c38f66fb8de5860b8c0c5a"
+      }
+    },
+    {
+      "file": "seams/config.patch",
+      "purpose": "Delegate config ownership and migration policy; keep all Localify fields and serialization upstream",
+      "checks": [
+        "test-settings-coexistence",
+        "test-vr-config-boundary"
+      ],
+      "before": {
+        "src/GakumasLocalify/config/Config.cpp": "bffd325fa7f2782ce956d9a99416dfaaf1a0f523e5031cb9ca0640f78bbdf5d2"
+      },
+      "after": {
+        "src/GakumasLocalify/config/Config.cpp": "9e50c8a1615845d23a2d430d294c085c6b0efee813b20045fea4d18ba8fd3de8"
+      },
+      "sha256": "609a76658567cf4dc7390638dc12d1c3424121e48fb393d68f10d4c907b8a66d",
+      "inputBlobs": {
+        "src/GakumasLocalify/config/Config.cpp": "f1bacea1558ecf641b8b8e9568aac4da866498d9"
+      }
+    },
+    {
+      "file": "compat/version-proxy.patch",
+      "purpose": "Keep the version.dll forwarding surface without the upstream DXGI proxy",
+      "checks": [
+        "test-proxy-exports"
+      ],
+      "before": {
+        "src/dllproxy/proxy.cpp": "587d38aea4bfe34a940eda01523fab1f404b4430dca2a6d932bc350d6ea5b954",
+        "src/dllproxy/version.asm": "ec61130f8722a1f9db8884b72d9091be54fd9f989176d12395446f3b03f5da00",
+        "src/dllproxy/version.def": "8fb0d9b58d97719477aecb840ccb283a35ec6a6e5aa30a77448edf8a15f5f2ed"
+      },
+      "after": {
+        "src/dllproxy/proxy.cpp": "1a9582d0bfac7af55965a8925869589f83dba0d4e9fd60543c153c6eab5a7e1c",
+        "src/dllproxy/version.asm": "754b4ea24d2fbdf5612fc869bf4dd907480c40d4d65c66f2e80abe26dacafe00",
+        "src/dllproxy/version.def": "edebdf3d344c090184eb9b809ea48be33697299cadbffcaf7b319e04dfe43fca"
+      },
+      "sha256": "eefedcd390163f1720c276c6c17e539be7405d9c3a85b8e9ec15851f482b6325",
+      "inputBlobs": {
+        "src/dllproxy/proxy.cpp": "56efd2ae32d26fb7e9ff9064382bd309d5d9294a",
+        "src/dllproxy/version.asm": "ae916844334ede39dc815f213dcaaef1f4954ade",
+        "src/dllproxy/version.def": "b0f9d41f1ad5d3750ca555ff702036bd2f67644a"
+      }
+    },
+    {
+      "file": "seams/windows.patch",
+      "purpose": "Reuse upstream keyboard, configuration and window handling with host lifecycle, quit and asset-bundle delegates",
+      "checks": [
+        "test-settings-coexistence",
+        "test-game-quit"
+      ],
+      "before": {
+        "src/windowsPlatform.cpp": "33291f445a691ac1ca12496e23b15448cb7b605e1559f77b08ef26fd64142ca8",
+        "src/windowsPlatform.hpp": "dea1be422f179b7ec7f6906d2ee77e6ba82a96be3288c3a3bc6e9e35d88eb926"
+      },
+      "after": {
+        "src/windowsPlatform.cpp": "4ab31893baba3fa2eb109846ea7d73f50370426186f274d17d3a655b612b93b6",
+        "src/windowsPlatform.hpp": "92ef1e4a59dff6b406e73599f0a0a4ce68bd91b16b0a5ac0771055dd0348b031"
+      },
+      "sha256": "8b7e432c6925b50c045589c52d22d4c93ee029411addd52b75ea540efc5c4f5f",
+      "inputBlobs": {
+        "src/windowsPlatform.cpp": "018b7a30ed36e184d477285db1c79431f7a267ec",
+        "src/windowsPlatform.hpp": "8dc9f66192c9ae103c2ab6eda88b6eae5c576370"
+      }
+    },
+    {
+      "file": "compat/hook-installer.patch",
+      "purpose": "Single evaluation, pointer-width status conversion and successful hook target tracking; preserve upstream version",
+      "checks": [
+        "test-hook-manager"
+      ],
+      "before": {
+        "src/platformDefine.hpp": "c3090bfebf13fd6ee5dc663b1f46957c49fb5c7ee4cc72afdea753ab93a4c7f3"
+      },
+      "after": {
+        "src/platformDefine.hpp": "e58ffcb10edc93905f20fb7b6963482fd87ee7477f846425cac9cab5aaa44fb9"
+      },
+      "sha256": "a1c095e851965d04abaef0aac9de70e2865ee71986938b5b926eb28ec5e76943",
+      "inputBlobs": {
+        "src/platformDefine.hpp": "219fb10bf2fab246a207200227ee1ff1576b6f35"
+      }
+    },
+    {
+      "file": "compat/unity-abi.patch",
+      "purpose": "Preserve CanvasRenderer MethodInfo argument, avoid aliased TMP overload detours, reject missing GameAssembly",
+      "checks": [
+        "test-shared-entry-contracts"
+      ],
+      "before": {
+        "src/GakumasLocalify/Hook.cpp": "55fd956e8c4f2a85468fb9ba5fb5bbbf285c6e194c23eaafa4f2fb295ea4af3b"
+      },
+      "after": {
+        "src/GakumasLocalify/Hook.cpp": "039e90ee2f096b461b8bf62b67780820b91f212c6d1fa32a400ea4da9fd011bb"
+      },
+      "sha256": "a0319c3eb4e0de7dfd7c3d3170c9db0b455b51699dcc01223a1a49b0e6b7b2d8",
+      "inputBlobs": {
+        "src/GakumasLocalify/Hook.cpp": "7d2e29464dddb9bd13ea125ac79d44a6d8934bef"
+      }
+    },
+    {
+      "file": "seams/unity.patch",
+      "purpose": "Named callbacks and feature gates; preserve original trampoline, early-return and callback ordering",
+      "checks": [
+        "test-shared-entry-contracts",
+        "test-source-camera-bootstrap",
+        "test-fp-head-skip"
+      ],
+      "before": {
+        "src/GakumasLocalify/Hook.cpp": "039e90ee2f096b461b8bf62b67780820b91f212c6d1fa32a400ea4da9fd011bb"
+      },
+      "after": {
+        "src/GakumasLocalify/Hook.cpp": "98d406e106ffc6ef69a02a3a0412c2595d73b889f19175afa07a94739fcfc252"
+      },
+      "sha256": "48b8b1bb5969568bed9a76cefa546a2c26a5c1af5eb9b2083e134ee9129493e5",
+      "inputBlobs": {
+        "src/GakumasLocalify/Hook.cpp": "52d3e49f421d7aad8eb91c586cc5d59f29c690a5"
+      }
+    },
+    {
+      "file": "compat/program-config.patch",
+      "purpose": "Validate program JSON types and reset startup feature flags before parsing",
+      "checks": [
+        "test-vr-startup-gating"
+      ],
+      "before": {
+        "src/main.cpp": "24a843d08e9aa00ff20b122b4f85dd94800d90301138a01c2e19b64de78967d3"
+      },
+      "after": {
+        "src/main.cpp": "13671522c3be01dadc5f6b43a2ea198a2be8e7e6789e5d0a18fb88f2ad9b8c02"
+      },
+      "sha256": "74ad10d2f01f56db62dc79d52bde11af7ad8482b7889a70516bd07eaa8a3352f",
+      "inputBlobs": {
+        "src/main.cpp": "1bd6769dd9ca754870f2315fde2702edc92b62ed"
+      }
+    },
+    {
+      "file": "seams/bootstrap.patch",
+      "purpose": "Use upstream program settings and console with an external loader-safe host",
+      "checks": [
+        "test-vr-startup-gating"
+      ],
+      "before": {
+        "src/main.cpp": "13671522c3be01dadc5f6b43a2ea198a2be8e7e6789e5d0a18fb88f2ad9b8c02"
+      },
+      "after": {
+        "src/main.cpp": "febbe2ab8de5cd464c8464efd78d7bf500ae0e3829d4bda8ddfc2fa35746e23d"
+      },
+      "sha256": "a116fd75f410e66c7993a8d6016ffa42ef7ace3e1dd6f5ac374990c40e19ef88",
+      "inputBlobs": {
+        "src/main.cpp": "c237f437891ca2fc8fa0ee882b7a05a71de8f34d"
+      }
+    },
+    {
+      "file": "compat/desktop-text-threading.patch",
+      "purpose": "Thread-local missing-key storage for simultaneous desktop and VR UI",
+      "checks": [
+        "test-settings-coexistence"
+      ],
+      "before": {
+        "src/gkmsGUI/GUII18n.cpp": "273a4b68ee1bd0c6ed5828d3aa69cb961c99cf08e5996b25fe9949f6d33f5f66"
+      },
+      "after": {
+        "src/gkmsGUI/GUII18n.cpp": "1007771830b5ef44df8ba49ee2fce92c06a083151f075c2bd594a54492295bff"
+      },
+      "sha256": "a760c342aebbed4ca502c0bf53eee26012f6a8c78224dc53fe329e0361af1861",
+      "inputBlobs": {
+        "src/gkmsGUI/GUII18n.cpp": "2e9c16f086ec31d77f01b75eec9c4f9dff503310"
+      }
+    },
+    {
+      "file": "seams/desktop-text.patch",
+      "purpose": "Desktop VR ownership notice, shared system-language query",
+      "checks": [
+        "test-settings-coexistence"
+      ],
+      "before": {
+        "src/gkmsGUI/GUII18n.cpp": "1007771830b5ef44df8ba49ee2fce92c06a083151f075c2bd594a54492295bff"
+      },
+      "after": {
+        "src/gkmsGUI/GUII18n.cpp": "446dc5448a0f4e241102ce1f29fc58db0781d5fc4a5f1594226bc1ffb0ef6fa1"
+      },
+      "sha256": "6b79d86f0f7fbaabcc3f1583b173d42d899a0ec94bb6e64ed8b78f39958ff51e",
+      "inputBlobs": {
+        "src/gkmsGUI/GUII18n.cpp": "4409227010a242bbd93d26b6577cd9952fe13bfd"
+      }
+    }
+  ]
+}

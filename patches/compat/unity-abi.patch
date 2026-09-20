@@ -1,0 +1,57 @@
+--- a/src/GakumasLocalify/Hook.cpp
++++ b/src/GakumasLocalify/Hook.cpp
+@@ -620,10 +620,10 @@
+         Image_set_overrideSprite_Orig(self, ReplaceSpriteAssetByTextureName(sprite));
+     }
+ 
+-    DEFINE_HOOK(void, CanvasRenderer_SetTexture, (void* self, void* texture)) {
++    DEFINE_HOOK(void, CanvasRenderer_SetTexture, (void* self, void* texture, void* method)) {
+         CanvasRenderer_SetTexture_Orig(
+             self,
+-            ReplaceTextureOrSpriteByObjectName(texture)
++            ReplaceTextureOrSpriteByObjectName(texture), method
+         );
+     }
+ 
+@@ -2379,9 +2379,10 @@
+         const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
+ 
+ #ifdef GKMS_WINDOWS
+-        auto il2cpp_module = GetModuleHandle("GameAssembly.dll");
++        auto il2cpp_module = GetModuleHandleW(L"GameAssembly.dll");
+         if (!il2cpp_module) {
+-            Log::ErrorFmt("GameAssembly.dll not loaded.");
++            Log::Error("GameAssembly.dll not loaded.");
++            return;
+         }
+         UnityResolve::Init(il2cpp_module, UnityResolve::Mode::Il2Cpp, Config::lazyInit);
+         GakumasLocal::WinHooks::Keyboard::InstallWndProcHook();
+@@ -2427,15 +2428,22 @@
+ 
+         ADD_HOOK(TMP_Text_set_text, Il2cppUtils::GetMethodPointer("Unity.TextMeshPro.dll", "TMPro",
+                                                                   "TMP_Text", "set_text"));
+-        ADD_HOOK(TMP_Text_SetText_1, Il2cppUtils::GetMethodPointer("Unity.TextMeshPro.dll", "TMPro",
+-                                                                  "TMP_Text", "SetText",
+-                                                                  {"System.String"}));
++        const auto tmpSetText1 = Il2cppUtils::GetMethodPointer(
++            "Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "SetText",
++            {"System.String"});
++        const auto tmpSetText2 = Il2cppUtils::GetMethodPointer(
++            "Unity.TextMeshPro.dll", "TMPro", "TMP_Text", "SetText",
++            {"System.String", "System.Boolean"});
++        ADD_HOOK(TMP_Text_SetText_1, tmpSetText1);
+         ADD_HOOK(TMP_Text_PopulateTextBackingArray, Il2cppUtils::GetMethodPointer("Unity.TextMeshPro.dll", "TMPro",
+                                                                   "TMP_Text", "PopulateTextBackingArray",
+                                                                   {"System.String", "System.Int32", "System.Int32"}));
+-        ADD_HOOK(TMP_Text_SetText_2, Il2cppUtils::GetMethodPointer("Unity.TextMeshPro.dll", "TMPro",
+-            "TMP_Text", "SetText",
+-            { "System.String", "System.Boolean" }));
++        if (tmpSetText2 && tmpSetText2 != tmpSetText1) {
++            ADD_HOOK(TMP_Text_SetText_2, tmpSetText2);
++        } else {
++            Log::Info(
++                "TMP_Text_SetText_2 skipped: same address as SetText_1");
++        }
+ 
+         ADD_HOOK(TextField_set_value, Il2cppUtils::GetMethodPointer("UnityEngine.UIElementsModule.dll", "UnityEngine.UIElements",
+                                                                   "TextField", "set_value"));

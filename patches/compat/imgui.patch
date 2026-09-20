@@ -1,0 +1,49 @@
+--- a/src/imgui/imgui_draw.cpp
++++ b/src/imgui/imgui_draw.cpp
+@@ -33,6 +33,7 @@
+ #include "imgui.h"
+ #ifndef IMGUI_DISABLE
+ #include "imgui_internal.h"
++#include "host/ImGuiCjkWordWrap.hpp"
+ #ifdef IMGUI_ENABLE_FREETYPE
+ #include "misc/freetype/imgui_freetype.h"
+ #endif
+@@ -2929,7 +2930,7 @@
+         0xFF00, 0xFFEF, // Half-width characters
+         0xFFFD, 0xFFFD  // Invalid
+     };
+-    static ImWchar full_ranges[IM_ARRAYSIZE(base_ranges) + IM_ARRAYSIZE(accumulative_offsets_from_0x4E00) * 2 + 1] = { 0 };
++    static thread_local ImWchar full_ranges[IM_ARRAYSIZE(base_ranges) + IM_ARRAYSIZE(accumulative_offsets_from_0x4E00) * 2 + 1] = { 0 };
+     if (!full_ranges[0])
+     {
+         memcpy(full_ranges, base_ranges, sizeof(base_ranges));
+@@ -3019,7 +3020,7 @@
+         0xFF00, 0xFFEF, // Half-width characters
+         0xFFFD, 0xFFFD  // Invalid
+     };
+-    static ImWchar full_ranges[IM_ARRAYSIZE(base_ranges) + IM_ARRAYSIZE(accumulative_offsets_from_0x4E00)*2 + 1] = { 0 };
++    static thread_local ImWchar full_ranges[IM_ARRAYSIZE(base_ranges) + IM_ARRAYSIZE(accumulative_offsets_from_0x4E00)*2 + 1] = { 0 };
+     if (!full_ranges[0])
+     {
+         memcpy(full_ranges, base_ranges, sizeof(base_ranges));
+@@ -3367,6 +3368,7 @@
+ // FIXME: Much possible improvements (don't cut things like "word !", "word!!!" but cut within "word,,,,", more sensible support for punctuations, support for Unicode punctuations, etc.)
+ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const char* text_end, float wrap_width) const
+ {
++    if (const char* cjk = gakumas::ui::CjkWordWrapPosition(*this, scale, text, text_end, wrap_width)) return cjk;
+     // For references, possible wrap point marked with ^
+     //  "aaa bbb, ccc,ddd. eee   fff. ggg!"
+     //      ^    ^    ^   ^   ^__    ^    ^
+@@ -3961,9 +3963,9 @@
+     return (input[8] << 24) + (input[9] << 16) + (input[10] << 8) + input[11];
+ }
+ 
+-static unsigned char *stb__barrier_out_e, *stb__barrier_out_b;
+-static const unsigned char *stb__barrier_in_b;
+-static unsigned char *stb__dout;
++static thread_local unsigned char *stb__barrier_out_e, *stb__barrier_out_b;
++static thread_local const unsigned char *stb__barrier_in_b;
++static thread_local unsigned char *stb__dout;
+ static void stb__match(const unsigned char *data, unsigned int length)
+ {
+     // INVERSE of memmove... write each byte before copying the next...

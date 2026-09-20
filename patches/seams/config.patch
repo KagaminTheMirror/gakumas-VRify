@@ -1,0 +1,42 @@
+--- a/src/GakumasLocalify/config/Config.cpp
++++ b/src/GakumasLocalify/config/Config.cpp
+@@ -1,4 +1,5 @@
+ #include <string>
++#include "host/localify/ConfigIntegration.hpp"
+ #include "nlohmann/json.hpp"
+ #include "../Log.h"
+ #include <thread>
+@@ -59,13 +60,16 @@
+     bool dmmUnlockSize = false;
+ 
+     void LoadConfig(const std::string& configStr) {
++        Integration::BeginLoad();
+         try {
+             const auto config = nlohmann::json::parse(configStr);
++            Integration::CheckDocument(config);
+ 
+             #define GetConfigItem(name) if (config.contains(#name)) name = config[#name]
+ 
+             GetConfigItem(dbgMode);
+             GetConfigItem(enabled);
++            Integration::Parsed(config);
+             GetConfigItem(lazyInit);
+             GetConfigItem(replaceFont);
+             GetConfigItem(replaceTexture);
+@@ -111,6 +115,7 @@
+             GetConfigItem(dmmUnlockSize);
+         }
+         catch (std::exception& e) {
++            Integration::LoadFailed();
+             Log::ErrorFmt("LoadConfig error: %s", e.what());
+         }
+         isConfigInit = true;
+@@ -118,7 +123,7 @@
+ 
+     void SaveConfig(const std::string& configPath) {
+         try {
+-            nlohmann::json config;
++            auto config = Integration::SaveBase(configPath);
+ 
+             #define SetConfigItem(name) config[#name] = name
+ 

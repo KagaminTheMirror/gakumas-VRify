@@ -1,5 +1,6 @@
 #include <string>
 #include "VrifyConfig.hpp"
+#include "host/localify/ConfigIntegration.hpp"
 #include "nlohmann/json.hpp"
 #include "GakumasLocalify/Log.h"
 #include <algorithm>
@@ -11,13 +12,10 @@
 #endif
 
 namespace GakumasLocal::Config {
-    bool isConfigInit = false;
 
-    bool dbgMode = false;
     bool vrDiagnosticsEnabled = false;
     bool vrRuntimeStartupEnabled = false;
     bool vrDiagnosticsStartupEnabled = false;
-    bool enabled = true;
     bool vrLocalizeText = false;
     int vrMenuLanguage = kDefaultVrMenuLanguage;
     bool vrEnabled = false;
@@ -312,211 +310,48 @@ namespace GakumasLocal::Config {
             return config;
         }
     }
-    bool lazyInit = true;
-    bool replaceFont = true;
-    bool replaceTexture = true;
-    bool forceExportResource = false;
-    bool textTest = false;
-    bool useMasterTrans = true;
-    int gameOrientation = 0;
-    bool dumpText = false;
-    bool dumpRuntimeTexture = false;
-    bool enableFreeCamera = false;
-    int targetFrameRate = 0;
-    bool unlockAllLive = false;
-    bool unlockAllLiveCostume = false;
 
-    bool enableLiveCustomeDress = false;
-    std::string liveCustomeHeadId = "";
-    std::string liveCustomeCostumeId = "";
 
-    bool loginAsIOS = false;
 
-    bool useCustomeGraphicSettings = false;
-    float renderScale = 0.77f;
-    int qualitySettingsLevel = 3;
-    int volumeIndex = 3;
-    int maxBufferPixel = 3384;
-    int reflectionQualityLevel = 4;
-    int lodQualityLevel = 4;
 
-    bool enableBreastParam = false;
-    float bDamping = 0.33f;
-    float bStiffness = 0.08f;
-    float bSpring = 1.0f;
-    float bPendulum = 0.055f;
-    float bPendulumRange = 0.15f;
-    float bAverage = 0.20f;
-    float bRootWeight = 0.5f;
-    bool bUseArmCorrection = true;
-    bool bUseScale = false;
-    float bScale = 1.0f;
-    bool bUseLimit = true;
-    float bLimitXx = 1.0f;
-    float bLimitXy = 1.0f;
-    float bLimitYx = 1.0f;
-    float bLimitYy = 1.0f;
-    float bLimitZx = 1.0f;
-    float bLimitZy = 1.0f;
 
-    bool dmmUnlockSize = false;
 
-    void LoadConfig(const std::string& configStr) {
-        LoadConfig(configStr, ConfigLoadPurpose::LocalifyReload);
+    namespace Integration {
+        thread_local ConfigLoadPurpose loadPurpose = ConfigLoadPurpose::LocalifyReload;
+        void BeginLoad() { isConfigInit = false; }
+        void CheckDocument(const nlohmann::json& config) {
+            if (!config.is_object()) throw std::runtime_error("Localify config root must be an object");
+        }
+        void Parsed(const nlohmann::json& config) {
+            if (loadPurpose == ConfigLoadPurpose::StartupMigration) ApplyVrConfig(config);
+        }
+        void LoadFailed() {
+            dbgMode = false;
+            enabled = false;
+            if (loadPurpose == ConfigLoadPurpose::StartupMigration) ResetVrConfigFailClosed();
+        }
+        nlohmann::json SaveBase(const std::string& path) {
+            auto config = nlohmann::json::object();
+            if (std::filesystem::exists(path)) {
+                std::ifstream in(path);
+                in >> config;
+                CheckDocument(config);
+            }
+            for (auto it = config.begin(); it != config.end(); ) {
+                if (it.key().rfind("vr", 0) == 0) it = config.erase(it);
+                else ++it;
+            }
+            return config;
+        }
     }
 
     void LoadConfig(const std::string& configStr, ConfigLoadPurpose purpose) {
-        isConfigInit = false;
-        try {
-            const auto config = nlohmann::json::parse(configStr);
-            if (!config.is_object()) {
-                throw std::runtime_error("Localify config root must be an object");
-            }
-
-            #define GetConfigItem(name) if (config.contains(#name)) name = config[#name]
-
-            GetConfigItem(dbgMode);
-            GetConfigItem(enabled);
-            // Only bootstrap may import legacy VR fields. Ctrl+U reload must
-            // never write (or clamp/reset) any state owned by the VR menu.
-            if (purpose == ConfigLoadPurpose::StartupMigration) {
-                ApplyVrConfig(config);
-            }
-            GetConfigItem(lazyInit);
-            GetConfigItem(replaceFont);
-            GetConfigItem(replaceTexture);
-            GetConfigItem(forceExportResource);
-            GetConfigItem(gameOrientation);
-            GetConfigItem(textTest);
-            GetConfigItem(useMasterTrans);
-            GetConfigItem(dumpText);
-            GetConfigItem(dumpRuntimeTexture);
-            GetConfigItem(targetFrameRate);
-            GetConfigItem(enableFreeCamera);
-            GetConfigItem(unlockAllLive);
-            GetConfigItem(unlockAllLiveCostume);
-            GetConfigItem(enableLiveCustomeDress);
-            GetConfigItem(liveCustomeHeadId);
-            GetConfigItem(liveCustomeCostumeId);
-            GetConfigItem(loginAsIOS);
-            GetConfigItem(useCustomeGraphicSettings);
-            GetConfigItem(renderScale);
-            GetConfigItem(qualitySettingsLevel);
-            GetConfigItem(volumeIndex);
-            GetConfigItem(maxBufferPixel);
-            GetConfigItem(reflectionQualityLevel);
-            GetConfigItem(lodQualityLevel);
-            GetConfigItem(enableBreastParam);
-            GetConfigItem(bDamping);
-            GetConfigItem(bStiffness);
-            GetConfigItem(bSpring);
-            GetConfigItem(bPendulum);
-            GetConfigItem(bPendulumRange);
-            GetConfigItem(bAverage);
-            GetConfigItem(bRootWeight);
-            GetConfigItem(bUseArmCorrection);
-            GetConfigItem(bUseScale);
-            GetConfigItem(bScale);
-            GetConfigItem(bUseLimit);
-            GetConfigItem(bLimitXx);
-            GetConfigItem(bLimitXy);
-            GetConfigItem(bLimitYx);
-            GetConfigItem(bLimitYy);
-            GetConfigItem(bLimitZx);
-            GetConfigItem(bLimitZy);
-            GetConfigItem(dmmUnlockSize);
-            isConfigInit = true;
-        }
-        catch (std::exception& e) {
-            dbgMode = false;
-            enabled = false;
-            // A startup failure still fails closed. A desktop reload failure
-            // cannot revoke the running OpenXR session's frozen decisions.
-            if (purpose == ConfigLoadPurpose::StartupMigration) {
-                ResetVrConfigFailClosed();
-            }
-            isConfigInit = true;
-            Log::ErrorFmt("LoadConfig error: %s", e.what());
-        }
-    }
-
-    void SaveConfig(const std::string& configPath) {
-        try {
-            nlohmann::json config = nlohmann::json::object();
-            if (std::filesystem::exists(configPath)) {
-                std::ifstream in(configPath);
-                in >> config;
-                if (!config.is_object()) {
-                    throw std::runtime_error("Localify config root must be an object");
-                }
-            }
-            for (auto it = config.begin(); it != config.end(); ) {
-                if (it.key().rfind("vr", 0) == 0) {
-                    it = config.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-
-            #define SetConfigItem(name) config[#name] = name
-
-            SetConfigItem(dbgMode);
-            SetConfigItem(enabled);
-            SetConfigItem(lazyInit);
-            SetConfigItem(replaceFont);
-            SetConfigItem(replaceTexture);
-            SetConfigItem(forceExportResource);
-            SetConfigItem(gameOrientation);
-            SetConfigItem(textTest);
-            SetConfigItem(useMasterTrans);
-            SetConfigItem(dumpText);
-            SetConfigItem(dumpRuntimeTexture);
-            SetConfigItem(targetFrameRate);
-            SetConfigItem(enableFreeCamera);
-            SetConfigItem(unlockAllLive);
-            SetConfigItem(unlockAllLiveCostume);
-            SetConfigItem(enableLiveCustomeDress);
-            SetConfigItem(liveCustomeHeadId);
-            SetConfigItem(liveCustomeCostumeId);
-            SetConfigItem(loginAsIOS);
-            SetConfigItem(useCustomeGraphicSettings);
-            SetConfigItem(renderScale);
-            SetConfigItem(qualitySettingsLevel);
-            SetConfigItem(volumeIndex);
-            SetConfigItem(maxBufferPixel);
-            SetConfigItem(reflectionQualityLevel);
-            SetConfigItem(lodQualityLevel);
-            SetConfigItem(enableBreastParam);
-            SetConfigItem(bDamping);
-            SetConfigItem(bStiffness);
-            SetConfigItem(bSpring);
-            SetConfigItem(bPendulum);
-            SetConfigItem(bPendulumRange);
-            SetConfigItem(bAverage);
-            SetConfigItem(bRootWeight);
-            SetConfigItem(bUseArmCorrection);
-            SetConfigItem(bUseScale);
-            SetConfigItem(bScale);
-            SetConfigItem(bUseLimit);
-            SetConfigItem(bLimitXx);
-            SetConfigItem(bLimitXy);
-            SetConfigItem(bLimitYx);
-            SetConfigItem(bLimitYy);
-            SetConfigItem(bLimitZx);
-            SetConfigItem(bLimitZy);
-            SetConfigItem(dmmUnlockSize);
-
-            std::ofstream out(configPath);
-            if (!out) {
-                Log::ErrorFmt("SaveConfig error: Cannot open file: %s", configPath.c_str());
-                return;
-            }
-            out << config.dump(4);
-			Log::Info("SaveConfig success");
-        }
-        catch (std::exception& e) {
-            Log::ErrorFmt("SaveConfig error: %s", e.what());
-        }
+        struct LoadScope {
+            ConfigLoadPurpose saved = Integration::loadPurpose;
+            ~LoadScope() { Integration::loadPurpose = saved; }
+        } scope;
+        Integration::loadPurpose = purpose;
+        LoadConfig(configStr);
     }
 
     void SaveVrConfig(const std::filesystem::path& configPath) {

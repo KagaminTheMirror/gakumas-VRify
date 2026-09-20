@@ -1,0 +1,24 @@
+--- a/src/gkmsGUI/GUII18n.cpp
++++ b/src/gkmsGUI/GUII18n.cpp
+@@ -1,4 +1,5 @@
+ #include "stdinclude.hpp"
++#include "host/localify/DesktopText.hpp"
+ #include "i18nData/strings_en.hpp"
+ #include "i18nData/strings_ja.hpp"
+ #include "i18nData/strings_zh-rCN.hpp"
+@@ -27,7 +28,15 @@
+ 		}
+ 	}
+ 
++    int SystemMenuLanguage() {
++        if (sChineseLangIds.contains(localLanguage)) return 1;
++        if (tChineseLangIds.contains(localLanguage)) return 2;
++        if (jpnLangIds.contains(localLanguage)) return 3;
++        return 4;
++    }
++
+     const char* ts(const std::string& key) {
++        if (const char* text = GakumasVR::Localify::DesktopTextOverride(key, localLanguage)) return text;
+         static std::unordered_map<std::string, std::string> i18nData = GetI18nData();
+ 
+         if (auto it = i18nData.find(key); it != i18nData.end()) {

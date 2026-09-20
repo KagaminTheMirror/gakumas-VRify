@@ -57,6 +57,13 @@ foreach ($path in @($versionDll, $loaderDll, $configJson, $localizationJson, $vr
     }
 }
 
+$builtDll = Join-Path $projectRoot "build/bin/x64/$Configuration/version.dll"
+& python (Join-Path $projectRoot 'scripts/source-pipeline.py') verify-binary --binary $builtDll
+if ($LASTEXITCODE -ne 0) { throw 'Refusing to install a stale or unverified build.' }
+if ((Get-FileHash -LiteralPath $versionDll).Hash -ne (Get-FileHash -LiteralPath $builtDll).Hash) {
+    throw 'Package DLL does not match the verified build. Package again.'
+}
+
 function Remove-VrOwnedKeys {
     param([hashtable]$Table)
     foreach ($key in @($Table.Keys)) {

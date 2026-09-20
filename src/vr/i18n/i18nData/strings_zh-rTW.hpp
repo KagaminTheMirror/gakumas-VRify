@@ -5,11 +5,6 @@
 
 namespace I18nData {
     static const std::unordered_map<std::string, std::string> i18nData_zh_rTW = {
-        { "hign", "高" },
-        { "middle", "中" },
-        { "low", "低" },
-        { "cancel", "取消" },
-        { "ok", "確定" },
         { "vr_menu_title", "VR 選單" },
         { "vr_menu_tab_picture", "畫面" },
         { "vr_menu_tab_taa", "抗鋸齒" },

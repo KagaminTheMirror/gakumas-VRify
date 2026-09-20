@@ -29,15 +29,7 @@
 extern std::filesystem::path gakumasLocalPath;
 extern std::filesystem::path ConfigJson;
 extern std::filesystem::path ProgramConfigJson;
-int hotk = 'u';
-
-void reload_all_data();
-
-std::function<void()> on_hotKey_0;
-std::function<void()> g_reload_all_data = reload_all_data;
-
-void readProgramConfig();
-
+extern std::function<void()> on_hotKey_0;
 namespace
 {
     class WindowsHookInstaller final : public GakumasLocal::HookInstaller
@@ -250,92 +242,10 @@ bool initHook() {
     return true;
 }
 
-void checkAndInitConfig(const std::filesystem::path& LocalConfigFile) {
-    if (!std::filesystem::exists(ProgramConfigJson)) {
-        g_useAPIAssetsURL = GkmsGUII18n::ts("default_assets_check_api");
-        GkmsResourceUpdate::saveProgramConfig();
-    }
-    if (!std::filesystem::exists(LocalConfigFile)) {
-        GakumasLocal::Config::SaveConfig(LocalConfigFile.string());
-    }
-}
 
-
-void loadConfig(const std::string& configJson,
-    GakumasLocal::Config::ConfigLoadPurpose purpose) {
-	GakumasLocal::Config::LoadConfig(configJson, purpose);
-}
-
-void loadConfig(const std::filesystem::path& filePath,
-    GakumasLocal::Config::ConfigLoadPurpose purpose) {
-	checkAndInitConfig(filePath);
-
-    std::ifstream file(filePath);
-    if (!file.is_open()) {
-        GakumasLocal::Log::ErrorFmt("Load config %s failed.\n", filePath.string().c_str());
-        loadConfig(std::string("{}"), purpose);
-        return;
-    }
-    std::string fileContent((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    file.close();
-
-    loadConfig(fileContent, purpose);
-}
-
-void reload_all_data() {
-    readProgramConfig();
-	loadConfig(ConfigJson, GakumasLocal::Config::ConfigLoadPurpose::LocalifyReload);
-    if (!GakumasLocal::Config::enabled) {
-        return;
-    }
-    GkmsResourceUpdate::GetCurrentResourceVersion(false);
-    GkmsResourceUpdate::GetCurrentTextureVersion(false);
-	GakumasLocal::Local::LoadData();
-	GakumasLocal::MasterLocal::LoadData();
-}
-
-bool getCurrentLodingProgress(int* stepTotal, int* stepCurrent, int* currTotal, int* currCurrent) {
-    *stepTotal = UnityResolveProgress::assembliesProgress.total;
-	*stepCurrent = UnityResolveProgress::assembliesProgress.current;
-	*currTotal = UnityResolveProgress::classProgress.total;
-	*currCurrent = UnityResolveProgress::classProgress.current;
-
-    return UnityResolveProgress::startInit;
-}
-
-void checkDBGKey(int action, int key_code) {
-	if (action != WM_KEYDOWN) return;
-	static const std::vector<int> targetDbgKeyList = { 38, 38, 40, 40, 37, 39, 37, 39, 66, 65};
-    static int currentIndex = 0;
-    if (targetDbgKeyList[currentIndex] == key_code) {
-        if (currentIndex == targetDbgKeyList.size() - 1) {
-            currentIndex = 0;
-			GakumasLocal::Config::dbgMode = !GakumasLocal::Config::dbgMode;
-			GakumasLocal::Config::SaveConfig(ConfigJson.string());
-            GakumasLocal::Log::InfoFmt("Debug Mode: %d", GakumasLocal::Config::dbgMode);
-        }
-        else {
-            currentIndex++;
-        }
-    }
-    else {
-        currentIndex = 0;
-    }
-}
-
-void keyboardEvents(int action, int key_code) {
-	// GakumasLocal::Log::DebugFmt("keyboardEvents: %d - %d", action, key_code);
-	checkDBGKey(action, key_code);
-    GKCamera::on_cam_rawinput_keyboard(action, key_code);
-    const auto msg = GakumasLocal::Local::OnKeyDown(action, key_code);
-    if (!msg.empty()) {
-		GakumasLocal::Log::Info(msg.c_str());
-    }
-}
-
-namespace GakumasLocal::WinHooks {
-    using Il2cppString = UnityResolve::UnityType::String;
-
+namespace GakumasVR::Localify {
+using namespace GakumasLocal;
+using Il2cppString = UnityResolve::UnityType::String;
     bool ArgTypeContains(
         const UnityResolve::Method::Arg* arg,
         const char* needle) {
@@ -470,7 +380,7 @@ namespace GakumasLocal::WinHooks {
         return array;
     }
 
-	void* LoadAssetBundle(const std::string& path) {
+	void* LoadBundle(const std::string& path) {
         const std::filesystem::path abs_path =
             std::filesystem::absolute(path).lexically_normal();
         if (!std::filesystem::is_regular_file(abs_path)) {
@@ -511,41 +421,7 @@ namespace GakumasLocal::WinHooks {
             "No live sync AssetBundle load API; extra bundle skipped.");
         return nullptr;
 	}
-
-    void SwitchFullScreen(HWND hWnd) {
-        static auto Screen_SetResolution = reinterpret_cast<void (*)(UINT, UINT, UINT, void*)>(
-            Il2cppUtils::il2cpp_resolve_icall("UnityEngine.Screen::SetResolution_Injected(System.Int32,System.Int32,UnityEngine.FullScreenMode,UnityEngine.RefreshRate&)"));
-        static auto get_Height = reinterpret_cast<int (*)()>(Il2cppUtils::il2cpp_resolve_icall("UnityEngine.Screen::get_height()"));
-        static auto get_Width = reinterpret_cast<int (*)()>(Il2cppUtils::il2cpp_resolve_icall("UnityEngine.Screen::get_width()"));
-
-        LONG style = GetWindowLong(hWnd, GWL_STYLE);
-        bool currFullScreen = style & WS_POPUP;
-
-		static int savedWidth = -1;
-		static int savedHeight = -1;
-
-        int64_t v8[3];
-        v8[0] = 0x100000000LL;
-
-        if (currFullScreen) {
-            // 取消全屏
-            if (savedWidth == -1) {
-                savedWidth = 542;
-                savedHeight = 990;
-            }
-            Screen_SetResolution(savedWidth, savedHeight, 2 * !false + 1, v8);
-        }
-        else {
-			savedWidth = get_Width();
-			savedHeight = get_Height();
-            Screen_SetResolution(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), 2 * !true + 1, v8);
-        }
-    }
-
-    namespace Keyboard {
-        std::function<void(int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD)> mKeyBoardCallBack = nullptr;
-
-        WNDPROC g_pfnOldWndProc = NULL;
+        WNDPROC g_pfnOldWndProc = nullptr;
         // Owned exclusively by the Unity window thread. A thread timer obtains
         // a system-assigned ID, so it cannot replace one of Unity's HWND timers.
         HWND g_quitWindow = nullptr;
@@ -572,117 +448,12 @@ namespace GakumasLocal::WinHooks {
             if (gakumas::vr::VrRuntime::Instance().PollGameQuit().CanClose()) ForwardGameClose();
         }
 
-        LRESULT CALLBACK WndProcCallback(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-            DWORD SHIFT_key = 0;
-            DWORD CTRL_key = 0;
-            DWORD ALT_key = 0;
-            DWORD SPACE_key = 0;
-            DWORD UP_key = 0;
-            DWORD DOWN_key = 0;
-            DWORD LEFT_key = 0;
-            DWORD RIGHT_key = 0;
-
-			// printf("WndProcCallback: 0x%x (%d)\n", uMsg, uMsg);
-
-            switch (uMsg) {
-            case WM_INPUT: {
-                RAWINPUT rawInput;
-                UINT size = sizeof(RAWINPUT);
-                if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &rawInput, &size, sizeof(RAWINPUTHEADER)) == size) {
-
-                    /* 鼠标事件，后面加上
-                    if (rawInput.header.dwType == RIM_TYPEMOUSE)
-                    {
-                        switch (rawInput.data.mouse.ulButtons) {
-                        case 0: {  // move
-                            SCCamera::mouseMove(rawInput.data.mouse.lLastX, rawInput.data.mouse.lLastY, 3);
-                        }; break;
-                        case 4: {  // press
-                            SCCamera::mouseMove(0, 0, 1);
-                        }; break;
-                        case 8: {  // release
-                            SCCamera::mouseMove(0, 0, 2);
-                        }; break;
-                        default: break;
-                        }
-
-                        if (rawInput.data.mouse.usButtonFlags == RI_MOUSE_WHEEL) {
-                            if (rawInput.data.mouse.usButtonData == 120) {
-                                SCCamera::mouseMove(0, 1, 4);
-                            }
-                            else {
-                                SCCamera::mouseMove(0, -1, 4);
-                            }
-                        }
-
-                    }*/
-                }
-            }; break;
-
-            case WM_SYSKEYUP:
-            case WM_KEYUP: {
-                int key = wParam;
-                keyboardEvents(uMsg, key);
-            }; break;
-
-            case WM_SYSKEYDOWN:
-            case WM_KEYDOWN: {
-                int key = wParam;
-
-                keyboardEvents(uMsg, key);
-                SHIFT_key = GetAsyncKeyState(VK_SHIFT);
-                CTRL_key = GetAsyncKeyState(VK_CONTROL);
-                ALT_key = GetAsyncKeyState(VK_MENU);
-                SPACE_key = GetAsyncKeyState(VK_SPACE);
-
-                UP_key = GetAsyncKeyState(VK_UP);
-                DOWN_key = GetAsyncKeyState(VK_DOWN);
-                LEFT_key = GetAsyncKeyState(VK_LEFT);
-                RIGHT_key = GetAsyncKeyState(VK_RIGHT);
-
-                if (mKeyBoardCallBack != nullptr) {
-                    mKeyBoardCallBack(key, SHIFT_key, CTRL_key, ALT_key, SPACE_key, UP_key, DOWN_key, LEFT_key, RIGHT_key);
-                }
-                if (key == 122) {
-					// F11
-                    if (GakumasLocal::Config::dmmUnlockSize) {
-                        SwitchFullScreen(hWnd);
-                    }
-                }
-                if (key >= 'A' && key <= 'Z')
-                {
-
-                    if (GetAsyncKeyState(VK_SHIFT) >= 0) key += 32;
-
-                    if (CTRL_key != 0 && key == hotk)
-                    {
-                        // fopenExternalPlugin(tlgport);
-                        printf("hotKey pressed.\n");
-                        if (on_hotKey_0) on_hotKey_0();
-                    }
-
-                    SHIFT_key = 0;
-                    CTRL_key = 0;
-                    ALT_key = 0;
-                    SPACE_key = 0;
-                    DWORD UP_key = 0;
-                    DWORD DOWN_key = 0;
-                    DWORD LEFT_key = 0;
-                    DWORD RIGHT_key = 0;
-                }
-            }; break;
-            case WM_NCACTIVATE: {
-                if (!wParam) {
-                    // SCCamera::onKillFocus();
-                    return FALSE;
-                }
-            }; break;
-            case WM_KILLFOCUS: {
-                // SCCamera::onKillFocus();
-                return FALSE;
-            }; break;
+    bool WindowMessage(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, WNDPROC previous, LRESULT& result) {
+        g_pfnOldWndProc = previous;
+        result = 0;
+        switch (uMsg) {
             case WM_CLOSE: {
-                if (g_quitForwarded || g_quitWindow != nullptr) return 0;
+                if (g_quitForwarded || g_quitWindow != nullptr) return true;
                 g_quitWindow = hWnd;
                 g_quitWParam = wParam;
                 g_quitLParam = lParam;
@@ -691,13 +462,13 @@ namespace GakumasLocal::WinHooks {
                 auto& runtime = gakumas::vr::VrRuntime::Instance();
                 if (!runtime.PollGameQuit().CanClose()) {
                     g_quitTimer = SetTimer(nullptr, 0, 20, GameQuitTimer);
-                    if (g_quitTimer != 0) return 0;
+                    if (g_quitTimer != 0) return true;
                     runtime.WriteVrLog("[VR][runtime] GAME_QUIT_TIMER failed error=" +
                         std::to_string(GetLastError()));
                     runtime.GameQuitTimerFailed();
                 }
                 ForwardGameClose();
-                return 0;
+                return true;
             }
             case WM_NCDESTROY: {
                 if (hWnd == g_quitWindow) {
@@ -706,76 +477,10 @@ namespace GakumasLocal::WinHooks {
                     g_quitWindow = nullptr;
                 }
             }; break;
-            case WM_NCHITTEST:
-            {
-                if (GakumasLocal::Config::dmmUnlockSize) {
-                    POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                    ScreenToClient(hWnd, &pt);
-                    RECT rcClient;
-                    GetClientRect(hWnd, &rcClient);
-                    const int borderWidth = 8; // 根据需要调整边缘宽度
-
-                    bool left = pt.x < borderWidth;
-                    bool right = pt.x >= rcClient.right - borderWidth;
-                    bool top = pt.y < borderWidth;
-                    bool bottom = pt.y >= rcClient.bottom - borderWidth;
-
-                    if (top && left) return HTTOPLEFT;
-                    if (top && right) return HTTOPRIGHT;
-                    if (bottom && left) return HTBOTTOMLEFT;
-                    if (bottom && right) return HTBOTTOMRIGHT;
-                    if (left) return HTLEFT;
-                    if (right) return HTRIGHT;
-                    if (top) return HTTOP;
-                    if (bottom) return HTBOTTOM;
-                    return HTCLIENT;
-                }
-            } break;
-
-            case WM_GETMINMAXINFO:
-            {
-                if (GakumasLocal::Config::dmmUnlockSize) {
-                    LPMINMAXINFO lpMMI = (LPMINMAXINFO)lParam;
-                    // 设置最大尺寸为屏幕分辨率，这样就不限制窗口的最大尺寸
-                    lpMMI->ptMaxTrackSize.x = GetSystemMetrics(SM_CXSCREEN) * 3;
-                    lpMMI->ptMaxTrackSize.y = GetSystemMetrics(SM_CYSCREEN) * 3;
-                    // 可选：设置窗口最小尺寸（例如200x200）
-                    lpMMI->ptMinTrackSize.x = 200;
-                    lpMMI->ptMinTrackSize.y = 200;
-                    return 1;
-                }
-            } break;
-
-            case WM_SYSCOMMAND: {
-                if (GakumasLocal::Config::dmmUnlockSize) {
-                    if ((wParam & 0xFFF0) == SC_MAXIMIZE) {
-                        SwitchFullScreen(hWnd);
-                        return 1;
-                    }
-                }
-            } break;
-
-			case WM_NCPAINT: {
-                if (GakumasLocal::Config::dmmUnlockSize) {
-                    LONG style = GetWindowLong(hWnd, GWL_STYLE);
-                    // printf("WM_NCPAINT: 0x%x\n", style);
-
-                    if (!(style & WS_POPUP)) {
-                        // 添加可调整大小的边框和最大化按钮
-                        style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
-                        SetWindowLong(hWnd, GWL_STYLE, style);
-                    }
-                }
-
-			} break;
-
-            default: break;
-            }
-
-            return CallWindowProc(g_pfnOldWndProc, hWnd, uMsg, wParam, lParam);
         }
-
-        void InstallWndProcHook() {
+        return false;
+    }
+        void InstallWindowProcedure(WNDPROC callback, WNDPROC* previous) {
             static std::atomic_bool installed{false};
             if (installed.exchange(true, std::memory_order_acq_rel)) {
                 return;
@@ -812,8 +517,8 @@ namespace GakumasLocal::WinHooks {
                 return;
             }
 
-            g_pfnOldWndProc = (WNDPROC)GetWindowLongPtr(hWnd, GWLP_WNDPROC);
-            SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)WndProcCallback);
+            *previous = (WNDPROC)GetWindowLongPtr(hWnd, GWLP_WNDPROC);
+            SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)callback);
             LONG style = GetWindowLong(hWnd, GWL_STYLE);
             style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
             SetWindowLong(hWnd, GWL_STYLE, style);
@@ -823,16 +528,7 @@ namespace GakumasLocal::WinHooks {
                 static_cast<void>(gakumas::vr::WriteVrLog(line.str()));
             }
         }
-
-        void UninstallWndProcHook(HWND hWnd)
-        {
-            SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)g_pfnOldWndProc);
-        }
-
-    }
-
 }
-
 // Existing native harness cannot run Unity bootstrap. Exercise the real window
 // hook on its own UnityWndClass window through an explicit test seam.
 extern "C" __declspec(dllexport) void GakumasVrInstallQuitHookForTest() noexcept {

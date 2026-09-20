@@ -2,11 +2,10 @@
 
 #include <filesystem>
 #include <string>
+#include "../../GakumasLocalify/config/Config.hpp"
 
 namespace GakumasLocal::Config {
-    extern bool isConfigInit;
 
-    extern bool dbgMode;
     // File-backed VR diagnostics switch. Unlike the upstream dbgMode, this is
     // sampled only during bootstrap and is not controlled by keyboard input.
     // It gates optional render/camera diagnostics, not VR startup itself.
@@ -18,7 +17,6 @@ namespace GakumasLocal::Config {
     // Legacy Localify key. In the VR fork this is the Localify feature
     // layer (unlocks, graphics, extra bundles), not the injected-module
     // lifetime switch and not the text/font/texture localization gate.
-    extern bool enabled;
     // VR-owned localization valve. When false, I18n / generic text /
     // MasterDB / font / texture replacements stay off even if `enabled`
     // is true. Default off so other Localify features can run without
@@ -220,61 +218,16 @@ namespace GakumasLocal::Config {
     void ResetVrPointerSettings();
     void ClampVrEyeAaSettings();
     void ClampVrPointerSettings();
-    extern bool lazyInit;
-    extern bool replaceFont;
-    extern bool replaceTexture;
-    extern bool forceExportResource;
-    extern int gameOrientation;
-    extern bool textTest;
-    extern bool useMasterTrans;
-    extern bool dumpText;
-    extern bool dumpRuntimeTexture;
-    extern bool enableFreeCamera;
-    extern int targetFrameRate;
-    extern bool unlockAllLive;
-    extern bool unlockAllLiveCostume;
 
-    extern bool enableLiveCustomeDress;
-    extern std::string liveCustomeHeadId;
-    extern std::string liveCustomeCostumeId;
 
-    extern bool loginAsIOS;
 
-    extern bool useCustomeGraphicSettings;
-    extern float renderScale;
-    extern int qualitySettingsLevel;
-    extern int volumeIndex;
-    extern int maxBufferPixel;
 
-    extern int reflectionQualityLevel;
-    extern int lodQualityLevel;
 
-    extern bool enableBreastParam;
-    extern float bDamping;
-    extern float bStiffness;
-    extern float bSpring;
-    extern float bPendulum;
-    extern float bPendulumRange;
-    extern float bAverage;
-    extern float bRootWeight;
-    extern bool bUseArmCorrection;
-    extern bool bUseScale;
-    extern float bScale;
-    extern bool bUseLimit;
-    extern float bLimitXx;
-    extern float bLimitXy;
-    extern float bLimitYx;
-    extern float bLimitYy;
-    extern float bLimitZx;
-    extern float bLimitZy;
 
-    extern bool dmmUnlockSize;
 
     enum class ConfigLoadPurpose { LocalifyReload, StartupMigration };
-    void LoadConfig(const std::string& configStr);
     void LoadConfig(const std::string& configStr,
         ConfigLoadPurpose purpose);
-    void SaveConfig(const std::string& configPath);
     void LoadVrConfig(
         const std::filesystem::path& configPath,
         const std::filesystem::path& legacyConfigPath);

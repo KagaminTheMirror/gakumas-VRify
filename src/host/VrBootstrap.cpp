@@ -18,26 +18,12 @@
 #include "vr/VrRuntime.hpp"
 
 extern void start_console();
-
-const auto CONSOLE_TITLE = L"Gakumas Localify";
-
-std::filesystem::path gakumasLocalPath = "./gakumas-local";
-std::filesystem::path ProgramConfigJson = gakumasLocalPath / "config.json";
-std::filesystem::path ConfigJson = gakumasLocalPath / "localizationConfig.json";
+extern void readProgramConfig();
+extern void create_localify_console();
+extern std::filesystem::path gakumasLocalPath, ProgramConfigJson, ConfigJson;
+extern bool g_enable_console;
 std::filesystem::path VrConfigJson = "./gakumas-vr/config.json";
-
-bool g_has_config_file = false;
-bool g_enable_console = false;
-bool g_useRemoteAssets = false;
-bool g_useAPIAssets = false;
-bool g_useAPITextureAssets = false;
-bool g_delTextureRemoteAfterUpdate = true;
-std::string g_remoteResourceUrl = "";
-std::string g_useAPIAssetsURL = "";
-std::string g_useAPITextureAssetsURL = "https://texture.gakumas.cn/api/gkms_texture_data";
-
-namespace
-{
+namespace {
 	BOOL WINAPI GameQuitConsoleHandler(DWORD controlType)
 	{
 		switch (controlType) {
@@ -61,84 +47,7 @@ namespace
 		}
 		return FALSE;
 	}
-
-	void create_debug_console()
-	{
-		AllocConsole();
-		SetConsoleCtrlHandler(GameQuitConsoleHandler, TRUE);
-
-		// open stdout stream
-		auto _ = freopen("CONOUT$", "w+t", stdout);
-		_ = freopen("CONOUT$", "w", stderr);
-		_ = freopen("CONIN$", "r", stdin);
-
-		SetConsoleTitleW(CONSOLE_TITLE);
-
-		// set this to avoid turn japanese texts into question mark
-		SetConsoleOutputCP(65001);
-		std::locale::global(std::locale(""));
-
-		wprintf(L"%ls Loaded! - By chinosk\n", CONSOLE_TITLE);
-		gakumas::vr::WriteVrConsole("Gakumas VRify Loaded! - By KagaminTheMirror");
-	}
 }
-
-void readProgramConfig() {
-	std::vector<std::string> dicts{};
-	g_has_config_file = false;
-	g_enable_console = false;
-	g_useRemoteAssets = false;
-	g_useAPIAssets = false;
-	g_useAPITextureAssets = false;
-	std::ifstream config_stream{ ProgramConfigJson };
-
-	if (!config_stream.is_open())
-		return;
-
-	rapidjson::IStreamWrapper wrapper{ config_stream };
-	rapidjson::Document document;
-
-	document.ParseStream(wrapper);
-
-	if (!document.HasParseError() && document.IsObject())
-	{
-		g_has_config_file = true;
-		if (document.HasMember("enableConsole") && document["enableConsole"].IsBool()) {
-			g_enable_console = document["enableConsole"].GetBool();
-		}
-
-		if (document.HasMember("useRemoteAssets") && document["useRemoteAssets"].IsBool()) {
-			g_useRemoteAssets = document["useRemoteAssets"].GetBool();
-		}
-
-		if (document.HasMember("transRemoteZipUrl") && document["transRemoteZipUrl"].IsString()) {
-			g_remoteResourceUrl = document["transRemoteZipUrl"].GetString();
-		}
-
-		if (document.HasMember("useAPIAssets") && document["useAPIAssets"].IsBool()) {
-			g_useAPIAssets = document["useAPIAssets"].GetBool();
-		}
-
-		if (document.HasMember("useAPIAssetsURL") && document["useAPIAssetsURL"].IsString()) {
-			g_useAPIAssetsURL = document["useAPIAssetsURL"].GetString();
-		}
-
-		if (document.HasMember("useAPITextureAssets") && document["useAPITextureAssets"].IsBool()) {
-			g_useAPITextureAssets = document["useAPITextureAssets"].GetBool();
-		}
-
-		if (document.HasMember("useAPITextureAssetsURL") && document["useAPITextureAssetsURL"].IsString()) {
-			g_useAPITextureAssetsURL = document["useAPITextureAssetsURL"].GetString();
-		}
-
-		if (document.HasMember("delTextureRemoteAfterUpdate") && document["delTextureRemoteAfterUpdate"].IsBool()) {
-			g_delTextureRemoteAfterUpdate = document["delTextureRemoteAfterUpdate"].GetBool();
-		}
-
-	}
-	config_stream.close();
-}
-
 namespace {
     bool install_vr_hook_batch(void*, const gakumas::vr::HookRegistrar::Request* requests, std::size_t count) {
         std::vector<GakumasVR::Hooks::Request> batch;
@@ -201,7 +110,9 @@ namespace {
 				GakumasLocal::Config::vrDiagnosticsEnabled;
 
 			if (g_enable_console) {
-				create_debug_console();
+				create_localify_console();
+                SetConsoleCtrlHandler(GameQuitConsoleHandler, TRUE);
+                gakumas::vr::WriteVrConsole("Gakumas VRify Loaded! - By KagaminTheMirror");
 				start_console();
 				printf("Command: %s\n", GetCommandLineA());
 			}

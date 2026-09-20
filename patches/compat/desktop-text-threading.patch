@@ -1,0 +1,11 @@
+--- a/src/gkmsGUI/GUII18n.cpp
++++ b/src/gkmsGUI/GUII18n.cpp
+@@ -37,7 +37,7 @@
+             return it->second.c_str();
+         }
+ 
+-        static std::unordered_map<std::string, std::string> fallbackMap;
++        static thread_local std::unordered_map<std::string, std::string> fallbackMap;
+         auto [iter, inserted] = fallbackMap.emplace(key, key);
+         return iter->second.c_str();
+     }

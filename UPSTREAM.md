@@ -15,13 +15,15 @@ The authoritative pin is [upstream.lock.json](upstream.lock.json): commit `098a4
 
 The public repository starts with selected source files, not the development repository's Git history. Internal hardware logs, extracted game data, investigation notes, development backlogs, private machine configuration, and generated build products are excluded.
 
-The upstream checkout is verified before staging or packaging. Its original implementation files remain present in the combined tree, but the CMake target excludes implementations listed as substitutions in the lock. Headers and relative include paths remain compatible with the existing integration. ImGui's font decompression state and lazy CJK range caches are adapted only in a generated copy, compiled through `src/host/ImGuiDraw.cpp`.
+The pinned raw source is verified and staged, then receives the exact patches in `patches/manifest.json`. CMake directly compiles the resulting upstream business implementations and this repository's owned adapters. There are no whole-file substitutions. ImGui uses the same patch pipeline. Invalid patch inputs/outputs or stale receipts stop build, packaging and installation.
+
+See [patches/README.md](patches/README.md) for the shared pipeline and named seam contracts. `scripts/check-source-ownership.py` checks candidate tracked files and untracked additions for forbidden upstream trees, retired copies and matching long upstream function bodies. Generated source remains ignored.
 
 ## Updating upstream
 
-1. Review changes between the current pin and the candidate upstream commit, especially every path in the lock's `substitutions` list.
+1. Review changes between the current pin and the candidate upstream commit, especially every path in the patch manifest.
 2. Port required behavior into the local adapters. Do not patch the fetched checkout as a permanent fix.
-3. Update the full commit and tree hashes in `upstream.lock.json` together. Preserve the substitution inventory unless the integration actually changes.
+3. Update the full commit and tree hashes in `upstream.lock.json` together. Review and regenerate each exact patch preimage/postimage digest; never bypass a mismatch.
 4. Preserve any useful local work in `.upstream/localify/`, then remove that generated checkout and rerun `scripts/fetch-upstream.ps1`.
 5. Run the boundary and source-layout checks, relevant C++ tests, a Release build, packaging, and hardware validation before publishing a new runtime.
 

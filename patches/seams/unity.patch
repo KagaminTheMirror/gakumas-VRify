@@ -1,0 +1,706 @@
+--- a/src/GakumasLocalify/Hook.cpp
++++ b/src/GakumasLocalify/Hook.cpp
+@@ -34,6 +34,8 @@
+ #endif
+ 
+ 
++#include "host/localify/UnityIntegration.hpp"
++
+ std::unordered_set<void*> hookedStubs{};
+ extern std::filesystem::path gakumasLocalPath;
+ 
+@@ -60,6 +62,8 @@
+     using Il2cppString = UnityResolve::UnityType::String;
+     using Il2CppGCHandle = void*;
+ 
++#include "vr/unity/LocalizationPolicy.inc.cpp"
++
+     UnityResolve::UnityType::String* environment_get_stacktrace() {
+         /*
+         static auto mtd = Il2cppUtils::GetMethod("mscorlib.dll", "System",
+@@ -120,11 +124,13 @@
+         );
+     }
+ 
++#include "vr/unity/CameraRuntime.inc.cpp"
++
+     UnityResolve::UnityType::Camera* mainCameraCache = nullptr;
+     UnityResolve::UnityType::Transform* cameraTransformCache = nullptr;
+ 
+     void CheckAndUpdateMainCamera(UnityResolve::UnityType::Camera* fallbackCamera = nullptr) {
+-        if (!Config::enableFreeCamera) return;
++        if (!IsLocalifyFreeCameraEnabled()) return;
+         if (IsNativeObjectAlive(mainCameraCache) && IsNativeObjectAlive(cameraTransformCache)) return;
+ 
+         // 优先使用游戏传入的真实相机（渲染回调 / FOV hook 捕获）。
+@@ -165,7 +171,7 @@
+     }
+ 
+     DEFINE_HOOK(void, Unity_set_fieldOfView, (UnityResolve::UnityType::Camera* self, float value)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             // self 是游戏传的真实相机，直接捕获。
+             // Cinemachine 每帧会把镜头参数应用到输出相机，这里拿到的就是实际游戏相机。
+             if (self != mainCameraCache) {
+@@ -180,7 +186,7 @@
+     }
+ 
+     DEFINE_HOOK(float, Unity_get_fieldOfView, (UnityResolve::UnityType::Camera* self)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             if (self != mainCameraCache) {
+                 mainCameraCache = self;
+                 cameraTransformCache = nullptr;
+@@ -212,9 +218,11 @@
+     // 从游戏自己的调用里捕获真实对象指针：
+     // Camera.get_main / Component.get_transform 是带 MethodInfo* 尾参的 managed 方法，
+     // 用 hook（而不是 UnityResolve 的 managed Invoke）才能拿到可靠结果。
++#include "vr/unity/MainCameraCallback.inc.cpp"
+     DEFINE_HOOK(UnityResolve::UnityType::Camera*, Camera_get_main, (void* mtd)) {
+         auto ret = Camera_get_main_Orig(mtd);
+-        if (Config::enableFreeCamera && ret && ret != mainCameraCache) {
++        if (ObserveMainCamera(ret)) return ret;
++        if (IsLocalifyFreeCameraEnabled() && ret && ret != mainCameraCache) {
+             mainCameraCache = ret;
+             cameraTransformCache = nullptr;
+         }
+@@ -223,7 +231,7 @@
+ 
+     DEFINE_HOOK(UnityResolve::UnityType::Transform*, Component_get_transform, (void* self, void* mtd)) {
+         auto ret = Component_get_transform_Orig(self, mtd);
+-        if (Config::enableFreeCamera && mainCameraCache && self == mainCameraCache) {
++        if (IsLocalifyFreeCameraEnabled() && mainCameraCache && self == mainCameraCache) {
+             cameraTransformCache = ret;
+         }
+         return ret;
+@@ -279,8 +287,12 @@
+     // 字段偏移来自 hook-reference dump.cs：
+     //   0x00 Lens.FieldOfView | 0x48 RawPosition | 0x54 RawOrientation
+     //   0x64 PositionDampingBypass | 0x74 PositionCorrection | 0x80 OrientationCorrection
++#include "vr/unity/CameraCallbacks.inc.cpp"
+     DEFINE_HOOK(void, CinemachineBrain_PushStateToUnityCamera, (void* self, void* state, void* mtd)) {
+-        if (Config::enableFreeCamera && state) {
++        VR_PERF_SCOPE(whole, "camera.push-state-hook", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
++        VR_PERF_SCOPE(pose, "camera.pose-mod", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
++        BeforeCameraState(self, state);
++        if (IsLocalifyFreeCameraEnabled() && state) {
+             CheckAndUpdateMainCamera();
+ 
+             using Vector3 = UnityResolve::UnityType::Vector3;
+@@ -300,15 +312,20 @@
+             }
+         }
+ 
+-        return CinemachineBrain_PushStateToUnityCamera_Orig(self, state, mtd);
+-    }
+-
+-    // Cinemachine 3（Unity 6）用 SetPositionAndRotation 一次性写相机位置+旋转，
+-    // set_position/set_rotation 拦截不到相机，必须在这里接管。
++        pose.Stop();
++        VR_PERF_SCOPE(original, "camera.push-state-original", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
++        CinemachineBrain_PushStateToUnityCamera_Orig(self, state, mtd);
++        original.Stop();
++        VR_PERF_SCOPE(post, "camera.post-state", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
++        AfterCameraState(self);
++    }
++
++#include "vr/unity/FlareHooks.inc.cpp"
++
+     DEFINE_HOOK(void, Unity_SetPositionAndRotation_Injected, (UnityResolve::UnityType::Transform* self,
+                                                               UnityResolve::UnityType::Vector3* position,
+                                                               UnityResolve::UnityType::Quaternion* rotation)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             CheckAndUpdateMainCamera();
+ 
+             const auto isControl = IsCameraControlTransform(self);
+@@ -328,7 +345,7 @@
+     // 兜底：游戏若用局部坐标写相机（rig 挂载场景），位置同样接管。
+     DEFINE_HOOK(void, Unity_set_localPosition_Injected, (UnityResolve::UnityType::Transform* self,
+                                                          UnityResolve::UnityType::Vector3* data)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             CheckAndUpdateMainCamera();
+ 
+             const auto isControl = IsCameraControlTransform(self);
+@@ -359,7 +376,7 @@
+     }
+ 
+     DEFINE_HOOK(void, Unity_set_rotation_Injected, (UnityResolve::UnityType::Transform* self, UnityResolve::UnityType::Quaternion* value)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             const auto isControl = IsCameraControlTransform(self);
+             if (isControl) {
+                 const auto cameraMode = GKCamera::GetCameraMode();
+@@ -412,7 +429,7 @@
+     }
+ 
+     DEFINE_HOOK(void, Unity_set_position_Injected, (UnityResolve::UnityType::Transform* self, UnityResolve::UnityType::Vector3* data)) {
+-        if (Config::enableFreeCamera) {
++        if (IsLocalifyFreeCameraEnabled()) {
+             CheckAndUpdateMainCamera();
+ 
+             const auto isControl = IsCameraControlTransform(self);
+@@ -522,10 +539,15 @@
+     }
+ #endif
+ 
++#include "vr/unity/RenderBeginHooks.inc.cpp"
++
++#include "vr/unity/EndCameraCallback.inc.cpp"
+     DEFINE_HOOK(void, EndCameraRendering, (void* ctx, void* camera, void* method)) {
+         EndCameraRendering_Orig(ctx, camera, method);
+ 
+-        if (Config::enableFreeCamera) {
++        const bool ownedByVrQueue = AfterEndCamera(camera);
++
++        if (!ownedByVrQueue && IsLocalifyFreeCameraEnabled()) {
+             // Camera.main 可能拿不到 3.0.0 实际渲染相机，用当前正在渲染的相机兜底
+             CheckAndUpdateMainCamera(static_cast<UnityResolve::UnityType::Camera*>(camera));
+             if (mainCameraCache && IsNativeObjectAlive(mainCameraCache)) {
+@@ -539,9 +561,11 @@
+         }
+     }
+ 
++#include "vr/unity/RenderLoopHooks.inc.cpp"
++
+     DEFINE_HOOK(void, Unity_set_targetFrameRate, (int value)) {
+         const auto configFps = Config::targetFrameRate;
+-        return Unity_set_targetFrameRate_Orig(configFps == 0 ? value: configFps);
++        return Unity_set_targetFrameRate_Orig(configFps == 0 ? value : configFps);
+     }
+ 
+     std::unordered_map<void*, std::string> loadHistory{};
+@@ -621,10 +645,8 @@
+     }
+ 
+     DEFINE_HOOK(void, CanvasRenderer_SetTexture, (void* self, void* texture, void* method)) {
+-        CanvasRenderer_SetTexture_Orig(
+-            self,
+-            ReplaceTextureOrSpriteByObjectName(texture), method
+-        );
++        void* selected = LocalizationActive() ? ReplaceTextureOrSpriteByObjectName(texture) : texture;
++        CanvasRenderer_SetTexture_Orig(self, selected, method);
+     }
+ 
+     DEFINE_HOOK(void, SpriteRenderer_set_sprite, (void* self, void* sprite)) {
+@@ -640,8 +662,12 @@
+     DEFINE_HOOK(void, I18nHelper_SetValue, (void* self, Il2cppString* key, Il2cppString* value)) {
+         // Log::InfoFmt("I18nHelper_SetValue: %s - %s", key->ToString().c_str(), value->ToString().c_str());
+         std::string local;
+-        if (Local::GetI18n(key->ToString(), &local)) {
++        if (TryGetI18n(key->ToString(), &local)) {
+             I18nHelper_SetValue_Orig(self, key, UnityResolve::UnityType::String::New(local));
++            return;
++        }
++        if (!LocalizationActive()) {
++            I18nHelper_SetValue_Orig(self, key, value);
+             return;
+         }
+         Local::DumpI18nItem(key->ToString(), value->ToString());
+@@ -662,10 +688,14 @@
+     typedef std::unordered_set<std::wstring, TransparentStringHash, std::equal_to<void>> AssetPathsType;
+     std::map<std::string, AssetPathsType> CustomAssetBundleAssetPaths;
+     std::unordered_map<std::string, Il2CppGCHandle> CustomAssetBundleHandleMap{};
++    std::unordered_set<std::string> CustomAssetBundleFailedPaths{};
+     std::list<std::string> g_extra_assetbundle_paths{};
++    std::atomic_bool extraAssetBundleLoadAllowed{false};
++    std::mutex extraAssetBundleLoadMutex;
+ 
+     void LoadExtraAssetBundle() {
+         using Il2CppString = UnityResolve::UnityType::String;
++        std::lock_guard<std::mutex> lock(extraAssetBundleLoadMutex);
+ 
+         if (g_extra_assetbundle_paths.empty()) {
+             return;
+@@ -682,7 +712,10 @@
+         );
+ 
+         for (const auto& i : g_extra_assetbundle_paths) {
+-            if (CustomAssetBundleHandleMap.contains(i)) continue;
++            if (CustomAssetBundleHandleMap.contains(i) ||
++                CustomAssetBundleFailedPaths.contains(i)) {
++                continue;
++            }
+ 
+             const auto extraAssetBundle = WinHooks::LoadAssetBundle(i);
+             if (extraAssetBundle)
+@@ -701,12 +734,16 @@
+             }
+             else
+             {
++                CustomAssetBundleFailedPaths.insert(i);
+                 Log::ErrorFmt("Cannot load asset bundle: %s\n", i.c_str());
+             }
+         }
+     }
+ 
++#include "host/localify/AssetBundleIntegration.inc.cpp"
++
+     Il2CppGCHandle GetBundleHandleByAssetName(std::wstring assetName) {
++        EnsureExtraAssetBundle();
+         for (const auto& i : CustomAssetBundleAssetPaths) {
+             for (const auto& m : i.second) {
+                 if (std::equal(m.begin(), m.end(), assetName.begin(), assetName.end(),
+@@ -728,7 +765,7 @@
+ 
+     void* GetReplaceFont() {
+         static auto FontClass = Il2cppUtils::GetClass("UnityEngine.TextRenderingModule.dll", "UnityEngine", "Font");
+-        static auto Font_Type = UnityResolve::Invoke<Il2cppUtils::Il2CppReflectionType*>("il2cpp_type_get_object", 
++        static auto Font_Type = UnityResolve::Invoke<Il2cppUtils::Il2CppReflectionType*>("il2cpp_type_get_object",
+             UnityResolve::Invoke<void*>("il2cpp_class_get_type", FontClass->address));
+ 
+         using Il2CppString = UnityResolve::UnityType::String;
+@@ -871,7 +908,7 @@
+ 
+     std::unordered_set<void*> updatedFontPtrs{};
+     void UpdateFont(void* TMP_Textself) {
+-        if (!Config::replaceFont) return;
++        if (!Config::replaceFont || !LocalizationActive()) return;
+         static auto get_font = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll",
+                                                       "TMPro", "TMP_Text", "get_font");
+         static auto set_font = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll",
+@@ -900,7 +937,7 @@
+         auto fontAssetName = get_name->Invoke<Il2cppString*>(fontAsset);
+         if (fontAssetName) {
+             std::string fontName = fontAssetName->ToString();
+-            std::transform(fontName.begin(), fontName.end(), fontName.begin(), 
++            std::transform(fontName.begin(), fontName.end(), fontName.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+             if (fontName.find("campusalphanumeric") != std::string::npos) {
+                 return;  // 保持原版数字字体
+@@ -916,7 +953,7 @@
+             UpdateFontAssetData->Invoke<void>(fontAsset);
+         }
+         if (updatedFontPtrs.size() > 200) updatedFontPtrs.clear();
+-        
++
+         set_font->Invoke<void>(TMP_Textself, fontAsset);
+ 
+ //        auto fontMaterial = get_material->Invoke<void*>(fontAsset);
+@@ -934,7 +971,7 @@
+ 
+         const std::string origText = Substring->Invoke<Il2cppString*>(text, start, length)->ToString();
+         std::string transText;
+-        if (Local::GetGenericText(origText, &transText)) {
++        if (TryGetGenericText(origText, &transText)) {
+             const auto newText = UnityResolve::UnityType::String::New(transText);
+             UpdateFont(self);
+             return TMP_Text_PopulateTextBackingArray_Orig(self, newText, 0, newText->length);
+@@ -955,7 +992,7 @@
+         }
+         const std::string origText = value->ToString();
+         std::string transText;
+-        if (Local::GetGenericText(origText, &transText)) {
++        if (TryGetGenericText(origText, &transText)) {
+             const auto newText = UnityResolve::UnityType::String::New(transText);
+             UpdateFont(self);
+             return TMP_Text_set_text_Orig(self, newText, mtd);
+@@ -975,7 +1012,7 @@
+         }
+         const std::string origText = sourceText->ToString();
+         std::string transText;
+-        if (Local::GetGenericText(origText, &transText)) {
++        if (TryGetGenericText(origText, &transText)) {
+             const auto newText = UnityResolve::UnityType::String::New(transText);
+             UpdateFont(self);
+             return TMP_Text_SetText_1_Orig(self, newText, mtd);
+@@ -995,7 +1032,7 @@
+ 		}
+ 		const std::string origText = sourceText->ToString();
+ 		std::string transText;
+-		if (Local::GetGenericText(origText, &transText)) {
++		if (TryGetGenericText(origText, &transText)) {
+ 			const auto newText = UnityResolve::UnityType::String::New(transText);
+ 			UpdateFont(self);
+ 			return TMP_Text_SetText_2_Orig(self, newText, syncTextInputBox, mtd);
+@@ -1020,7 +1057,7 @@
+         if (currText) {
+             //Log::InfoFmt("TextMeshProUGUI_Awake: %s", currText->ToString().c_str());
+             std::string transText;
+-            if (Local::GetGenericText(currText->ToString(), &transText)) {
++            if (TryGetGenericText(currText->ToString(), &transText)) {
+                 if (Config::textTest) {
+                     set_Text_method->Invoke<void>(self, UnityResolve::UnityType::String::New("[TA]" + transText));
+                 }
+@@ -1042,7 +1079,7 @@
+         }
+         const std::string origText = value->ToString();
+         std::string transText;
+-        if (Local::GetGenericText(origText, &transText)) {
++        if (TryGetGenericText(origText, &transText)) {
+             const auto newText = UnityResolve::UnityType::String::New(transText);
+             return UIText_set_text_Orig(self, newText);
+         }
+@@ -1070,7 +1107,7 @@
+                         static_cast<size_t>(count));
+                     const std::string origText = Misc::ToUTF8(u16);
+                     std::string transText;
+-                    if (Local::GetGenericText(origText, &transText)) {
++                    if (TryGetGenericText(origText, &transText)) {
+                         UpdateFont(self);
+                         TMP_Text_set_text_Orig(self, Il2cppString::New(transText), nullptr);
+                         return;
+@@ -1089,7 +1126,7 @@
+     DEFINE_HOOK(void, TextField_set_value, (void* self, Il2cppString* value)) {
+         if (value) {
+             std::string transText;
+-            if (Local::GetGenericText(value->ToString(), &transText)) {
++            if (TryGetGenericText(value->ToString(), &transText)) {
+                 return TextField_set_value_Orig(self, UnityResolve::UnityType::String::New(transText));
+             }
+         }
+@@ -1112,7 +1149,8 @@
+     // 用于本地化 MasterDB
+     DEFINE_HOOK(void, MessageExtensions_MergeFrom, (void* message, void* span, void* mtd)) {
+         MessageExtensions_MergeFrom_Orig(message, span, mtd);
+-        if (message) {
++        if (LocalizationActive() && message) {
++            EnsureLocalizationData();
+             auto ret_klass = Il2cppUtils::get_class_from_instance(message);
+             if (ret_klass) {
+                 // Log::DebugFmt("LocalizeMasterItem: %s", ret_klass->name);
+@@ -1174,7 +1212,8 @@
+         Log::DebugFmt("OctoResourceLoader_LoadFromCacheOrDownload: %s\n", resourceName->ToString().c_str());
+ 
+         std::string replaceStr;
+-        if (Local::GetResourceText(resourceName->ToString(), &replaceStr)) {
++        if (LocalizationActive() &&
++            Local::GetResourceText(resourceName->ToString(), &replaceStr)) {
+             const auto onComplete_klass = Il2cppUtils::get_class_from_instance(onComplete);
+             const auto onComplete_invoke_mtd = UnityResolve::Invoke<Il2cppUtils::MethodInfo*>(
+                     "il2cpp_class_get_method_from_name", onComplete_klass, "Invoke", 2);
+@@ -1811,15 +1850,23 @@
+     std::unordered_set<void*> g_lyricsInitialForced{};
+ 
+     DEFINE_HOOK(void, LiveSceneModel_set_IsLyricsActive, (void* self, bool value, void* mtd)) {
++#ifdef GKMS_WINDOWS
++        gakumas::vr::NoteLiveSceneModel(self);
++#endif
+         return LiveSceneModel_set_IsLyricsActive_Orig(self, value, mtd);
+     }
+ 
+     DEFINE_HOOK(void, LiveScenePresenter_SetLyricsActive, (void* self, bool value, void* mtd)) {
++#ifdef GKMS_WINDOWS
++        gakumas::vr::NoteLiveScenePresenter(self);
++#endif
+         if (Config::dbgMode && Config::unlockAllLive && self && g_lyricsInitialForced.insert(self).second) {
+             value = true;
+         }
+         return LiveScenePresenter_SetLyricsActive_Orig(self, value, mtd);
+     }
++
++#include "vr/unity/PhotoHooks.inc.cpp"
+ 
+     DEFINE_HOOK(void, LiveSceneContentView_SetLyricsTextActive, (void* self, bool value, void* mtd)) {
+         return LiveSceneContentView_SetLyricsTextActive_Orig(self, value, mtd);
+@@ -1867,10 +1914,20 @@
+     }
+ #endif
+ 
++#include "vr/unity/ActorLightingHooks.inc.cpp"
++
+     DEFINE_HOOK(bool, VLDOF_IsActive, (void* self)) {
+-        if (Config::enableFreeCamera) return false;
+-        return VLDOF_IsActive_Orig(self);
+-    }
++        if (IsLocalifyFreeCameraEnabled()) return false;
++        const bool originalActive = VLDOF_IsActive_Orig(self);
++#ifdef GKMS_WINDOWS
++        if (unityStereoRenderer.ShouldSuppressDepthOfField(self, originalActive)) {
++            return false;
++        }
++#endif
++        return originalActive;
++    }
++
++#include "vr/unity/DepthOfFieldHook.inc.cpp"
+ 
+     DEFINE_HOOK(void, CampusQualityManager_set_TargetFrameRate, (void* self, float value)) {
+         // Log::InfoFmt("CampusQualityManager_set_TargetFrameRate: %f", value);
+@@ -1971,36 +2028,19 @@
+         return true;
+     }
+ 
++#include "vr/unity/HeadVisibility.inc.cpp"
++
+     void HideHead(UnityResolve::UnityType::GameObject* obj, const bool isFace) {
+-        static UnityResolve::UnityType::GameObject* lastFaceObj = nullptr;
+-        static UnityResolve::UnityType::GameObject* lastHairObj = nullptr;
+-
+-#define lastHidedObj (isFace ? lastFaceObj : lastHairObj)
+-
+-       static auto get_activeInHierarchy = reinterpret_cast<bool (*)(void*)>(
+-                Il2cppUtils::il2cpp_resolve_icall("UnityEngine.GameObject::get_activeInHierarchy()"));
+-
+-        const auto isFirstPerson = GKCamera::GetCameraMode() == GKCamera::CameraMode::FIRST_PERSON;
+-
+-        if (isFirstPerson && obj) {
+-            if (obj == lastHidedObj) return;
+-            if (lastHidedObj && IsNativeObjectAlive(lastHidedObj) && get_activeInHierarchy(lastHidedObj)) {
+-                lastHidedObj->SetActive(true);
+-            }
+-            if (IsNativeObjectAlive(obj)) {
+-                obj->SetActive(false);
+-                lastHidedObj = obj;
+-            }
+-        }
+-        else {
+-            if (lastHidedObj && IsNativeObjectAlive(lastHidedObj)) {
+-                lastHidedObj->SetActive(true);
+-                lastHidedObj = nullptr;
+-            }
+-        }
+-    }
+-
++        ApplyHeadVisibility(obj, isFace);
++    }
++
++#include "vr/unity/ActorSampling.inc.cpp"
+     DEFINE_HOOK(void, CampusActorController_LateUpdate, (void* self, void* mtd)) {
++        if (Config::vrRuntimeStartupEnabled) {
++            SampleVrActor(self);
++            CampusActorController_LateUpdate_Orig(self, mtd);
++            return;
++        }
+         static auto CampusActorController_klass = Il2cppUtils::GetClass("campus-submodule.Runtime.dll",
+                                                                         "Campus.Common", "CampusActorController");
+         static auto rootBody_field = CampusActorController_klass->Get<UnityResolve::Field>("_rootBody");
+@@ -2016,9 +2056,8 @@
+         }
+ 
+         static auto GetHumanBodyBoneTransform_mtd = Il2cppUtils::il2cpp_class_get_method_from_name(parentKlass, "GetHumanBodyBoneTransform", 1);
+-        static auto GetHumanBodyBoneTransform = reinterpret_cast<UnityResolve::UnityType::Transform* (*)(void*, int)>(
+-                GetHumanBodyBoneTransform_mtd->methodPointer
+-                );
++        static auto GetHumanBodyBoneTransform = GetHumanBodyBoneTransform_mtd ? reinterpret_cast<UnityResolve::UnityType::Transform* (*)(void*, int)>(
++                GetHumanBodyBoneTransform_mtd->methodPointer) : nullptr;
+         static auto get_index_mtd = Il2cppUtils::il2cpp_class_get_method_from_name(CampusActorController_klass->address, "get_index", 0);
+         static auto get_Index = get_index_mtd ? reinterpret_cast<int (*)(void*)>(
+                 get_index_mtd->methodPointer) : [](void*){return 0;};
+@@ -2029,8 +2068,8 @@
+             static auto headBodyId = initPartsSuccess ? GKCamera::bodyPartsEnum.GetValueByName("Head") : 0xA;
+             const auto isFirstPerson = GKCamera::GetCameraMode() == GKCamera::CameraMode::FIRST_PERSON;
+ 
+-            auto targetTrans = GetHumanBodyBoneTransform(self,
+-                                                         isFirstPerson ? headBodyId : GKCamera::bodyPartsEnum.GetCurrent().second);
++            auto targetTrans = ActorBonesReady(self) && GetHumanBodyBoneTransform ? GetHumanBodyBoneTransform(self,
++                                                         isFirstPerson ? headBodyId : GKCamera::bodyPartsEnum.GetCurrent().second) : nullptr;
+ 
+             if (targetTrans) {
+                 cacheTrans = targetTrans;
+@@ -2068,6 +2107,8 @@
+ 
+         CampusActorController_LateUpdate_Orig(self, mtd);
+     }
++
++#include "vr/unity/GripHooks.inc.cpp"
+ 
+     DEFINE_HOOK(bool, PlatformInformation_get_IsAndroid, ()) {
+         if (Config::loginAsIOS) {
+@@ -2375,6 +2416,8 @@
+     }
+ */
+ 
++#include "vr/unity/RegisterUnityExtensions.inc.cpp"
++
+     void StartInjectFunctions() {
+         const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
+ 
+@@ -2385,12 +2428,25 @@
+             return;
+         }
+         UnityResolve::Init(il2cpp_module, UnityResolve::Mode::Il2Cpp, Config::lazyInit);
+-        GakumasLocal::WinHooks::Keyboard::InstallWndProcHook();
++        if (Config::vrRuntimeStartupEnabled && Config::enableFreeCamera &&
++            Config::vrDiagnosticsStartupEnabled) {
++            Log::Info(
++                "VR_CAMERA_OWNERSHIP owner=vr localifyFreeCamera=suppressed");
++        }
++        if (Config::enabled) {
++            GakumasLocal::WinHooks::Keyboard::InstallWndProcHook();
++        }
+ #else
+         UnityResolve::Init(xdl_open(hookInstaller->m_il2cppLibraryPath.c_str(), RTLD_NOW),
+             UnityResolve::Mode::Il2Cpp, Config::lazyInit);
+ #endif
+ 
++        if (Config::enabled) {
++        // Extra font/texture bundle is armed on demand from
++        // EnsureExtraAssetBundle when vrLocalizeText is on. Do not
++        // LoadFromFile on PatchWorker (.312).
++        // Translation and legacy Localify features are deliberately isolated
++        // from the VR camera core below.
+         // Texture replacement is currently isolated to CanvasRenderer.SetTexture.
+         //
+         // Unity 6 compatibility warning:
+@@ -2613,6 +2669,10 @@
+         ADD_HOOK(VLDOF_IsActive,
+                  Il2cppUtils::GetMethodPointer("Unity.RenderPipelines.Universal.Runtime.dll", "VL.Rendering",
+                                                "VLDOF", "IsActive"));
++        ADD_HOOK(URPDOF_IsActive,
++                 Il2cppUtils::GetMethodPointer("Unity.RenderPipelines.Universal.Runtime.dll",
++                                               "UnityEngine.Rendering.Universal",
++                                               "DepthOfField", "IsActive"));
+ 
+         ADD_HOOK(CampusQualityManager_ApplySetting,
+                  Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
+@@ -2634,9 +2694,6 @@
+         ADD_HOOK(CampusActorModelParts_OnRegisterBone,
+                  Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
+                                                "CampusActorModelParts", "OnRegisterBone"));
+-        ADD_HOOK(CampusActorController_LateUpdate,
+-                 Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
+-                                               "CampusActorController", "LateUpdate"));
+ 
+         ADD_HOOK(PlatformInformation_get_IsAndroid, Il2cppUtils::GetMethodPointer("Firebase.Platform.dll", "Firebase.Platform",
+                                                                          "PlatformInformation", "get_IsAndroid"));
+@@ -2710,46 +2767,39 @@
+         ADD_HOOK(InternalSetOrientationAsync,
+             Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
+                 "ScreenOrientationControllerBase", "InternalSetOrientationAsync"));
+-
+-        ADD_HOOK(Unity_set_position_Injected, Il2cppUtils::il2cpp_resolve_icall(
+-                "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)"));
+-        ADD_HOOK(Unity_set_rotation_Injected, Il2cppUtils::il2cpp_resolve_icall(
+-                "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)"));
+-        ADD_HOOK(Unity_SetPositionAndRotation_Injected, Il2cppUtils::il2cpp_resolve_icall(
+-                "UnityEngine.Transform::SetPositionAndRotation_Injected(UnityEngine.Vector3&,UnityEngine.Quaternion&)"));
+-        ADD_HOOK(Unity_set_localPosition_Injected, Il2cppUtils::il2cpp_resolve_icall(
+-                "UnityEngine.Transform::set_localPosition_Injected(UnityEngine.Vector3&)"));
+-        ADD_HOOK(Camera_get_main, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
+-                                                                "Camera", "get_main"));
+-        ADD_HOOK(CinemachineBrain_PushStateToUnityCamera,
+-                 Il2cppUtils::GetMethodPointer("Cinemachine.dll", "Cinemachine",
+-                                               "CinemachineBrain", "PushStateToUnityCamera"));
+-        ADD_HOOK(Component_get_transform, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
+-                                                                        "Component", "get_transform"));
+-        ADD_HOOK(Unity_get_fieldOfView, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
+-                                                                      "Camera", "get_fieldOfView"));
+-        ADD_HOOK(Unity_set_fieldOfView, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
+-                                                                      "Camera", "set_fieldOfView"));
+-        ADD_HOOK(Unity_set_targetFrameRate, Il2cppUtils::il2cpp_resolve_icall(
+-                "UnityEngine.Application::set_targetFrameRate(System.Int32)"));
+-        ADD_HOOK(EndCameraRendering, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine.Rendering",
+-                                                                     "RenderPipeline", "EndCameraRendering"));
++        }
++
++        // Keep the VR-only observation milestone deliberately smaller than the
++        // legacy translation/free-camera surface. Managed FOV hooks and
++        // Transform setters are not required to discover cameras, and their ABI
++        // or side effects would add risk to a read-only hardware probe.
++        if (Config::enabled) {
++            ADD_HOOK(Unity_set_position_Injected, Il2cppUtils::il2cpp_resolve_icall(
++                    "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)"));
++            ADD_HOOK(Unity_set_rotation_Injected, Il2cppUtils::il2cpp_resolve_icall(
++                    "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)"));
++            ADD_HOOK(Unity_SetPositionAndRotation_Injected, Il2cppUtils::il2cpp_resolve_icall(
++                    "UnityEngine.Transform::SetPositionAndRotation_Injected(UnityEngine.Vector3&,UnityEngine.Quaternion&)"));
++            ADD_HOOK(Unity_set_localPosition_Injected, Il2cppUtils::il2cpp_resolve_icall(
++                    "UnityEngine.Transform::set_localPosition_Injected(UnityEngine.Vector3&)"));
++            ADD_HOOK(Component_get_transform, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
++                                                                            "Component", "get_transform"));
++            ADD_HOOK(Unity_get_fieldOfView, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
++                                                                          "Camera", "get_fieldOfView"));
++            ADD_HOOK(Unity_set_fieldOfView, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine",
++                                                                          "Camera", "set_fieldOfView"));
++            ADD_HOOK(Unity_set_targetFrameRate, Il2cppUtils::il2cpp_resolve_icall(
++                    "UnityEngine.Application::set_targetFrameRate(System.Int32)"));
++        }
+ 
+ #ifdef GKMS_WINDOWS
++        if (Config::enabled) {
+         ADD_HOOK(WindowHandle_SetWindowLong, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+             "WindowHandle", "SetWindowLong"));
+-        //ADD_HOOK(WindowHandle_SetWindowLong32, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+-        //    "WindowHandle", "SetWindowLong32"));
+-        //ADD_HOOK(WindowHandle_SetWindowLongPtr64, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+-        //    "WindowHandle", "SetWindowLongPtr64"));
+-        //ADD_HOOK(WindowSizeUtility_RestoreWindowSize, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+-        //    "WindowSizeUtility", "RestoreWindowSize"));
+         ADD_HOOK(WindowManager_ApplyOrientationSettings, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+             "WindowManager", "ApplyOrientationSettings"));
+         ADD_HOOK(AspectRatioHandler_NudgeWindow, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+             "AspectRatioHandler", "NudgeWindow"));
+-        //ADD_HOOK(AspectRatioHandler_WindowProc, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
+-        //    "AspectRatioHandler", "WindowProc"));
+ 
+         if (GakumasLocal::Config::dmmUnlockSize) {
+             std::thread([]() {
+@@ -2850,10 +2900,11 @@
+             }).detach();
+         }
+ 
+-        g_extra_assetbundle_paths.push_back((gakumasLocalPath / "local-files/gakumasassets").string());
+-		LoadExtraAssetBundle();
+ 		GkmsResourceUpdate::CheckUpdateFromAPI(false);
+-#endif // GKMS_WINDOWS
++        }
++#endif
++
++        RegisterUnityExtensions(hookInstaller);
+ 
+     }
+     // 77 2640 5000
+@@ -2866,17 +2917,24 @@
+ #endif
+         // InjectFunctions();
+ 
+-        Log::Info("Waiting for config...");
+-
+-        while (!Config::isConfigInit) {
+-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-        }
+-        if (!Config::enabled) {
+-            Log::Info("Plugin not enabled");
++        if (!Config::isConfigInit) {
++            Log::Error("Core initialization requested before config was loaded.");
+             return ret;
+         }
+-
+-        Log::Info("Start init plugin...");
++        if (!Config::enabled &&
++            (!Config::vrRuntimeStartupEnabled || Config::vrNativeOnly)) {
++            Log::Info("Unity hook layer is disabled for this configuration.");
++            return ret;
++        }
++
++        Log::InfoFmt(
++            "Start core init (localify=%d, localizeText=%d, "
++            "vrRuntimeStartup=%d, vrDiagnosticsStartup=%d, nativeOnly=%d)...",
++            Config::enabled,
++            Config::vrLocalizeText,
++            Config::vrRuntimeStartupEnabled,
++            Config::vrDiagnosticsStartupEnabled,
++            Config::vrNativeOnly);
+ 
+         if (Config::lazyInit) {
+             UnityResolveProgress::startInit = true;
+@@ -2887,7 +2945,9 @@
+         }
+ 
+         StartInjectFunctions();
+-        GKCamera::initCameraSettings();
++        if (Config::enabled) {
++            GKCamera::initCameraSettings();
++        }
+ 
+         if (Config::lazyInit) {
+             UnityResolveProgress::assembliesProgress.current = 2;
+@@ -2895,12 +2955,13 @@
+             UnityResolveProgress::classProgress.current = 0;
+         }
+ 
+-        Local::LoadData();
+-        MasterLocal::LoadData();
++        if (Config::enabled) {
++            EnsureLocalizationData();
++        }
+ 
+         UnityResolveProgress::startInit = false;
+ 
+-        Log::Info("Plugin init finished.");
++        Log::Info("Core init finished.");
+         return ret;
+     }
+ }

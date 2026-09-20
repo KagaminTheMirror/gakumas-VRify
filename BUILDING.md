@@ -26,9 +26,9 @@ Set-Location gakumas-VRify
 
 1. Creates a Python environment in `.tools/build/` and installs the pinned versions in `scripts/build-requirements.txt` (Conan 2.32.0 and CMake 4.4.3).
 2. Verifies upstream, copies its `src/` and `deps/` into `build/source/`, and adds only the local `src/host/`, `src/hooks/`, `src/vr/`, and `deps/openxr/` directories. An ownership collision stops the build.
-3. Generates the narrowly scoped ImGui font-state adaptation under `build/source/build/imgui-patched/`. The checked-out upstream file remains unchanged.
+3. Applies the reviewed seam and compatibility patches from `patches/manifest.json`, including ImGui fixes. Input blobs, patch digests and output hashes must match exactly; failure invalidates staging. The upstream checkout remains unchanged.
 4. Resolves dependencies using `conan-release.lock`, `scripts/vs2022.profile`, and the repository-local `.tools/conan2/` cache.
-5. Configures CMake and builds the DLL. The substitution list in `upstream.lock.json` excludes replaced upstream implementation files from compilation.
+5. Configures CMake and compiles the staged upstream implementations plus owned adapters. Whole-file substitutions are forbidden. Build, package and installation verify staging and binary receipts to reject stale products.
 
 The output is **`build/bin/x64/Release/version.dll`**, with a PDB alongside it. The build does not install anything into the game. Local source changes must be rebuilt through `build.ps1` so that the combined source tree is refreshed; editing `build/source/` directly is temporary and unsupported.
 

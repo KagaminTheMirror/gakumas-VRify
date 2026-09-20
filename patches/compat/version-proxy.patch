@@ -1,0 +1,213 @@
+--- a/src/dllproxy/proxy.cpp
++++ b/src/dllproxy/proxy.cpp
+@@ -20,29 +20,6 @@
+ 	void* VerLanguageNameW_Original = NULL;
+ 	void* VerQueryValueA_Original = NULL;
+ 	void* VerQueryValueW_Original = NULL;
+-
+-#define RESOLVE_DEF(name)\
+-	void* name##_Original = NULL;
+-
+-	RESOLVE_DEF(ApplyCompatResolutionQuirking);
+-	RESOLVE_DEF(CompatString);
+-	RESOLVE_DEF(CompatValue);
+-	RESOLVE_DEF(DXGIDumpJournal);
+-	RESOLVE_DEF(PIXBeginCapture);
+-	RESOLVE_DEF(PIXEndCapture);
+-	RESOLVE_DEF(PIXGetCaptureState);
+-	RESOLVE_DEF(SetAppCompatStringPointer);
+-	RESOLVE_DEF(UpdateHMDEmulationStatus);
+-	RESOLVE_DEF(CreateDXGIFactory);
+-	RESOLVE_DEF(CreateDXGIFactory1);
+-	RESOLVE_DEF(CreateDXGIFactory2);
+-	RESOLVE_DEF(DXGID3D10CreateDevice);
+-	RESOLVE_DEF(DXGID3D10CreateLayeredDevice);
+-	RESOLVE_DEF(DXGID3D10GetLayeredDeviceSize);
+-	RESOLVE_DEF(DXGID3D10RegisterLayers);
+-	RESOLVE_DEF(DXGIDeclareAdapterRemovalSupport);
+-	RESOLVE_DEF(DXGIGetDebugInterface1);
+-	RESOLVE_DEF(DXGIReportAdapterConfiguration);
+ }
+ 
+ using namespace std;
+@@ -81,43 +58,5 @@
+ 			VerQueryValueW_Original = GetProcAddress(original_dll, "VerQueryValueW");
+ 		};
+ 	};
+-
+-#define RESOLVE_ADDR(name)\
+-	name##_Original = GetProcAddress(original_dll, #name)
+-
+-	class dxgi_init {
+-	public :
+-		dxgi_init() {
+-			std::string dll_path;
+-			dll_path.resize(MAX_PATH);
+-			dll_path.resize(GetSystemDirectoryA(dll_path.data(), MAX_PATH));
+-
+-			dll_path += "\\" + "dxgi.dll"s;
+-
+-			auto original_dll = LoadLibraryA(dll_path.data());
+-
+-			RESOLVE_ADDR(ApplyCompatResolutionQuirking);
+-			RESOLVE_ADDR(CompatString);
+-			RESOLVE_ADDR(CompatValue);
+-			RESOLVE_ADDR(DXGIDumpJournal);
+-			RESOLVE_ADDR(PIXBeginCapture);
+-			RESOLVE_ADDR(PIXEndCapture);
+-			RESOLVE_ADDR(PIXGetCaptureState);
+-			RESOLVE_ADDR(SetAppCompatStringPointer);
+-			RESOLVE_ADDR(UpdateHMDEmulationStatus);
+-			RESOLVE_ADDR(CreateDXGIFactory);
+-			RESOLVE_ADDR(CreateDXGIFactory1);
+-			RESOLVE_ADDR(CreateDXGIFactory2);
+-			RESOLVE_ADDR(DXGID3D10CreateDevice);
+-			RESOLVE_ADDR(DXGID3D10CreateLayeredDevice);
+-			RESOLVE_ADDR(DXGID3D10GetLayeredDeviceSize);
+-			RESOLVE_ADDR(DXGID3D10RegisterLayers);
+-			RESOLVE_ADDR(DXGIDeclareAdapterRemovalSupport);
+-			RESOLVE_ADDR(DXGIGetDebugInterface1);
+-			RESOLVE_ADDR(DXGIReportAdapterConfiguration);
+-		}
+-	};
+-
+ 	version_init init {};
+-	dxgi_init dx_init{};
+ }
+--- a/src/dllproxy/version.asm
++++ b/src/dllproxy/version.asm
+@@ -17,26 +17,6 @@
+ extern VerLanguageNameW_Original:QWORD
+ extern VerQueryValueA_Original:QWORD
+ extern VerQueryValueW_Original:QWORD
+-
+-extern ApplyCompatResolutionQuirking_Original:QWORD
+-extern CompatString_Original:QWORD
+-extern CompatValue_Original:QWORD
+-extern DXGIDumpJournal_Original:QWORD
+-extern PIXBeginCapture_Original:QWORD
+-extern PIXEndCapture_Original:QWORD
+-extern PIXGetCaptureState_Original:QWORD
+-extern SetAppCompatStringPointer_Original:QWORD
+-extern UpdateHMDEmulationStatus_Original:QWORD
+-extern CreateDXGIFactory_Original:QWORD
+-extern CreateDXGIFactory1_Original:QWORD
+-extern CreateDXGIFactory2_Original:QWORD
+-extern DXGID3D10CreateDevice_Original:QWORD
+-extern DXGID3D10CreateLayeredDevice_Original:QWORD
+-extern DXGID3D10GetLayeredDeviceSize_Original:QWORD
+-extern DXGID3D10RegisterLayers_Original:QWORD
+-extern DXGIDeclareAdapterRemovalSupport_Original:QWORD
+-extern DXGIGetDebugInterface1_Original:QWORD
+-extern DXGIReportAdapterConfiguration_Original:QWORD
+ 
+ GetFileVersionInfoA_EXPORT proc
+   jmp QWORD ptr GetFileVersionInfoA_Original
+@@ -106,80 +86,4 @@
+   jmp QWORD ptr VerQueryValueW_Original
+ VerQueryValueW_EXPORT endp
+ 
+-ApplyCompatResolutionQuirking_EXPORT proc
+-  jmp QWORD ptr ApplyCompatResolutionQuirking_Original
+-ApplyCompatResolutionQuirking_EXPORT endp
+-
+-CompatString_EXPORT proc
+-  jmp QWORD ptr CompatString_Original
+-CompatString_EXPORT endp
+-
+-CompatValue_EXPORT proc
+-  jmp QWORD ptr CompatValue_Original
+-CompatValue_EXPORT endp
+-
+-DXGIDumpJournal_EXPORT proc
+-  jmp QWORD ptr DXGIDumpJournal_Original
+-DXGIDumpJournal_EXPORT endp
+-
+-PIXBeginCapture_EXPORT proc
+-  jmp QWORD ptr PIXBeginCapture_Original
+-PIXBeginCapture_EXPORT endp
+-
+-PIXEndCapture_EXPORT proc
+-  jmp QWORD ptr PIXEndCapture_Original
+-PIXEndCapture_EXPORT endp
+-
+-PIXGetCaptureState_EXPORT proc
+-  jmp QWORD ptr PIXGetCaptureState_Original
+-PIXGetCaptureState_EXPORT endp
+-
+-SetAppCompatStringPointer_EXPORT proc
+-  jmp QWORD ptr SetAppCompatStringPointer_Original
+-SetAppCompatStringPointer_EXPORT endp
+-
+-UpdateHMDEmulationStatus_EXPORT proc
+-  jmp QWORD ptr UpdateHMDEmulationStatus_Original
+-UpdateHMDEmulationStatus_EXPORT endp
+-
+-CreateDXGIFactory_EXPORT proc
+-  jmp QWORD ptr CreateDXGIFactory_Original
+-CreateDXGIFactory_EXPORT endp
+-
+-CreateDXGIFactory1_EXPORT proc
+-  jmp QWORD ptr CreateDXGIFactory1_Original
+-CreateDXGIFactory1_EXPORT endp
+-
+-CreateDXGIFactory2_EXPORT proc
+-  jmp QWORD ptr CreateDXGIFactory2_Original
+-CreateDXGIFactory2_EXPORT endp
+-
+-DXGID3D10CreateDevice_EXPORT proc
+-  jmp QWORD ptr DXGID3D10CreateDevice_Original
+-DXGID3D10CreateDevice_EXPORT endp
+-
+-DXGID3D10CreateLayeredDevice_EXPORT proc
+-  jmp QWORD ptr DXGID3D10CreateLayeredDevice_Original
+-DXGID3D10CreateLayeredDevice_EXPORT endp
+-
+-DXGID3D10GetLayeredDeviceSize_EXPORT proc
+-  jmp QWORD ptr DXGID3D10GetLayeredDeviceSize_Original
+-DXGID3D10GetLayeredDeviceSize_EXPORT endp
+-
+-DXGID3D10RegisterLayers_EXPORT proc
+-  jmp QWORD ptr DXGID3D10RegisterLayers_Original
+-DXGID3D10RegisterLayers_EXPORT endp
+-
+-DXGIDeclareAdapterRemovalSupport_EXPORT proc
+-  jmp QWORD ptr DXGIDeclareAdapterRemovalSupport_Original
+-DXGIDeclareAdapterRemovalSupport_EXPORT endp
+-
+-DXGIGetDebugInterface1_EXPORT proc
+-  jmp QWORD ptr DXGIGetDebugInterface1_Original
+-DXGIGetDebugInterface1_EXPORT endp
+-
+-DXGIReportAdapterConfiguration_EXPORT proc
+-  jmp QWORD ptr DXGIReportAdapterConfiguration_Original
+-DXGIReportAdapterConfiguration_EXPORT endp
+-
+ end
+--- a/src/dllproxy/version.def
++++ b/src/dllproxy/version.def
+@@ -17,24 +17,3 @@
+ 	VerLanguageNameW=VerLanguageNameW_EXPORT
+ 	VerQueryValueA=VerQueryValueA_EXPORT
+ 	VerQueryValueW=VerQueryValueW_EXPORT
+-
+-	;dxgi.dll
+-	ApplyCompatResolutionQuirking=ApplyCompatResolutionQuirking_EXPORT
+-	CompatString=CompatString_EXPORT
+-	CompatValue=CompatValue_EXPORT
+-	DXGIDumpJournal=DXGIDumpJournal_EXPORT
+-	PIXBeginCapture=PIXBeginCapture_EXPORT
+-	PIXEndCapture=PIXEndCapture_EXPORT
+-	PIXGetCaptureState=PIXGetCaptureState_EXPORT
+-	SetAppCompatStringPointer=SetAppCompatStringPointer_EXPORT
+-	UpdateHMDEmulationStatus=UpdateHMDEmulationStatus_EXPORT
+-	CreateDXGIFactory=CreateDXGIFactory_EXPORT
+-	CreateDXGIFactory1=CreateDXGIFactory1_EXPORT
+-	CreateDXGIFactory2=CreateDXGIFactory2_EXPORT
+-	DXGID3D10CreateDevice=DXGID3D10CreateDevice_EXPORT
+-	DXGID3D10CreateLayeredDevice=DXGID3D10CreateLayeredDevice_EXPORT
+-	DXGID3D10GetLayeredDeviceSize=DXGID3D10GetLayeredDeviceSize_EXPORT
+-	DXGID3D10RegisterLayers=DXGID3D10RegisterLayers_EXPORT
+-	DXGIDeclareAdapterRemovalSupport=DXGIDeclareAdapterRemovalSupport_EXPORT
+-	DXGIGetDebugInterface1=DXGIGetDebugInterface1_EXPORT
+-	DXGIReportAdapterConfiguration=DXGIReportAdapterConfiguration_EXPORT

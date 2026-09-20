@@ -63,6 +63,4 @@
 
 
 
-菜单翻译开关：启用翻译 / 啟用翻譯 / 翻訳を有効にする / Enable translation。
-繁中 threshold 使用「臨界值」，frame / frame rate 使用「影格 / 影格率」。
-Toon 参照的玩家／头显位置是看向角色的观察起点，不是注视目标。
+菜单翻译开关：启用翻译 / 啟用翻譯 / 翻訳を有効にする / Enable translation。 繁中 threshold 使用「臨界值」，frame / frame rate 使用「影格 / 影格率」。 Toon 参照的玩家／头显位置是看向角色的观察起点，不是注视目标。

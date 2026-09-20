@@ -1,3 +1,6 @@
 * text=auto eol=lf
 *.png binary
 *.dds binary
+
+# Patch digests describe exact bytes on all checkouts.
+patches/**/*.patch -text -whitespace

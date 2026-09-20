@@ -1,4 +1,7 @@
-#include "stdinclude.hpp"
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include "host/localify/DesktopText.hpp"
 #include "i18nData/strings_en.hpp"
 #include "i18nData/strings_ja.hpp"
 #include "i18nData/strings_zh-rCN.hpp"
@@ -7,29 +10,7 @@
 
 
 namespace GakumasVrI18n {
-	int DetectSystemMenuLanguage() {
-		const LANGID localLanguage = GetUserDefaultUILanguage();
-		static const std::unordered_set<LANGID> sChineseLangIds{
-			{ 0x0004, 0x0804, 0x1004 }
-		};  // zh-Hans, zh-CN, zh-SG
-		static const std::unordered_set<LANGID> tChineseLangIds{
-			{ 0x0404, 0x0c04, 0x1404, 0x048E }
-		};  // zh-TW, zh-HK, zh-MO, zh-yue-HK
-		static const std::unordered_set<LANGID> jpnLangIds{
-			{ 0x0011, 0x0411 }
-		};  // ja, ja-JP
-
-		if (sChineseLangIds.contains(localLanguage)) {
-			return GakumasLocal::Config::kVrMenuLanguageZhCN;
-		}
-		if (tChineseLangIds.contains(localLanguage)) {
-			return GakumasLocal::Config::kVrMenuLanguageZhTW;
-		}
-		if (jpnLangIds.contains(localLanguage)) {
-			return GakumasLocal::Config::kVrMenuLanguageJa;
-		}
-		return GakumasLocal::Config::kVrMenuLanguageEn;
-	}
+	int DetectSystemMenuLanguage() { return GkmsGUII18n::SystemMenuLanguage(); }
 
 	int ResolvedMenuLanguage() {
 		const int stored = GakumasLocal::Config::vrMenuLanguage;
@@ -75,6 +56,7 @@ namespace GakumasVrI18n {
 		AppendTable(strings, I18nData::i18nData_zh_rTW);
 		AppendTable(strings, I18nData::i18nData_ja);
 		AppendTable(strings, I18nData::i18nData_default);
+        GakumasVR::Localify::AppendCommonMenuStrings(strings);
         return strings;
     }
 
@@ -84,9 +66,11 @@ namespace GakumasVrI18n {
         if (auto it = i18nData.find(key); it != i18nData.end()) {
             return it->second.c_str();
         }
+        if (const char* text = GakumasVR::Localify::CommonMenuText(key, ResolvedMenuLanguage())) return text;
         if (auto it = I18nData::i18nData_default.find(key); it != I18nData::i18nData_default.end()) {
             return it->second.c_str();
         }
+
 
         static thread_local std::unordered_map<std::string, std::string> fallbackMap;
         auto [iter, inserted] = fallbackMap.emplace(key, key);

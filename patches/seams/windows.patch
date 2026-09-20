@@ -1,0 +1,173 @@
+--- a/src/windowsPlatform.cpp
++++ b/src/windowsPlatform.cpp
+@@ -1,4 +1,5 @@
+ ﻿#include "windowsPlatform.hpp"
++#include "host/localify/WindowsIntegration.hpp"
+ #include "GakumasLocalify/Plugin.h"
+ #include "GakumasLocalify/Log.h"
+ #include "GakumasLocalify/Local.h"
+@@ -16,7 +17,7 @@
+ #include <cpprest/details/http_helpers.h>
+ #include <windowsx.h>
+ 
+-bool mh_inited;
++
+ extern std::filesystem::path gakumasLocalPath;
+ extern std::filesystem::path ConfigJson;
+ extern std::filesystem::path ProgramConfigJson;
+@@ -24,13 +25,14 @@
+ 
+ void reload_all_data();
+ 
+-std::function<void()> g_on_close;
++
+ std::function<void()> on_hotKey_0;
+ std::function<void()> g_reload_all_data = reload_all_data;
+ 
+ void patchGameAssenbly();
+ void readProgramConfig();
+ 
++#ifndef GAKUMAS_EXTERNAL_HOST
+ namespace
+ {
+     class AndroidHookInstaller : public GakumasLocal::HookInstaller
+@@ -124,6 +126,8 @@
+     GakumasLocal::Log::InfoFmt("initHook stat: %s - %s\n", MH_StatusToString(stat1), MH_StatusToString(stat2));
+ }
+ 
++#endif
++
+ void checkAndInitConfig(const std::filesystem::path& LocalConfigFile) {
+     if (!std::filesystem::exists(ProgramConfigJson)) {
+         g_useAPIAssetsURL = GkmsGUII18n::ts("default_assets_check_api");
+@@ -135,28 +139,31 @@
+ }
+ 
+ 
+-void loadConfig(const std::string& configJson) {
+-	GakumasLocal::Config::LoadConfig(configJson);
+-}
+-
+-void loadConfig(const std::filesystem::path& filePath) {
++void loadConfig(const std::string& configJson,
++    GakumasLocal::Config::ConfigLoadPurpose purpose) {
++	GakumasLocal::Config::LoadConfig(configJson, purpose);
++}
++
++void loadConfig(const std::filesystem::path& filePath,
++    GakumasLocal::Config::ConfigLoadPurpose purpose) {
+ 	checkAndInitConfig(filePath);
+ 
+     std::ifstream file(filePath);
+     if (!file.is_open()) {
+         GakumasLocal::Log::ErrorFmt("Load config %s failed.\n", filePath.string().c_str());
+-        loadConfig(std::string("{}"));
++        loadConfig(std::string("{}"), purpose);
+         return;
+     }
+     std::string fileContent((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+     file.close();
+ 
+-    loadConfig(fileContent);
++    loadConfig(fileContent, purpose);
+ }
+ 
+ void reload_all_data() {
+     readProgramConfig();
+-	loadConfig(ConfigJson);
++	loadConfig(ConfigJson, GakumasLocal::Config::ConfigLoadPurpose::LocalifyReload);
++    if (!GakumasLocal::Config::enabled) return;
+     GkmsResourceUpdate::GetCurrentResourceVersion(false);
+     GkmsResourceUpdate::GetCurrentTextureVersion(false);
+ 	GakumasLocal::Local::LoadData();
+@@ -205,20 +212,9 @@
+ namespace GakumasLocal::WinHooks {
+     using Il2cppString = UnityResolve::UnityType::String;
+ 
+-	void* LoadAssetBundle(const std::string& path) {
+-        std::filesystem::path abs_path = std::filesystem::absolute(path).lexically_normal();
+-        Il2cppString* bundlePath = Il2cppString::New(abs_path.wstring());
+-
+-        static auto LoadFromFileAsync = Il2cppUtils::GetMethod("UnityEngine.AssetBundleModule.dll", "UnityEngine", "AssetBundle", "LoadFromFileAsync");
+-        static auto get_assetBundle = Il2cppUtils::GetMethod("UnityEngine.AssetBundleModule.dll", "UnityEngine", "AssetBundleCreateRequest", "get_assetBundle");
+-
+-        auto bundleTask = LoadFromFileAsync->Invoke<void*>(bundlePath);
+-
+-		if (!bundleTask) {
+-			return nullptr;
+-		}
+-		return get_assetBundle->Invoke<void*>(bundleTask);
+-	}
++    void* LoadAssetBundle(const std::string& path) {
++        return GakumasVR::Localify::LoadBundle(path);
++    }
+ 
+     void SwitchFullScreen(HWND hWnd) {
+         static auto Screen_SetResolution = reinterpret_cast<void (*)(UINT, UINT, UINT, void*)>(
+@@ -255,6 +251,8 @@
+ 
+         WNDPROC g_pfnOldWndProc = NULL;
+         LRESULT CALLBACK WndProcCallback(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
++            LRESULT handled = 0;
++            if (GakumasVR::Localify::WindowMessage(hWnd, uMsg, wParam, lParam, g_pfnOldWndProc, handled)) return handled;
+             DWORD SHIFT_key = 0;
+             DWORD CTRL_key = 0;
+             DWORD ALT_key = 0;
+@@ -365,7 +363,7 @@
+                 return FALSE;
+             }; break;
+             case WM_CLOSE: {
+-                if (g_on_close) g_on_close();
++                // Closing is coordinated by the host before upstream message handling.
+             }; break;
+ 
+             case WM_NCHITTEST:
+@@ -438,13 +436,7 @@
+         }
+ 
+         void InstallWndProcHook() {
+-            auto hWnd = FindWindowW(L"UnityWndClass", L"gakumas");
+-            g_pfnOldWndProc = (WNDPROC)GetWindowLongPtr(hWnd, GWLP_WNDPROC);
+-            SetWindowLongPtr(FindWindowW(L"UnityWndClass", L"gakumas"), GWLP_WNDPROC, (LONG_PTR)WndProcCallback);
+-            // 添加可调整大小的边框和最大化按钮
+-            LONG style = GetWindowLong(hWnd, GWL_STYLE);
+-            style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+-            SetWindowLong(hWnd, GWL_STYLE, style);
++            GakumasVR::Localify::InstallWindowProcedure(WndProcCallback, &g_pfnOldWndProc);
+         }
+ 
+         void UninstallWndProcHook(HWND hWnd)
+--- a/src/windowsPlatform.hpp
++++ b/src/windowsPlatform.hpp
+@@ -1,14 +1,21 @@
+ #pragma once
+ #include <string>
+ #include <filesystem>
++#include "vr/config/VrifyConfig.hpp"
+ 
+-void initHook();
++// Initializes the process-wide hook owner. The return value reports whether
++// MinHook is ready for Localify and VR registrars.
++bool initHook();
+ 
+ void unInitHook();
+ 
+-void loadConfig(const std::string& configJson);
++void loadConfig(const std::string& configJson,
++    GakumasLocal::Config::ConfigLoadPurpose purpose =
++        GakumasLocal::Config::ConfigLoadPurpose::LocalifyReload);
+ 
+-void loadConfig(const std::filesystem::path& filePath);
++void loadConfig(const std::filesystem::path& filePath,
++    GakumasLocal::Config::ConfigLoadPurpose purpose =
++        GakumasLocal::Config::ConfigLoadPurpose::LocalifyReload);
+ 
+ bool getCurrentLodingProgress(int* stepTotal, int* stepCurrent, int* currTotal, int* currCurrent);
+ 
+@@ -20,4 +27,4 @@
+ 	namespace Keyboard {
+ 		void InstallWndProcHook();
+ 	}
+-}
+\ No newline at end of file
++}
