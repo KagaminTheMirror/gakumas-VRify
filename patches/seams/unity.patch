@@ -1,6 +1,6 @@
 --- a/src/GakumasLocalify/Hook.cpp
 +++ b/src/GakumasLocalify/Hook.cpp
-@@ -34,6 +34,8 @@
+@@ -36,6 +36,8 @@
  #endif
  
  
@@ -9,7 +9,7 @@
  std::unordered_set<void*> hookedStubs{};
  extern std::filesystem::path gakumasLocalPath;
  
-@@ -60,6 +62,8 @@
+@@ -62,6 +64,8 @@ namespace GakumasLocal::HookMain {
      using Il2cppString = UnityResolve::UnityType::String;
      using Il2CppGCHandle = void*;
  
@@ -18,7 +18,7 @@
      UnityResolve::UnityType::String* environment_get_stacktrace() {
          /*
          static auto mtd = Il2cppUtils::GetMethod("mscorlib.dll", "System",
-@@ -120,11 +124,13 @@
+@@ -122,11 +126,13 @@ namespace GakumasLocal::HookMain {
          );
      }
  
@@ -33,7 +33,7 @@
          if (IsNativeObjectAlive(mainCameraCache) && IsNativeObjectAlive(cameraTransformCache)) return;
  
          // 优先使用游戏传入的真实相机（渲染回调 / FOV hook 捕获）。
-@@ -165,7 +171,7 @@
+@@ -167,7 +173,7 @@ namespace GakumasLocal::HookMain {
      }
  
      DEFINE_HOOK(void, Unity_set_fieldOfView, (UnityResolve::UnityType::Camera* self, float value)) {
@@ -42,7 +42,7 @@
              // self 是游戏传的真实相机，直接捕获。
              // Cinemachine 每帧会把镜头参数应用到输出相机，这里拿到的就是实际游戏相机。
              if (self != mainCameraCache) {
-@@ -180,7 +186,7 @@
+@@ -182,7 +188,7 @@ namespace GakumasLocal::HookMain {
      }
  
      DEFINE_HOOK(float, Unity_get_fieldOfView, (UnityResolve::UnityType::Camera* self)) {
@@ -51,10 +51,87 @@
              if (self != mainCameraCache) {
                  mainCameraCache = self;
                  cameraTransformCache = nullptr;
-@@ -212,9 +218,11 @@
-     // 从游戏自己的调用里捕获真实对象指针：
-     // Camera.get_main / Component.get_transform 是带 MethodInfo* 尾参的 managed 方法，
-     // 用 hook（而不是 UnityResolve 的 managed Invoke）才能拿到可靠结果。
+@@ -221,16 +227,16 @@ namespace GakumasLocal::HookMain {
+     //                    托管包装（PC 上被内联，实测一次不被调用）。
+     //  2. GyroForceInit —— PC 把 IsPanoramaGyroDisabledOnPlatform() 内联成常量 true，控制器根本不创建，LateUpdate 里自己建。
+     //  3. 两个方法体足够大、实测会被调用的托管 hook 放开 UI 闸门。
+-#define GYRO_LOG_ONCE(name) { static bool logged = false; if (!logged) { logged = true; Log::InfoFmt("[GyroEmu] %s called (emu=%d)", name, (int)Config::enableGyroEmu); } }
++#define GYRO_LOG_ONCE(name) { static bool logged = false; if (!logged) { logged = true; Log::InfoFmt("[GyroEmu] %s called (emu=%d)", name, (int)IsLocalifyGyroEmuEnabled()); } }
+ 
+     DEFINE_HOOK(void, LiveScenePanoramaContentPresenter_Initialize, (void* self, void* screenRoot, bool isGyroSupported, void* mtd)) {
+         GYRO_LOG_ONCE("PanoramaContentPresenter.Initialize");
+-        LiveScenePanoramaContentPresenter_Initialize_Orig(self, screenRoot, isGyroSupported || Config::enableGyroEmu, mtd);
++        LiveScenePanoramaContentPresenter_Initialize_Orig(self, screenRoot, isGyroSupported || IsLocalifyGyroEmuEnabled(), mtd);
+     }
+ 
+     DEFINE_HOOK(bool, Photography3DPresenter_get_IsGyroSupported, (void* self, void* mtd)) {
+         GYRO_LOG_ONCE("Photography3DPresenter.IsGyroSupported");
+-        if (Config::enableGyroEmu) return true;
++        if (IsLocalifyGyroEmuEnabled()) return true;
+         return Photography3DPresenter_get_IsGyroSupported_Orig(self, mtd);
+     }
+ 
+@@ -299,12 +305,12 @@ namespace GakumasLocal::HookMain {
+     // 所有 CampusGyroController 一出生就初始化完成，Live / 拍摄 / 其他持有者都不用再关心 PC 上被跳过的 InitializeAsync
+     DEFINE_HOOK(void, CampusGyroController_ctor, (void* self, void* mtd)) {
+         CampusGyroController_ctor_Orig(self, mtd);
+-        if (Config::enableGyroEmu) GyroForceInit::InitController(self);
++        if (IsLocalifyGyroEmuEnabled()) GyroForceInit::InitController(self);
+     }
+ 
+     // Live：PC 版可能连控制器都没建，LateUpdate 里兜底
+     DEFINE_HOOK(void, LivePanoramaCameraManager_LateUpdate, (void* self, void* mtd)) {
+-        if (Config::enableGyroEmu && self) {
++        if (IsLocalifyGyroEmuEnabled() && self) {
+             auto& ctrl = GyroForceInit::F<void*>(self, 0x60);        // _gyroController
+             if (!ctrl) ctrl = GyroForceInit::NewController();
+             else GyroForceInit::InitController(ctrl);
+@@ -314,7 +320,7 @@ namespace GakumasLocal::HookMain {
+ 
+     // 拍摄：PhotographySceneManager 把控制器交给 PhotographyActivityController，这里是它进相机控制器的唯一入口
+     DEFINE_HOOK(void, PhotographyActivityController_Initialize, (void* self, void* volumeProfile, void* gyroController, float arg, void* mtd)) {
+-        if (Config::enableGyroEmu) {
++        if (IsLocalifyGyroEmuEnabled()) {
+             if (!gyroController) gyroController = GyroForceInit::NewController();
+             else GyroForceInit::InitController(gyroController);
+         }
+@@ -334,27 +340,27 @@ namespace GakumasLocal::HookMain {
+ 
+         bool IsGyroAvailable() {
+             GYRO_LOG_ONCE("icall SystemInfo.IsGyroAvailable");
+-            if (Config::enableGyroEmu) return true;
++            if (IsLocalifyGyroEmuEnabled()) return true;
+             return orig_IsGyroAvailable ? orig_IsGyroAvailable() : false;
+         }
+         bool getEnabled(int idx) {
+             GYRO_LOG_ONCE("icall Gyroscope.getEnabled");
+-            if (Config::enableGyroEmu) return true;
++            if (IsLocalifyGyroEmuEnabled()) return true;
+             return orig_getEnabled ? orig_getEnabled(idx) : false;
+         }
+         void setEnabled(int idx, bool v) {
+             GYRO_LOG_ONCE("icall Gyroscope.setEnabled");
+-            if (Config::enableGyroEmu) return;   // Windows 无传感器对象，原生实现解空指针
++            if (IsLocalifyGyroEmuEnabled()) return;   // Windows 无传感器对象，原生实现解空指针
+             if (orig_setEnabled) orig_setEnabled(idx, v);
+         }
+         void attitude(int idx, Quaternion* ret) {
+             GYRO_LOG_ONCE("icall Gyroscope.attitude");
+-            if (Config::enableGyroEmu) { *ret = GyroEmu::Attitude(); return; }
++            if (IsLocalifyGyroEmuEnabled()) { *ret = GyroEmu::Attitude(); return; }
+             if (orig_attitude) orig_attitude(idx, ret); else *ret = Quaternion(0, 0, 0, 1);
+         }
+         void gravity(int idx, Vector3* ret) {
+             GYRO_LOG_ONCE("icall Gyroscope.gravity");
+-            if (Config::enableGyroEmu) { *ret = GyroEmu::Gravity(); return; }
++            if (IsLocalifyGyroEmuEnabled()) { *ret = GyroEmu::Gravity(); return; }
+             if (orig_gravity) orig_gravity(idx, ret); else *ret = Vector3(0, 0, 0);
+         }
+ 
+@@ -399,9 +405,11 @@ namespace GakumasLocal::HookMain {
+     }
+ #endif
+ 
 +#include "vr/unity/MainCameraCallback.inc.cpp"
      DEFINE_HOOK(UnityResolve::UnityType::Camera*, Camera_get_main, (void* mtd)) {
          auto ret = Camera_get_main_Orig(mtd);
@@ -64,7 +141,7 @@
              mainCameraCache = ret;
              cameraTransformCache = nullptr;
          }
-@@ -223,7 +231,7 @@
+@@ -410,7 +418,7 @@ namespace GakumasLocal::HookMain {
  
      DEFINE_HOOK(UnityResolve::UnityType::Transform*, Component_get_transform, (void* self, void* mtd)) {
          auto ret = Component_get_transform_Orig(self, mtd);
@@ -73,7 +150,7 @@
              cameraTransformCache = ret;
          }
          return ret;
-@@ -279,8 +287,12 @@
+@@ -466,8 +474,12 @@ namespace GakumasLocal::HookMain {
      // 字段偏移来自 hook-reference dump.cs：
      //   0x00 Lens.FieldOfView | 0x48 RawPosition | 0x54 RawOrientation
      //   0x64 PositionDampingBypass | 0x74 PositionCorrection | 0x80 OrientationCorrection
@@ -87,23 +164,21 @@
              CheckAndUpdateMainCamera();
  
              using Vector3 = UnityResolve::UnityType::Vector3;
-@@ -300,15 +312,20 @@
+@@ -487,15 +499,20 @@ namespace GakumasLocal::HookMain {
              }
          }
  
 -        return CinemachineBrain_PushStateToUnityCamera_Orig(self, state, mtd);
--    }
--
--    // Cinemachine 3（Unity 6）用 SetPositionAndRotation 一次性写相机位置+旋转，
--    // set_position/set_rotation 拦截不到相机，必须在这里接管。
 +        pose.Stop();
 +        VR_PERF_SCOPE(original, "camera.push-state-original", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
 +        CinemachineBrain_PushStateToUnityCamera_Orig(self, state, mtd);
 +        original.Stop();
 +        VR_PERF_SCOPE(post, "camera.post-state", [](std::string_view line) noexcept { WriteUnityCameraDiagnosticEvent(line); });
 +        AfterCameraState(self);
-+    }
-+
+     }
+ 
+-    // Cinemachine 3（Unity 6）用 SetPositionAndRotation 一次性写相机位置+旋转，
+-    // set_position/set_rotation 拦截不到相机，必须在这里接管。
 +#include "vr/unity/FlareHooks.inc.cpp"
 +
      DEFINE_HOOK(void, Unity_SetPositionAndRotation_Injected, (UnityResolve::UnityType::Transform* self,
@@ -114,7 +189,7 @@
              CheckAndUpdateMainCamera();
  
              const auto isControl = IsCameraControlTransform(self);
-@@ -328,7 +345,7 @@
+@@ -515,7 +532,7 @@ namespace GakumasLocal::HookMain {
      // 兜底：游戏若用局部坐标写相机（rig 挂载场景），位置同样接管。
      DEFINE_HOOK(void, Unity_set_localPosition_Injected, (UnityResolve::UnityType::Transform* self,
                                                           UnityResolve::UnityType::Vector3* data)) {
@@ -123,7 +198,7 @@
              CheckAndUpdateMainCamera();
  
              const auto isControl = IsCameraControlTransform(self);
-@@ -359,7 +376,7 @@
+@@ -546,7 +563,7 @@ namespace GakumasLocal::HookMain {
      }
  
      DEFINE_HOOK(void, Unity_set_rotation_Injected, (UnityResolve::UnityType::Transform* self, UnityResolve::UnityType::Quaternion* value)) {
@@ -132,7 +207,7 @@
              const auto isControl = IsCameraControlTransform(self);
              if (isControl) {
                  const auto cameraMode = GKCamera::GetCameraMode();
-@@ -412,7 +429,7 @@
+@@ -599,7 +616,7 @@ namespace GakumasLocal::HookMain {
      }
  
      DEFINE_HOOK(void, Unity_set_position_Injected, (UnityResolve::UnityType::Transform* self, UnityResolve::UnityType::Vector3* data)) {
@@ -141,7 +216,7 @@
              CheckAndUpdateMainCamera();
  
              const auto isControl = IsCameraControlTransform(self);
-@@ -522,10 +539,15 @@
+@@ -709,10 +726,15 @@ namespace GakumasLocal::HookMain {
      }
  #endif
  
@@ -158,7 +233,7 @@
              // Camera.main 可能拿不到 3.0.0 实际渲染相机，用当前正在渲染的相机兜底
              CheckAndUpdateMainCamera(static_cast<UnityResolve::UnityType::Camera*>(camera));
              if (mainCameraCache && IsNativeObjectAlive(mainCameraCache)) {
-@@ -539,9 +561,11 @@
+@@ -726,9 +748,11 @@ namespace GakumasLocal::HookMain {
          }
      }
  
@@ -171,7 +246,7 @@
      }
  
      std::unordered_map<void*, std::string> loadHistory{};
-@@ -621,10 +645,8 @@
+@@ -808,10 +832,8 @@ namespace GakumasLocal::HookMain {
      }
  
      DEFINE_HOOK(void, CanvasRenderer_SetTexture, (void* self, void* texture, void* method)) {
@@ -184,21 +259,23 @@
      }
  
      DEFINE_HOOK(void, SpriteRenderer_set_sprite, (void* self, void* sprite)) {
-@@ -640,8 +662,12 @@
+@@ -827,10 +849,14 @@ namespace GakumasLocal::HookMain {
      DEFINE_HOOK(void, I18nHelper_SetValue, (void* self, Il2cppString* key, Il2cppString* value)) {
          // Log::InfoFmt("I18nHelper_SetValue: %s - %s", key->ToString().c_str(), value->ToString().c_str());
          std::string local;
 -        if (Local::GetI18n(key->ToString(), &local)) {
 +        if (TryGetI18n(key->ToString(), &local)) {
              I18nHelper_SetValue_Orig(self, key, UnityResolve::UnityType::String::New(local));
-+            return;
-+        }
-+        if (!LocalizationActive()) {
-+            I18nHelper_SetValue_Orig(self, key, value);
              return;
          }
++        if (!LocalizationActive()) {
++            I18nHelper_SetValue_Orig(self, key, value);
++            return;
++        }
          Local::DumpI18nItem(key->ToString(), value->ToString());
-@@ -662,10 +688,14 @@
+         if (Config::textTest) {
+             I18nHelper_SetValue_Orig(self, key, Il2cppString::New("[I18]" + value->ToString()));
+@@ -849,10 +875,14 @@ namespace GakumasLocal::HookMain {
      typedef std::unordered_set<std::wstring, TransparentStringHash, std::equal_to<void>> AssetPathsType;
      std::map<std::string, AssetPathsType> CustomAssetBundleAssetPaths;
      std::unordered_map<std::string, Il2CppGCHandle> CustomAssetBundleHandleMap{};
@@ -213,7 +290,7 @@
  
          if (g_extra_assetbundle_paths.empty()) {
              return;
-@@ -682,7 +712,10 @@
+@@ -869,7 +899,10 @@ namespace GakumasLocal::HookMain {
          );
  
          for (const auto& i : g_extra_assetbundle_paths) {
@@ -225,7 +302,7 @@
  
              const auto extraAssetBundle = WinHooks::LoadAssetBundle(i);
              if (extraAssetBundle)
-@@ -701,12 +734,16 @@
+@@ -888,12 +921,16 @@ namespace GakumasLocal::HookMain {
              }
              else
              {
@@ -242,7 +319,7 @@
          for (const auto& i : CustomAssetBundleAssetPaths) {
              for (const auto& m : i.second) {
                  if (std::equal(m.begin(), m.end(), assetName.begin(), assetName.end(),
-@@ -728,7 +765,7 @@
+@@ -915,7 +952,7 @@ namespace GakumasLocal::HookMain {
  
      void* GetReplaceFont() {
          static auto FontClass = Il2cppUtils::GetClass("UnityEngine.TextRenderingModule.dll", "UnityEngine", "Font");
@@ -251,16 +328,16 @@
              UnityResolve::Invoke<void*>("il2cpp_class_get_type", FontClass->address));
  
          using Il2CppString = UnityResolve::UnityType::String;
-@@ -871,7 +908,7 @@
- 
-     std::unordered_set<void*> updatedFontPtrs{};
+@@ -1067,7 +1104,7 @@ namespace GakumasLocal::HookMain {
+     };
+     std::unordered_map<void*, UpdatedFontState> updatedFontStates{};
      void UpdateFont(void* TMP_Textself) {
 -        if (!Config::replaceFont) return;
 +        if (!Config::replaceFont || !LocalizationActive()) return;
          static auto get_font = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll",
                                                        "TMPro", "TMP_Text", "get_font");
          static auto set_font = Il2cppUtils::GetMethod("Unity.TextMeshPro.dll",
-@@ -900,7 +937,7 @@
+@@ -1127,7 +1164,7 @@ namespace GakumasLocal::HookMain {
          auto fontAssetName = get_name->Invoke<Il2cppString*>(fontAsset);
          if (fontAssetName) {
              std::string fontName = fontAssetName->ToString();
@@ -269,16 +346,7 @@
                  [](unsigned char c) { return std::tolower(c); });
              if (fontName.find("campusalphanumeric") != std::string::npos) {
                  return;  // 保持原版数字字体
-@@ -916,7 +953,7 @@
-             UpdateFontAssetData->Invoke<void>(fontAsset);
-         }
-         if (updatedFontPtrs.size() > 200) updatedFontPtrs.clear();
--        
-+
-         set_font->Invoke<void>(TMP_Textself, fontAsset);
- 
- //        auto fontMaterial = get_material->Invoke<void*>(fontAsset);
-@@ -934,7 +971,7 @@
+@@ -1209,7 +1246,7 @@ namespace GakumasLocal::HookMain {
  
          const std::string origText = Substring->Invoke<Il2cppString*>(text, start, length)->ToString();
          std::string transText;
@@ -287,7 +355,7 @@
              const auto newText = UnityResolve::UnityType::String::New(transText);
              UpdateFont(self);
              return TMP_Text_PopulateTextBackingArray_Orig(self, newText, 0, newText->length);
-@@ -955,7 +992,7 @@
+@@ -1230,7 +1267,7 @@ namespace GakumasLocal::HookMain {
          }
          const std::string origText = value->ToString();
          std::string transText;
@@ -296,7 +364,7 @@
              const auto newText = UnityResolve::UnityType::String::New(transText);
              UpdateFont(self);
              return TMP_Text_set_text_Orig(self, newText, mtd);
-@@ -975,7 +1012,7 @@
+@@ -1250,7 +1287,7 @@ namespace GakumasLocal::HookMain {
          }
          const std::string origText = sourceText->ToString();
          std::string transText;
@@ -305,7 +373,7 @@
              const auto newText = UnityResolve::UnityType::String::New(transText);
              UpdateFont(self);
              return TMP_Text_SetText_1_Orig(self, newText, mtd);
-@@ -995,7 +1032,7 @@
+@@ -1270,7 +1307,7 @@ namespace GakumasLocal::HookMain {
  		}
  		const std::string origText = sourceText->ToString();
  		std::string transText;
@@ -314,7 +382,7 @@
  			const auto newText = UnityResolve::UnityType::String::New(transText);
  			UpdateFont(self);
  			return TMP_Text_SetText_2_Orig(self, newText, syncTextInputBox, mtd);
-@@ -1020,7 +1057,7 @@
+@@ -1295,7 +1332,7 @@ namespace GakumasLocal::HookMain {
          if (currText) {
              //Log::InfoFmt("TextMeshProUGUI_Awake: %s", currText->ToString().c_str());
              std::string transText;
@@ -323,7 +391,7 @@
                  if (Config::textTest) {
                      set_Text_method->Invoke<void>(self, UnityResolve::UnityType::String::New("[TA]" + transText));
                  }
-@@ -1042,7 +1079,7 @@
+@@ -1317,7 +1354,7 @@ namespace GakumasLocal::HookMain {
          }
          const std::string origText = value->ToString();
          std::string transText;
@@ -332,7 +400,7 @@
              const auto newText = UnityResolve::UnityType::String::New(transText);
              return UIText_set_text_Orig(self, newText);
          }
-@@ -1070,7 +1107,7 @@
+@@ -1345,7 +1382,7 @@ namespace GakumasLocal::HookMain {
                          static_cast<size_t>(count));
                      const std::string origText = Misc::ToUTF8(u16);
                      std::string transText;
@@ -341,7 +409,7 @@
                          UpdateFont(self);
                          TMP_Text_set_text_Orig(self, Il2cppString::New(transText), nullptr);
                          return;
-@@ -1089,7 +1126,7 @@
+@@ -1364,7 +1401,7 @@ namespace GakumasLocal::HookMain {
      DEFINE_HOOK(void, TextField_set_value, (void* self, Il2cppString* value)) {
          if (value) {
              std::string transText;
@@ -350,7 +418,7 @@
                  return TextField_set_value_Orig(self, UnityResolve::UnityType::String::New(transText));
              }
          }
-@@ -1112,7 +1149,8 @@
+@@ -1387,7 +1424,8 @@ namespace GakumasLocal::HookMain {
      // 用于本地化 MasterDB
      DEFINE_HOOK(void, MessageExtensions_MergeFrom, (void* message, void* span, void* mtd)) {
          MessageExtensions_MergeFrom_Orig(message, span, mtd);
@@ -360,7 +428,7 @@
              auto ret_klass = Il2cppUtils::get_class_from_instance(message);
              if (ret_klass) {
                  // Log::DebugFmt("LocalizeMasterItem: %s", ret_klass->name);
-@@ -1174,7 +1212,8 @@
+@@ -1449,7 +1487,8 @@ namespace GakumasLocal::HookMain {
          Log::DebugFmt("OctoResourceLoader_LoadFromCacheOrDownload: %s\n", resourceName->ToString().c_str());
  
          std::string replaceStr;
@@ -370,7 +438,7 @@
              const auto onComplete_klass = Il2cppUtils::get_class_from_instance(onComplete);
              const auto onComplete_invoke_mtd = UnityResolve::Invoke<Il2cppUtils::MethodInfo*>(
                      "il2cpp_class_get_method_from_name", onComplete_klass, "Invoke", 2);
-@@ -1811,15 +1850,23 @@
+@@ -2166,16 +2205,24 @@ namespace GakumasLocal::HookMain {
      std::unordered_set<void*> g_lyricsInitialForced{};
  
      DEFINE_HOOK(void, LiveSceneModel_set_IsLyricsActive, (void* self, bool value, void* mtd)) {
@@ -389,12 +457,13 @@
          }
          return LiveScenePresenter_SetLyricsActive_Orig(self, value, mtd);
      }
-+
-+#include "vr/unity/PhotoHooks.inc.cpp"
  
++#include "vr/unity/PhotoHooks.inc.cpp"
++
      DEFINE_HOOK(void, LiveSceneContentView_SetLyricsTextActive, (void* self, bool value, void* mtd)) {
          return LiveSceneContentView_SetLyricsTextActive_Orig(self, value, mtd);
-@@ -1867,10 +1914,20 @@
+     }
+@@ -2222,11 +2269,21 @@ namespace GakumasLocal::HookMain {
      }
  #endif
  
@@ -403,7 +472,6 @@
      DEFINE_HOOK(bool, VLDOF_IsActive, (void* self)) {
 -        if (Config::enableFreeCamera) return false;
 -        return VLDOF_IsActive_Orig(self);
--    }
 +        if (IsLocalifyFreeCameraEnabled()) return false;
 +        const bool originalActive = VLDOF_IsActive_Orig(self);
 +#ifdef GKMS_WINDOWS
@@ -412,19 +480,18 @@
 +        }
 +#endif
 +        return originalActive;
-+    }
-+
-+#include "vr/unity/DepthOfFieldHook.inc.cpp"
+     }
  
++#include "vr/unity/DepthOfFieldHook.inc.cpp"
++
      DEFINE_HOOK(void, CampusQualityManager_set_TargetFrameRate, (void* self, float value)) {
          // Log::InfoFmt("CampusQualityManager_set_TargetFrameRate: %f", value);
-@@ -1971,36 +2028,19 @@
+         const auto configFps = Config::targetFrameRate;
+@@ -2326,36 +2383,21 @@ namespace GakumasLocal::HookMain {
          return true;
      }
  
-+#include "vr/unity/HeadVisibility.inc.cpp"
-+
-     void HideHead(UnityResolve::UnityType::GameObject* obj, const bool isFace) {
+-    void HideHead(UnityResolve::UnityType::GameObject* obj, const bool isFace) {
 -        static UnityResolve::UnityType::GameObject* lastFaceObj = nullptr;
 -        static UnityResolve::UnityType::GameObject* lastHairObj = nullptr;
 -
@@ -432,7 +499,8 @@
 -
 -       static auto get_activeInHierarchy = reinterpret_cast<bool (*)(void*)>(
 -                Il2cppUtils::il2cpp_resolve_icall("UnityEngine.GameObject::get_activeInHierarchy()"));
--
++#include "vr/unity/HeadVisibility.inc.cpp"
+ 
 -        const auto isFirstPerson = GKCamera::GetCameraMode() == GKCamera::CameraMode::FIRST_PERSON;
 -
 -        if (isFirstPerson && obj) {
@@ -451,13 +519,14 @@
 -                lastHidedObj = nullptr;
 -            }
 -        }
--    }
--
++    void HideHead(UnityResolve::UnityType::GameObject* obj, const bool isFace) {
 +        ApplyHeadVisibility(obj, isFace);
-+    }
-+
+     }
+ 
 +#include "vr/unity/ActorSampling.inc.cpp"
++#include "vr/unity/ActorLateUpdateScope.inc.cpp"
      DEFINE_HOOK(void, CampusActorController_LateUpdate, (void* self, void* mtd)) {
++        ActorLateUpdateScope actorScope{self};
 +        if (Config::vrRuntimeStartupEnabled) {
 +            SampleVrActor(self);
 +            CampusActorController_LateUpdate_Orig(self, mtd);
@@ -466,7 +535,7 @@
          static auto CampusActorController_klass = Il2cppUtils::GetClass("campus-submodule.Runtime.dll",
                                                                          "Campus.Common", "CampusActorController");
          static auto rootBody_field = CampusActorController_klass->Get<UnityResolve::Field>("_rootBody");
-@@ -2016,9 +2056,8 @@
+@@ -2371,9 +2413,8 @@ namespace GakumasLocal::HookMain {
          }
  
          static auto GetHumanBodyBoneTransform_mtd = Il2cppUtils::il2cpp_class_get_method_from_name(parentKlass, "GetHumanBodyBoneTransform", 1);
@@ -478,7 +547,7 @@
          static auto get_index_mtd = Il2cppUtils::il2cpp_class_get_method_from_name(CampusActorController_klass->address, "get_index", 0);
          static auto get_Index = get_index_mtd ? reinterpret_cast<int (*)(void*)>(
                  get_index_mtd->methodPointer) : [](void*){return 0;};
-@@ -2029,8 +2068,8 @@
+@@ -2384,8 +2425,8 @@ namespace GakumasLocal::HookMain {
              static auto headBodyId = initPartsSuccess ? GKCamera::bodyPartsEnum.GetValueByName("Head") : 0xA;
              const auto isFirstPerson = GKCamera::GetCameraMode() == GKCamera::CameraMode::FIRST_PERSON;
  
@@ -489,16 +558,16 @@
  
              if (targetTrans) {
                  cacheTrans = targetTrans;
-@@ -2068,6 +2107,8 @@
- 
+@@ -2424,6 +2465,8 @@ namespace GakumasLocal::HookMain {
          CampusActorController_LateUpdate_Orig(self, mtd);
      }
-+
-+#include "vr/unity/GripHooks.inc.cpp"
  
++#include "vr/unity/GripHooks.inc.cpp"
++
      DEFINE_HOOK(bool, PlatformInformation_get_IsAndroid, ()) {
          if (Config::loginAsIOS) {
-@@ -2375,6 +2416,8 @@
+             return false;
+@@ -2730,6 +2773,8 @@ namespace GakumasLocal::HookMain {
      }
  */
  
@@ -507,7 +576,7 @@
      void StartInjectFunctions() {
          const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
  
-@@ -2385,12 +2428,25 @@
+@@ -2740,12 +2785,25 @@ namespace GakumasLocal::HookMain {
              return;
          }
          UnityResolve::Init(il2cpp_module, UnityResolve::Mode::Il2Cpp, Config::lazyInit);
@@ -534,7 +603,7 @@
          // Texture replacement is currently isolated to CanvasRenderer.SetTexture.
          //
          // Unity 6 compatibility warning:
-@@ -2613,6 +2669,10 @@
+@@ -2975,6 +3033,10 @@ namespace GakumasLocal::HookMain {
          ADD_HOOK(VLDOF_IsActive,
                   Il2cppUtils::GetMethodPointer("Unity.RenderPipelines.Universal.Runtime.dll", "VL.Rendering",
                                                 "VLDOF", "IsActive"));
@@ -545,7 +614,7 @@
  
          ADD_HOOK(CampusQualityManager_ApplySetting,
                   Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
-@@ -2634,9 +2694,6 @@
+@@ -2996,9 +3058,6 @@ namespace GakumasLocal::HookMain {
          ADD_HOOK(CampusActorModelParts_OnRegisterBone,
                   Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
                                                 "CampusActorModelParts", "OnRegisterBone"));
@@ -555,11 +624,12 @@
  
          ADD_HOOK(PlatformInformation_get_IsAndroid, Il2cppUtils::GetMethodPointer("Firebase.Platform.dll", "Firebase.Platform",
                                                                           "PlatformInformation", "get_IsAndroid"));
-@@ -2710,46 +2767,39 @@
+@@ -3072,32 +3131,33 @@ namespace GakumasLocal::HookMain {
          ADD_HOOK(InternalSetOrientationAsync,
              Il2cppUtils::GetMethodPointer("campus-submodule.Runtime.dll", "Campus.Common",
                  "ScreenOrientationControllerBase", "InternalSetOrientationAsync"));
--
++        }
+ 
 -        ADD_HOOK(Unity_set_position_Injected, Il2cppUtils::il2cpp_resolve_icall(
 -                "UnityEngine.Transform::set_position_Injected(UnityEngine.Vector3&)"));
 -        ADD_HOOK(Unity_set_rotation_Injected, Il2cppUtils::il2cpp_resolve_icall(
@@ -583,8 +653,6 @@
 -                "UnityEngine.Application::set_targetFrameRate(System.Int32)"));
 -        ADD_HOOK(EndCameraRendering, Il2cppUtils::GetMethodPointer("UnityEngine.CoreModule.dll", "UnityEngine.Rendering",
 -                                                                     "RenderPipeline", "EndCameraRendering"));
-+        }
-+
 +        // Keep the VR-only observation milestone deliberately smaller than the
 +        // legacy translation/free-camera surface. Managed FOV hooks and
 +        // Transform setters are not required to discover cameras, and their ABI
@@ -610,6 +678,11 @@
  
  #ifdef GKMS_WINDOWS
 +        if (Config::enabled) {
+         ADD_HOOK(LiveScenePanoramaContentPresenter_Initialize, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Live",
+             "LiveScenePanoramaContentPresenter", "Initialize"));
+         ADD_HOOK(Photography3DPresenter_get_IsGyroSupported, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Photography",
+@@ -3112,18 +3172,10 @@ namespace GakumasLocal::HookMain {
+ 
          ADD_HOOK(WindowHandle_SetWindowLong, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
              "WindowHandle", "SetWindowLong"));
 -        //ADD_HOOK(WindowHandle_SetWindowLong32, Il2cppUtils::GetMethodPointer("Assembly-CSharp.dll", "Campus.Common.StandAloneWindow",
@@ -627,7 +700,7 @@
  
          if (GakumasLocal::Config::dmmUnlockSize) {
              std::thread([]() {
-@@ -2850,10 +2900,11 @@
+@@ -3224,10 +3276,11 @@ namespace GakumasLocal::HookMain {
              }).detach();
          }
  
@@ -642,7 +715,7 @@
  
      }
      // 77 2640 5000
-@@ -2866,17 +2917,24 @@
+@@ -3240,17 +3293,24 @@ namespace GakumasLocal::HookMain {
  #endif
          // InjectFunctions();
  
@@ -650,21 +723,19 @@
 -
 -        while (!Config::isConfigInit) {
 -            std::this_thread::sleep_for(std::chrono::milliseconds(100));
--        }
--        if (!Config::enabled) {
--            Log::Info("Plugin not enabled");
 +        if (!Config::isConfigInit) {
 +            Log::Error("Core initialization requested before config was loaded.");
-             return ret;
++            return ret;
          }
--
--        Log::Info("Start init plugin...");
+-        if (!Config::enabled) {
+-            Log::Info("Plugin not enabled");
 +        if (!Config::enabled &&
 +            (!Config::vrRuntimeStartupEnabled || Config::vrNativeOnly)) {
 +            Log::Info("Unity hook layer is disabled for this configuration.");
-+            return ret;
-+        }
-+
+             return ret;
+         }
+ 
+-        Log::Info("Start init plugin...");
 +        Log::InfoFmt(
 +            "Start core init (localify=%d, localizeText=%d, "
 +            "vrRuntimeStartup=%d, vrDiagnosticsStartup=%d, nativeOnly=%d)...",
@@ -676,7 +747,7 @@
  
          if (Config::lazyInit) {
              UnityResolveProgress::startInit = true;
-@@ -2887,7 +2945,9 @@
+@@ -3261,7 +3321,9 @@ namespace GakumasLocal::HookMain {
          }
  
          StartInjectFunctions();
@@ -687,7 +758,7 @@
  
          if (Config::lazyInit) {
              UnityResolveProgress::assembliesProgress.current = 2;
-@@ -2895,12 +2955,13 @@
+@@ -3269,12 +3331,13 @@ namespace GakumasLocal::HookMain {
              UnityResolveProgress::classProgress.current = 0;
          }
  

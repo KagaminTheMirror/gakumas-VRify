@@ -5,7 +5,7 @@
 #include <iostream>
 std::vector<std::string> events;
 namespace Config {
-bool enabled, vrRuntimeStartupEnabled, vrDiagnosticsStartupEnabled, vrNativeOnly, enableFreeCamera;
+bool enabled, vrRuntimeStartupEnabled, vrDiagnosticsStartupEnabled, vrNativeOnly, enableFreeCamera, enableGyroEmu;
 }
 namespace UnityResolve::UnityType {
 struct Vector3 { float x,y,z; Vector3(float a,float b,float c):x(a),y(b),z(c){} };
@@ -72,6 +72,7 @@ int main() {
     alignas(16) unsigned char state[256]{};
     for (bool localify : {false,true}) for (bool vr : {false,true}) {
         Config::enabled = localify; Config::enableFreeCamera = localify;
+        Config::enableGyroEmu = localify;
         Config::vrRuntimeStartupEnabled = vr;
         for (bool nativeOnly : {false,true}) for (bool diagnostics : {false,true}) {
             Config::vrNativeOnly = nativeOnly;
@@ -79,6 +80,7 @@ int main() {
             assert(IsVrUnityRuntimeEnabled() == (vr && !nativeOnly));
             assert(AreVrUnityCameraDiagnosticsEnabled() == (vr && diagnostics && !nativeOnly));
             assert(IsLocalifyFreeCameraEnabled() == (localify && !vr));
+            assert(IsLocalifyGyroEmuEnabled() == (localify && !vr));
             CinemachineBrain_PushStateToUnityCamera_Hook(nullptr,state,nullptr);
             if (localify && !vr) expect({"before","desktop","original","after"});
             else expect({"before","original","after"});

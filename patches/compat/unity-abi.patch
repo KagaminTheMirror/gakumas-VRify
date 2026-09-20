@@ -1,6 +1,6 @@
 --- a/src/GakumasLocalify/Hook.cpp
 +++ b/src/GakumasLocalify/Hook.cpp
-@@ -620,10 +620,10 @@
+@@ -807,10 +807,10 @@ namespace GakumasLocal::HookMain {
          Image_set_overrideSprite_Orig(self, ReplaceSpriteAssetByTextureName(sprite));
      }
  
@@ -13,7 +13,7 @@
          );
      }
  
-@@ -2379,9 +2379,10 @@
+@@ -2734,9 +2734,10 @@ namespace GakumasLocal::HookMain {
          const auto hookInstaller = Plugin::GetInstance().GetHookInstaller();
  
  #ifdef GKMS_WINDOWS
@@ -26,7 +26,7 @@
          }
          UnityResolve::Init(il2cpp_module, UnityResolve::Mode::Il2Cpp, Config::lazyInit);
          GakumasLocal::WinHooks::Keyboard::InstallWndProcHook();
-@@ -2427,15 +2428,22 @@
+@@ -2782,15 +2783,22 @@ namespace GakumasLocal::HookMain {
  
          ADD_HOOK(TMP_Text_set_text, Il2cppUtils::GetMethodPointer("Unity.TextMeshPro.dll", "TMPro",
                                                                    "TMP_Text", "set_text"));

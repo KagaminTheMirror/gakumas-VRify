@@ -6,12 +6,12 @@
 #include "gkmsGUI/i18nData/strings_zh-rTW.hpp"
 namespace GakumasVR::Localify {
 const char* DesktopTextOverride(const std::string& key, unsigned short language) {
-    if (key != "enable_free_camera" || !GakumasLocal::Config::vrRuntimeStartupEnabled) return nullptr;
+    if (key != "camera_settings" || !GakumasLocal::Config::vrRuntimeStartupEnabled) return nullptr;
     switch (language) {
-    case 0x0004: case 0x0804: case 0x1004: return "自由相机（VR 运行期间不生效）";
-    case 0x0404: case 0x0c04: case 0x1404: case 0x048E: return "自由相機（VR 執行期間不生效）";
-    case 0x0011: case 0x0411: return "フリーカメラ（VR 実行中は無効）";
-    default: return "Free camera (inactive while VR is running)";
+    case 0x0004: case 0x0804: case 0x1004: return "摄像机设置（VR模块已开启，不会生效）";
+    case 0x0404: case 0x0c04: case 0x1404: case 0x048E: return "攝影機設定（VR模組已開啟，不會生效）";
+    case 0x0011: case 0x0411: return "カメラ設定（VRモジュール有効のため無効）";
+    default: return "Camera Settings (VR module on; inactive)";
     }
 }
 const char* CommonMenuText(const std::string& key, int language) {

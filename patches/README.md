@@ -13,14 +13,14 @@ Only successful staging writes `build/source-receipt.json`. Preparation failure 
 | Config | Localify fields, load/save field list | `src/host/localify/ConfigIntegration.hpp`; VR fields/migration/save in `VrifyConfig` |
 | DLL startup | Program config parser and globals | `VrBootstrap`: loader-lock-free worker, paths, gates and coordinated lifetime |
 | Windows | Keyboard, window and Localify reload business | `WindowsIntegration.hpp`: native hook owner, process window, quit and asset loader |
-| Desktop text | System language and lookup | `DesktopText.hpp`: single-key camera notice, selected-language common words |
+| Desktop text | System language and lookup | `DesktopText.hpp`: camera-section notice while VR is on, selected-language common words |
 | Unity | Localify detours, translations and desktop camera | Named callbacks and registration from `src/vr/unity/*.inc.cpp` |
 
 Unity fragments are included at declared points in the *upstream translation unit*. They contain VR implementations, not extracted upstream business functions. Sharing a translation unit permits the existing HookInstaller to register a single detour per shared game entry, with the original pointer still pointing at the game trampoline. There is no dynamic hook chain.
 
 `BeforeCameraState` runs before the original; `AfterCameraState` runs after it. `AfterEndCamera` runs after the original and reports VR render ownership before desktop processing. `SampleVrActor` samples before the original; the private actor scope observes before and applies the accepted gaze processing on exit. VR owns its actor selection, pose samples and mode. Desktop camera state is not used as a VR state mirror. The upstream enum discovery is reused as immutable bone metadata. Material-pass head visibility, live-object checks and GC handles are owned by the integration and also serve the desktop first-person path.
 
-The public and private manifest may differ in Unity seams because their feature baselines differ. The pipeline and patch rules are identical. Private gaze and costume features must not be transferred to public as part of this refactor.
+The public and private manifest may differ in Unity seams when their feature baselines differ. The pipeline and patch rules are identical.
 
 ## Regression gates
 

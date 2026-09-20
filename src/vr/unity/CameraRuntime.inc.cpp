@@ -196,7 +196,15 @@
         return Config::enableFreeCamera && !Config::vrRuntimeStartupEnabled;
     }
 
+    bool IsLocalifyGyroEmuEnabled() noexcept {
+        // Same lifetime as the free-camera writers: the Localify checkbox may
+        // stay on, but the PC gyro emulator must not rotate the panorama /
+        // photography camera while VR owns that transform.
+        return Config::enableGyroEmu && !Config::vrRuntimeStartupEnabled;
+    }
+
     void InvalidateVrStereoCameraFrame() noexcept {
+        gakumas::vr::InvalidateLiveGazeCenter();
         std::lock_guard lock(vrStereoCameraFrameMutex);
         vrStereoCameraFrame = {};
         vrStereoCameraFrameValid = false;
@@ -917,6 +925,10 @@
     // CampusActorController.LateUpdate), so the anchor globals need no locks;
     // only the controller input crosses threads via VrCameraInputMailbox.
     gakumas::vr::camera::VrFreeCameraRig vrFreeCameraRig;
+    gakumas::vr::camera::FollowSmoothingProbe vrFollowSmoothingProbe;
+    int vrCameraAnchorActor = -1;
+    int vrCameraAnchorBone = -1;
+    std::uintptr_t vrCameraAnchorActorToken = 0;
     UnityResolve::UnityType::Vector3 vrCameraAnchorPosition{};
     UnityResolve::UnityType::Vector3 vrCameraAnchorForward{};
     UnityResolve::UnityType::Quaternion vrCameraAnchorRotation{};
@@ -996,6 +1008,7 @@
                 static_cast<double>(now - lastUpdateNanoseconds) * 1.0e-9);
         }
         lastUpdateNanoseconds = now;
+        const float actualDtSeconds = dtSeconds;
         constexpr float kMaxFreeCameraDeltaSeconds = 0.10F;
         if (dtSeconds > kMaxFreeCameraDeltaSeconds) {
             dtSeconds = kMaxFreeCameraDeltaSeconds;
@@ -1004,6 +1017,7 @@
         vrcam::VrFreeCameraCommands commands;
         commands.dtSeconds = dtSeconds;
         commands.fpDirectionFollow = Config::vrFpDirectionFollow;
+        commands.followSmoothing = vrcam::ReadFollowSmoothing();
         const int menuModeRequest = vrcam::ConsumeVrFreeCameraModeRequest();
         if (menuModeRequest >= 0) {
             commands.hasModeRequest = true;
@@ -1045,6 +1059,10 @@
 
         vrcam::VrFreeCameraAnchor anchor;
         anchor.valid = IsVrCameraAnchorFresh(now);
+        anchor.sampleNs = vrCameraAnchorTimeNanoseconds;
+        anchor.actor = vrCameraAnchorActor;
+        anchor.bone = vrCameraAnchorBone;
+        anchor.actorToken = vrCameraAnchorActorToken;
         if (anchor.valid) {
             anchor.position = {
                 vrCameraAnchorPosition.x,
@@ -1071,6 +1089,23 @@
             gameRequested,
             vrFreeCameraLastComposedValid,
             vrFreeCameraLastComposed);
+
+        if (AreVrUnityCameraDiagnosticsEnabled()) {
+            vrcam::FollowSmoothingProbe::Sample sample;
+            sample.nowNs = now;
+            sample.anchorNs = vrCameraAnchorTimeNanoseconds;
+            sample.actor = vrCameraAnchorActor;
+            sample.bone = vrCameraAnchorBone;
+            sample.actorToken = vrCameraAnchorActorToken;
+            sample.dt = actualDtSeconds;
+            sample.settings = commands.followSmoothing;
+            sample.anchor = anchor;
+            sample.result = result;
+            sample.source = gameRequested;
+            vrFollowSmoothingProbe.Observe(sample, [](const std::string& line) {
+                static_cast<void>(gakumas::vr::WriteVrLog(line));
+            });
+        }
 
         if (result.modeChanged) {
             std::ostringstream stream;
@@ -1289,6 +1324,7 @@
         // uses it as the movement basis and the snap-turn pivot.
         vrFreeCameraLastComposed = composed.center;
         vrFreeCameraLastComposedValid = true;
+        gakumas::vr::PublishLiveGazeCenter(outputPosition.x, outputPosition.y, outputPosition.z);
 
         {
             std::lock_guard lock(vrStereoCameraFrameMutex);

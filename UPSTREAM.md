@@ -2,7 +2,7 @@
 
 Localify upstream: https://git.chinosk6.cn/chinosk/gkms-localify-dmm.git
 
-The authoritative pin is [upstream.lock.json](upstream.lock.json): commit `098a41459e17b130be02353f26d0ab0a2ccad914`, tree `622df9ccc55469741c301caa0ed5b30c64c369d3`.
+The authoritative pin is [upstream.lock.json](upstream.lock.json): commit `318107b6af69740d55f3674ad29644f0b21284e7`, tree `ea9ed8fa297f53ec348e133e6c34ec0f41a41822`.
 
 | Location | Ownership and purpose |
 | --- | --- |

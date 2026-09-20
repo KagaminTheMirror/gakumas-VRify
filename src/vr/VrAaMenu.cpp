@@ -11,6 +11,7 @@
 #include "../host/ScopedImGuiContext.hpp"
 
 #include "VrFreeCamera.hpp"
+#include "LiveGaze.hpp"
 #include "VrHandGlowSticks.hpp"
 #include "VrLog.hpp"
 
@@ -57,6 +58,7 @@ ImGuiID g_selectedSlider = 0;
 int g_fpFollowPendingValue = 0;
 int g_taaQualityPendingValue = 0;
 bool g_sliderRowClicked = false;
+bool g_selectedSliderSeen = false;
 float g_savedFlashSeconds = 0.0F;
 float g_draftRenderScale = 1.0F;
 bool g_draftRenderScaleValid = false;
@@ -416,6 +418,7 @@ std::string g_helpCaptureForTest;
 std::string g_popupCaptureForTest;
 std::string g_comboCaptureForTest;
 float g_scrollCaptureForTest = -1;
+float g_bodyScrollForTest = 0;
 float g_panelBarRightForTest = 0;
 float g_nextActionWidth = 0;
 float g_gridPendingHeight = 0;
@@ -699,13 +702,15 @@ void SliderRow(
     ImGui::PopStyleColor(6);
     ImGui::PopStyleVar();
     ImGui::PopItemWidth();
-    const bool rowClicked = !actionHover && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        ImGui::IsMouseHoveringRect(row.origin, ImVec2(row.origin.x + row.width, row.origin.y + row.height), false);
+    const bool rowClicked = !actionHover && ImGui::IsWindowHovered() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        ImGui::IsMouseHoveringRect(row.origin, ImVec2(row.origin.x + row.width, row.origin.y + row.height));
     if (enabled && (rowClicked || sliderClicked || sliderActive)) {
         g_selectedSlider = id;
         if (rowClicked || sliderClicked) g_sliderRowClicked = true;
     }
     const bool focused = enabled && g_selectedSlider == id;
+    g_selectedSliderSeen |= focused;
     const bool stickActive = focused && openxr::AaMenuSliderStickActive(sticks);
     if (focused) openxr::NudgeAaMenuSlider(*value, minimum, maximum, ImGui::GetIO().DeltaTime, sticks);
     g_helpDragging |= sliderActive || stickActive;
@@ -889,6 +894,7 @@ bool PaintVrAaMenu(
     namespace Config = GakumasLocal::Config;
 
     g_sliderRowClicked = false;
+    g_selectedSliderSeen = false;
     g_autoSliderHeld = false;
     EnsureDraftRenderScale();
 
@@ -935,11 +941,11 @@ bool PaintVrAaMenu(
     if (g_tab < 0 || g_tab > 3) {
         g_tab = 0;
     }
-    if (TabButton(ts("vr_menu_tab_picture"), g_tab == 0)) {
+    if (TabButton(ts("vr_menu_tab_general"), g_tab == 0)) {
         g_tab = 0;
     }
     ImGui::SameLine();
-    if (TabButton(ts("vr_menu_tab_taa"), g_tab == 1)) {
+    if (TabButton(ts("vr_menu_tab_picture"), g_tab == 1)) {
         g_tab = 1;
     }
     ImGui::SameLine();
@@ -960,10 +966,13 @@ bool PaintVrAaMenu(
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (g_helpTab != g_tab || g_helpLanguage != Config::vrMenuLanguage) {
+    const bool pageChanged = g_helpTab != g_tab || g_helpLanguage != Config::vrMenuLanguage;
+    if (pageChanged) {
+        g_selectedSlider = 0;
         g_helpState.Reset(); g_helpTab = g_tab; g_helpLanguage = Config::vrMenuLanguage;
     }
     ImGui::BeginChild("##settings_body", ImVec2(0, 500), false);
+    if (pageChanged) ImGui::SetScrollY(0);
     if (g_scrollCaptureForTest >= 0) {
         ImGui::SetScrollY(g_scrollCaptureForTest);
         g_scrollCaptureForTest = -1;
@@ -1032,6 +1041,64 @@ bool PaintVrAaMenu(
             PersistLocalizeAndPromptRestart(log);
         }
 
+        const bool gazeBefore = Config::vrLiveGaze;
+        ToggleRow(ts("vr_menu_live_gaze"), &Config::vrLiveGaze, true,
+            ts("vr_menu_toggle_on"), ts("vr_menu_toggle_off"));
+        HelpLine(ts("vr_menu_live_gaze_help"));
+        if (gazeBefore != Config::vrLiveGaze) {
+            SetLiveGazeRequested(Config::vrLiveGaze);
+            PersistMenuConfig(log, "live-gaze");
+        }
+        if (Config::vrLiveGaze) {
+            const char* gazeScopes[] = {ts("vr_gaze_selected"), ts("vr_gaze_all")};
+            const int gazeScopeBefore = Config::vrLiveGazeScope;
+            ComboRow(ts("vr_menu_gaze_scope"), &Config::vrLiveGazeScope,
+                gazeScopes, 2, true, stick);
+            HelpLine(ts("vr_menu_gaze_scope_help"));
+            if (gazeScopeBefore != Config::vrLiveGazeScope) {
+                SetLiveGazeScope(Config::vrLiveGazeScope);
+                PersistMenuConfig(log, "live-gaze-scope");
+            }
+            const char* gazePresets[] = {ts("vr_gaze_stable"), ts("vr_gaze_standard"), ts("vr_gaze_priority")};
+            const int gazePresetBefore = Config::vrLiveGazePreset;
+            ComboRow(ts("vr_menu_gaze_preset"), &Config::vrLiveGazePreset,
+                gazePresets, 3, true, stick);
+            HelpLine(ts("vr_menu_gaze_preset_help"));
+            if (gazePresetBefore != Config::vrLiveGazePreset) {
+                SetLiveGazePreset(Config::vrLiveGazePreset);
+                PersistMenuConfig(log, "live-gaze-preset");
+            }
+        }
+
+        const bool tinyBefore = Config::vrSourceCameraTiny;
+        ToggleRow(
+            ts("vr_menu_source_tiny"),
+            &Config::vrSourceCameraTiny,
+            true,
+            ts("vr_menu_toggle_on"),
+            ts("vr_menu_toggle_off"));
+        HelpLine(ts("vr_menu_source_tiny_help"));
+        if (tinyBefore != Config::vrSourceCameraTiny) {
+            PersistMenuConfig(log, "source-tiny");
+            log.Write(
+                std::string("[VR][menu] source camera tiny=") +
+                (Config::vrSourceCameraTiny ? "1" : "0"));
+        }
+        const bool gripTransparentBefore = Config::vrGripPanelTransparent;
+        ToggleRow(
+            ts("vr_menu_grip_transparent"),
+            &Config::vrGripPanelTransparent,
+            Config::vrSourceCameraTiny || Config::vrDisableSourceCamera,
+            ts("vr_menu_toggle_on"),
+            ts("vr_menu_toggle_off"));
+        HelpLine(ts("vr_menu_grip_transparent_help"));
+        if (gripTransparentBefore != Config::vrGripPanelTransparent) {
+            PersistMenuConfig(log, "grip-transparent");
+            log.Write(
+                std::string("[VR][menu] grip panel transparent=") +
+                (Config::vrGripPanelTransparent ? "1" : "0"));
+        }
+    } else if (g_tab == 1) {
         bool applyRenderScale = false;
         SliderRow(
             ts("vr_menu_render_scale"),
@@ -1118,13 +1185,59 @@ bool PaintVrAaMenu(
                 std::string("[VR][menu] skip eye VL lens cards=") +
                 (Config::vrHideUiTextureOverlay ? "1" : "0"));
         }
-        // .119: spent diagnostics dropped from the menu (eye-as-main,
-        // object-MV skip, JumpFlood temporal off) — all three proven
-        // no-effect on the source-off TAA jitter in the .116/.117 runs.
-        // .185: deferred-stencil skip also left config-only.
-        // .268: projected-shadow / toon / shade-band live on the
-        // experimental tab (default off).
-        // Config flags remain for log-driven experiments.
+        const int aaModeBefore = Config::vrEyeAaMode;
+        ComboRow(
+            ts("vr_menu_aa_mode"), &aaModeDisplay, aaModeItems, 6, true, stick);
+        Config::vrEyeAaMode = kAaDisplayToStored[static_cast<std::size_t>(
+            std::clamp(aaModeDisplay, 0, 5))];
+        PersistConfigChange(
+            aaModeBefore != Config::vrEyeAaMode, log, "aa-mode");
+        if (Config::vrEyeAaMode == 1) {
+            const int taaQualityBefore = Config::vrEyeTaaQuality;
+            ComboRow(
+                ts("vr_taa_quality"),
+                &Config::vrEyeTaaQuality,
+                taaQualityItems,
+                5,
+                true,
+                stick);
+            HelpLine(ts("vr_taa_quality_help"));
+            if (taaQualityBefore != Config::vrEyeTaaQuality) {
+                // Hardware feedback confirms LED/sign color issues at Medium+.
+                if (Config::vrEyeTaaQuality >= 2 && taaQualityBefore < 2) {
+                    g_taaQualityPendingValue = Config::vrEyeTaaQuality;
+                    Config::vrEyeTaaQuality = taaQualityBefore;
+                    g_openTaaConfirm = true;
+                } else {
+                    PersistMenuConfig(log, "taa-quality");
+                    log.Write(
+                        "[VR][menu] taa quality=" +
+                        std::to_string(Config::vrEyeTaaQuality));
+                }
+            }
+            SliderRow(
+                ts("vr_taa_jitter_scale"), &Config::vrEyeTaaJitterScale, 0.0F,
+                2.0F, "%.2f", true, input.sticks);
+            HelpLine(ts("vr_taa_jitter_scale_help"));
+            SliderRow(
+                ts("vr_taa_frame_influence"), &Config::vrEyeTaaFrameInfluence,
+                0.0F, 1.0F, "%.3f", true, input.sticks);
+            HelpLine(ts("vr_taa_frame_influence_help"));
+        } else if (Config::vrEyeAaMode == 2 || Config::vrEyeAaMode == 4 ||
+                   Config::vrEyeAaMode == 5) {
+            const int smaaBefore = Config::vrEyeSmaaQuality;
+            ComboRow(
+                ts(Config::vrEyeAaMode == 5
+                    ? "vr_tscmaa_quality"
+                    : "vr_smaa_quality"),
+                &Config::vrEyeSmaaQuality,
+                smaaQualityItems,
+                3,
+                true,
+                stick);
+            PersistConfigChange(
+                smaaBefore != Config::vrEyeSmaaQuality, log, "smaa-quality");
+        }
     } else if (g_tab == 2) {
         // Free-camera tab. The mode combo mirrors the live rig state (the
         // Unity thread republishes it every frame); a user change posts an
@@ -1216,6 +1329,41 @@ bool PaintVrAaMenu(
                 std::to_string(Config::vrCameraYButtonBone));
         }
 
+        const char* smoothingItems[] = {
+            ts("vr_follow_smooth_auto"), ts("vr_follow_smooth_custom"),
+        };
+        const int smoothingBefore = Config::vrFollowSmoothingPreset;
+        const float horizontalBefore = Config::vrFollowHorizontalMs;
+        const float verticalBefore = Config::vrFollowVerticalMs;
+        int smoothingDisplay = Config::vrFollowSmoothingPreset == 5 ? 1 : 0;
+        ComboRow(ts("vr_menu_follow_smoothing"), &smoothingDisplay,
+            smoothingItems, camera::kFollowSmoothingPresetCount, true, stick);
+        Config::vrFollowSmoothingPreset = smoothingDisplay == 1 ? 5 : 0;
+        HelpLine(ts("vr_menu_follow_smoothing_help"));
+        if (Config::vrFollowSmoothingPreset == 5) {
+            SliderRow(ts("vr_follow_horizontal"), &Config::vrFollowHorizontalMs,
+                0.0F, 500.0F, "%.0f ms", true, input.sticks);
+            HelpLine(ts("vr_follow_axis_help"));
+            SliderRow(ts("vr_follow_vertical"), &Config::vrFollowVerticalMs,
+                0.0F, 500.0F, "%.0f ms", true, input.sticks);
+            HelpLine(ts("vr_follow_axis_help"));
+        }
+        if (smoothingBefore != Config::vrFollowSmoothingPreset ||
+            horizontalBefore != Config::vrFollowHorizontalMs ||
+            verticalBefore != Config::vrFollowVerticalMs) {
+            camera::PublishFollowSmoothing(Config::vrFollowSmoothingPreset,
+                Config::vrFollowHorizontalMs, Config::vrFollowVerticalMs);
+            if (smoothingBefore != Config::vrFollowSmoothingPreset) {
+                PersistMenuConfig(log, "follow-smoothing");
+                const auto settings = camera::ReadFollowSmoothing();
+                log.Write("[VR][menu] FOLLOW_SMOOTHING_APPLY preset=" +
+                    std::to_string(settings.preset) + " horizontalMs=" +
+                    std::to_string(settings.horizontalMs) + " verticalMs=" +
+                    std::to_string(settings.verticalMs));
+            }
+            // Sliders use the existing debounced save; publication is immediate.
+        }
+
         const char* fpFollowItems[] = {
             ts("vr_fp_follow_off"),
             ts("vr_fp_follow_none"),
@@ -1283,35 +1431,7 @@ bool PaintVrAaMenu(
             ImGui::EndPopup();
         }
 
-        const bool tinyBefore = Config::vrSourceCameraTiny;
-        ToggleRow(
-            ts("vr_menu_source_tiny"),
-            &Config::vrSourceCameraTiny,
-            true,
-            ts("vr_menu_toggle_on"),
-            ts("vr_menu_toggle_off"));
-        HelpLine(ts("vr_menu_source_tiny_help"));
-        if (tinyBefore != Config::vrSourceCameraTiny) {
-            PersistMenuConfig(log, "source-tiny");
-            log.Write(
-                std::string("[VR][menu] source camera tiny=") +
-                (Config::vrSourceCameraTiny ? "1" : "0"));
-        }
     } else if (g_tab == 3) {
-        const bool gripTransparentBefore = Config::vrGripPanelTransparent;
-        ToggleRow(
-            ts("vr_menu_grip_transparent"),
-            &Config::vrGripPanelTransparent,
-            Config::vrSourceCameraTiny || Config::vrDisableSourceCamera,
-            ts("vr_menu_toggle_on"),
-            ts("vr_menu_toggle_off"));
-        HelpLine(ts("vr_menu_grip_transparent_help"));
-        if (gripTransparentBefore != Config::vrGripPanelTransparent) {
-            PersistMenuConfig(log, "grip-transparent");
-            log.Write(
-                std::string("[VR][menu] grip panel transparent=") +
-                (Config::vrGripPanelTransparent ? "1" : "0"));
-        }
         const bool handGlowBefore = Config::vrHandGlowSticks;
         bool cycleHandGlow = false;
         ToggleRow(
@@ -1398,64 +1518,27 @@ bool PaintVrAaMenu(
             PersistMenuConfig(log, "shade-band-reset");
             log.Write("[VR][menu] reset character shade band bias to 0");
         }
-    } else {
-        const int aaModeBefore = Config::vrEyeAaMode;
-        ComboRow(
-            ts("vr_menu_aa_mode"), &aaModeDisplay, aaModeItems, 6, true, stick);
-        Config::vrEyeAaMode = kAaDisplayToStored[static_cast<std::size_t>(
-            std::clamp(aaModeDisplay, 0, 5))];
-        PersistConfigChange(
-            aaModeBefore != Config::vrEyeAaMode, log, "aa-mode");
-        if (Config::vrEyeAaMode == 1) {
-            const int taaQualityBefore = Config::vrEyeTaaQuality;
-            ComboRow(
-                ts("vr_taa_quality"),
-                &Config::vrEyeTaaQuality,
-                taaQualityItems,
-                5,
-                true,
-                stick);
-            HelpLine(ts("vr_taa_quality_help"));
-            if (taaQualityBefore != Config::vrEyeTaaQuality) {
-                // Hardware feedback confirms LED/sign color issues at Medium+.
-                if (Config::vrEyeTaaQuality >= 2 && taaQualityBefore < 2) {
-                    g_taaQualityPendingValue = Config::vrEyeTaaQuality;
-                    Config::vrEyeTaaQuality = taaQualityBefore;
-                    g_openTaaConfirm = true;
-                } else {
-                    PersistMenuConfig(log, "taa-quality");
-                    log.Write(
-                        "[VR][menu] taa quality=" +
-                        std::to_string(Config::vrEyeTaaQuality));
-                }
-            }
-            SliderRow(
-                ts("vr_taa_jitter_scale"), &Config::vrEyeTaaJitterScale, 0.0F,
-                2.0F, "%.2f", true, input.sticks);
-            HelpLine(ts("vr_taa_jitter_scale_help"));
-            SliderRow(
-                ts("vr_taa_frame_influence"), &Config::vrEyeTaaFrameInfluence,
-                0.0F, 1.0F, "%.3f", true, input.sticks);
-            HelpLine(ts("vr_taa_frame_influence_help"));
-        } else if (Config::vrEyeAaMode == 2 || Config::vrEyeAaMode == 4 ||
-                   Config::vrEyeAaMode == 5) {
-            const int smaaBefore = Config::vrEyeSmaaQuality;
-            ComboRow(
-                ts(Config::vrEyeAaMode == 5
-                    ? "vr_tscmaa_quality"
-                    : "vr_smaa_quality"),
-                &Config::vrEyeSmaaQuality,
-                smaaQualityItems,
-                3,
-                true,
-                stick);
-            PersistConfigChange(
-                smaaBefore != Config::vrEyeSmaaQuality, log, "smaa-quality");
-        }
     }
 
     ImGui::SetCursorScreenPos(ImVec2(g_gridX, g_gridY + (g_gridRight ? g_gridPendingHeight : 0)));
     ImGui::Dummy(ImVec2(1,1));
+    g_bodyScrollForTest = ImGui::GetScrollY();
+    // Hidden controls and page changes must not retain slider ownership.
+    if (!g_selectedSliderSeen ||
+        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !g_sliderRowClicked)) {
+        g_selectedSlider = 0;
+    }
+    // The pointing hand scrolls; selected sliders retain horizontal stick input.
+    // Keep the body still while a dropdown, modal, or drag owns the interaction.
+    if (!pageChanged && g_selectedSlider == 0 && input.hovering &&
+        input.thumbstickActive && !input.triggerHeld && !ImGui::IsAnyItemActive() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+        std::abs(input.thumbstickY) > openxr::kAaMenuSliderDeadzone) {
+        constexpr float kScrollPixelsPerSecond = 600.0F;
+        ImGui::SetScrollY(std::clamp(ImGui::GetScrollY() -
+            input.thumbstickY * kScrollPixelsPerSecond * io.DeltaTime,
+            0.0F, ImGui::GetScrollMaxY()));
+    }
     ImGui::EndChild();
     if (!g_popupCaptureForTest.empty()) {
         ImGui::OpenPopup(g_popupCaptureForTest.c_str());
@@ -1505,10 +1588,19 @@ bool PaintVrAaMenu(
         const float confirmWidth = ActionWidth(ts("ok"));
         const float cancelWidth = ActionWidth(ts("cancel"));
         if (ImGui::Button(ts("ok"), ImVec2(confirmWidth, 54.0F))) {
-            const bool localizeBeforeReset = Config::vrLocalizeText;
             Config::ResetVrEyeAaToBaseline();
             Config::ResetVrPointerSettings();
-            Config::vrLocalizeText = false;
+            Config::vrFollowSmoothingPreset = 0;
+            Config::vrLiveGaze = false;
+            Config::vrLiveGazePreset = Config::kDefaultVrLiveGazePreset;
+            Config::vrLiveGazeScope = Config::kDefaultVrLiveGazeScope;
+            SetLiveGazePreset(Config::vrLiveGazePreset);
+            SetLiveGazeScope(Config::vrLiveGazeScope);
+            SetLiveGazeRequested(false);
+            Config::vrFollowHorizontalMs = 0.0F;
+            Config::vrFollowVerticalMs = 100.0F;
+            camera::PublishFollowSmoothing(0, 0.0F, 100.0F);
+            camera::SetVrFreeCameraFollowBone(9);
             Config::vrMenuLanguage = Config::kDefaultVrMenuLanguage;
             Config::vrEyeOutlineWidth = Config::kDefaultVrEyeOutlineWidth;
             Config::vrBloomFollowSourceCamera = false;
@@ -1530,9 +1622,6 @@ bool PaintVrAaMenu(
             PersistMenuConfig(log, "restore");
             log.Write("[VR][menu] restore defaults confirmed");
             ImGui::CloseCurrentPopup();
-            if (localizeBeforeReset != Config::vrLocalizeText) {
-                PersistLocalizeAndPromptRestart(log);
-            }
         }
         ImGui::SameLine();
         if (ImGui::Button(ts("cancel"), ImVec2(cancelWidth, 54.0F))) {
@@ -1911,6 +2000,19 @@ void ShutdownVrAaMenu() noexcept {
 void SetVrMenuHelpDeltaForTest(float dt) { g_helpTestDelta = dt; }
 void SetVrMenuHelpCaptureForTest(const char* key) { g_helpCaptureForTest = key; }
 void SetVrMenuScrollCaptureForTest(float scroll) { g_scrollCaptureForTest = scroll; }
+float VrMenuScrollForTest() { return g_bodyScrollForTest; }
+bool VrMenuRowRectForTest(const char* key, float* rect) {
+    for (const auto& entry : g_helpRows) {
+        if (entry.row.label != GakumasVrI18n::ts(key)) continue;
+        const auto& row = entry.row;
+        rect[0] = row.origin.x; rect[1] = row.origin.y;
+        rect[2] = row.width; rect[3] = row.height;
+        rect[4] = row.controlTop;
+        return true;
+    }
+    return false;
+}
+void ClearVrMenuSavedFlashForTest() { g_savedFlashSeconds = 0.0F; }
 void SetVrMenuComboCaptureForTest(const char* key) { g_comboCaptureForTest = key; }
 float VrPanelBarRightForTest() { return g_panelBarRightForTest; }
 bool VrMenuToggleColumnsFitForTest() {

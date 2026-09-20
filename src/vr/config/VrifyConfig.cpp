@@ -1,6 +1,8 @@
 #include <string>
 #include "VrifyConfig.hpp"
 #include "host/localify/ConfigIntegration.hpp"
+#include "../camera/FollowSmoothing.hpp"
+#include "../LiveGaze.hpp"
 #include "nlohmann/json.hpp"
 #include "GakumasLocalify/Log.h"
 #include <algorithm>
@@ -56,6 +58,12 @@ namespace GakumasLocal::Config {
     float vrPointerSmoothBeta = kDefaultVrPointerSmoothBeta;
     int vrCameraYButtonBone = 0;
     int vrFpDirectionFollow = 3;
+    int vrFollowSmoothingPreset = 0;
+    bool vrLiveGaze = false;
+    int vrLiveGazePreset = kDefaultVrLiveGazePreset;
+    int vrLiveGazeScope = kDefaultVrLiveGazeScope;
+    float vrFollowHorizontalMs = 0.0F;
+    float vrFollowVerticalMs = 100.0F;
     bool vrPanelCustomized = false;
     bool vrPanelPinned = false;
     float vrPanelOffsetX = 0.0F;
@@ -138,6 +146,16 @@ namespace GakumasLocal::Config {
         };
         vrCameraYButtonBone = clampInt(vrCameraYButtonBone, 0, 1);
         vrFpDirectionFollow = clampInt(vrFpDirectionFollow, 0, 3);
+        vrFollowSmoothingPreset = vrFollowSmoothingPreset == 5 ? 5 : 0;
+        gakumas::vr::SetLiveGazeRequested(vrLiveGaze);
+        if (vrLiveGazePreset < 0 || vrLiveGazePreset > 2) vrLiveGazePreset = kDefaultVrLiveGazePreset;
+        gakumas::vr::SetLiveGazePreset(vrLiveGazePreset);
+        if (vrLiveGazeScope != 0 && vrLiveGazeScope != 1) vrLiveGazeScope = kDefaultVrLiveGazeScope;
+        gakumas::vr::SetLiveGazeScope(vrLiveGazeScope);
+        vrFollowHorizontalMs = clampFloat(vrFollowHorizontalMs, 0.0F, 500.0F, 0.0F);
+        vrFollowVerticalMs = clampFloat(vrFollowVerticalMs, 0.0F, 500.0F, 100.0F);
+        gakumas::vr::camera::PublishFollowSmoothing(
+            vrFollowSmoothingPreset, vrFollowHorizontalMs, vrFollowVerticalMs);
         vrMenuLanguage = clampInt(
             vrMenuLanguage, kVrMenuLanguageSystem, kVrMenuLanguageEn);
     }
@@ -146,6 +164,16 @@ namespace GakumasLocal::Config {
         nlohmann::json g_vrConfigDocument = nlohmann::json::object();
 
         void ResetVrConfigFailClosed() {
+            vrFollowSmoothingPreset = 0;
+            vrLiveGaze = false;
+            vrLiveGazePreset = kDefaultVrLiveGazePreset;
+            vrLiveGazeScope = kDefaultVrLiveGazeScope;
+            gakumas::vr::SetLiveGazePreset(vrLiveGazePreset);
+            gakumas::vr::SetLiveGazeScope(vrLiveGazeScope);
+            gakumas::vr::SetLiveGazeRequested(false);
+            vrFollowHorizontalMs = 0.0F;
+            vrFollowVerticalMs = 100.0F;
+            gakumas::vr::camera::PublishFollowSmoothing(0, 0.0F, 100.0F);
             vrDiagnosticsEnabled = false;
             vrRuntimeStartupEnabled = false;
             vrDiagnosticsStartupEnabled = false;
@@ -234,6 +262,12 @@ namespace GakumasLocal::Config {
             GetVrConfigItem(vrHandGlowSticks);
             GetVrConfigItem(vrCameraYButtonBone);
             GetVrConfigItem(vrFpDirectionFollow);
+            GetVrConfigItem(vrFollowSmoothingPreset);
+            GetVrConfigItem(vrLiveGaze);
+            GetVrConfigItem(vrLiveGazePreset);
+            GetVrConfigItem(vrLiveGazeScope);
+            GetVrConfigItem(vrFollowHorizontalMs);
+            GetVrConfigItem(vrFollowVerticalMs);
             GetVrConfigItem(vrPanelCustomized);
             GetVrConfigItem(vrPanelPinned);
             GetVrConfigItem(vrPanelOffsetX);
@@ -300,6 +334,12 @@ namespace GakumasLocal::Config {
             SetVrConfigItem(vrPointerSmoothBeta);
             SetVrConfigItem(vrCameraYButtonBone);
             SetVrConfigItem(vrFpDirectionFollow);
+            SetVrConfigItem(vrFollowSmoothingPreset);
+            SetVrConfigItem(vrLiveGaze);
+            SetVrConfigItem(vrLiveGazePreset);
+            SetVrConfigItem(vrLiveGazeScope);
+            SetVrConfigItem(vrFollowHorizontalMs);
+            SetVrConfigItem(vrFollowVerticalMs);
             SetVrConfigItem(vrPanelCustomized);
             SetVrConfigItem(vrPanelPinned);
             SetVrConfigItem(vrPanelOffsetX);

@@ -50,6 +50,13 @@
             unityRenderLoopDepth == 0U;
         ++unityRenderLoopDepth;
 #ifdef GKMS_WINDOWS
+        if (outerNormalLoop && Config::vrRuntimeStartupEnabled) {
+            gakumas::vr::TickLiveGaze();
+            gakumas::vr::TickFollowCostumeHandover();
+        }
+        if (outerNormalLoop && Config::vrRuntimeStartupEnabled) {
+            gakumas::vr::TickCommonLiveGazeProbe();
+        }
         // The current Unity 6000 player invokes the camera callbacks from this
         // native render-loop bridge but does not pass through the managed
         // Begin/EndContextRendering event wrappers we can hook. Treat the

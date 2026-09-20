@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 
 namespace gakumas::vr::camera {
 namespace {
@@ -11,7 +12,9 @@ constexpr float kPi = 3.14159265358979323846F;
 
 std::atomic<int> publishedMode{static_cast<int>(VrFreeCameraMode::Off)};
 std::atomic<int> requestedMode{-1};
-std::atomic<int> followBoneValue{10}; // HumanBodyBones.Head
+std::atomic<int> followBoneValue{9}; // HumanBodyBones.Neck
+std::atomic<std::uintptr_t> followActorToken{0};
+std::atomic<bool> followIdentityRetarget{false};
 
 [[nodiscard]] float WrapPi(float radians) noexcept {
     while (radians > kPi) {
@@ -158,6 +161,18 @@ void SetVrFreeCameraFollowBone(int humanBodyBoneValue) noexcept {
     followBoneValue.store(humanBodyBoneValue, std::memory_order_release);
 }
 
+void PublishVrFollowActorController(void* actor) noexcept {
+    followActorToken.store(reinterpret_cast<std::uintptr_t>(actor), std::memory_order_release);
+}
+
+void* ReadVrFollowActorController() noexcept {
+    return reinterpret_cast<void*>(followActorToken.load(std::memory_order_acquire));
+}
+
+void RequestFollowIdentityRetarget() noexcept {
+    followIdentityRetarget.store(true, std::memory_order_release);
+}
+
 int ReadVrFreeCameraFollowBone() noexcept {
     return followBoneValue.load(std::memory_order_acquire);
 }
@@ -204,6 +219,7 @@ const char* VrFreeCameraModeName(VrFreeCameraMode mode) noexcept {
 
 void VrFreeCameraRig::ForceOff() noexcept {
     mode_ = VrFreeCameraMode::Off;
+    followPreviousSample_ = {};
     snapEngaged_ = false;
     lastPoseValid_ = false;
     anchorSmoothedValid_ = false;
@@ -214,6 +230,7 @@ void VrFreeCameraRig::ForceOff() noexcept {
 void VrFreeCameraRig::EnterMode(
     VrFreeCameraMode next,
     const pose::Pose& gamePose) noexcept {
+    followPreviousSample_ = {};
     switch (next) {
     case VrFreeCameraMode::Free:
         // Seed at the current game camera pose so the composed output does
@@ -274,7 +291,8 @@ void VrFreeCameraRig::ApplyReset(const pose::Pose& gamePose) noexcept {
 void VrFreeCameraRig::UpdateAnchorSmoothing(
     const VrFreeCameraAnchor& anchor,
     float dtSeconds,
-    float tauSeconds) noexcept {
+    float horizontalTauSeconds,
+    float verticalTauSeconds) noexcept {
     if (!anchor.valid || !pose::IsFinite(anchor.position)) {
         return;
     }
@@ -282,10 +300,12 @@ void VrFreeCameraRig::UpdateAnchorSmoothing(
         anchorSmoothedPosition_ = anchor.position;
         anchorSmoothedValid_ = true;
     } else {
-        const float alpha = SmoothingAlpha(dtSeconds, tauSeconds);
-        anchorSmoothedPosition_ = Add(
-            anchorSmoothedPosition_,
-            Scale(Subtract(anchor.position, anchorSmoothedPosition_), alpha));
+        const float horizontalAlpha = SmoothingAlpha(dtSeconds, horizontalTauSeconds);
+        const float verticalAlpha = SmoothingAlpha(dtSeconds, verticalTauSeconds);
+        const auto delta = Subtract(anchor.position, anchorSmoothedPosition_);
+        anchorSmoothedPosition_ = Add(anchorSmoothedPosition_,
+            {delta.x * horizontalAlpha, delta.y * verticalAlpha,
+             delta.z * horizontalAlpha});
     }
     if (pose::IsFinite(anchor.forward)) {
         anchorForward_ = anchor.forward;
@@ -345,6 +365,7 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
     }
 
     if (commands.resetPresses > 0 && mode_ != VrFreeCameraMode::Off) {
+        followPreviousSample_ = {};
         ApplyReset(gamePose);
         result.resetApplied = true;
     }
@@ -411,7 +432,34 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
     }
 
     case VrFreeCameraMode::Follow: {
-        UpdateAnchorSmoothing(anchor, dt, kFollowSmoothingTau);
+        const auto smoothing = ResolveFollowSmoothing(
+            commands.followSmoothing.preset,
+            static_cast<float>(commands.followSmoothing.horizontalMs),
+            static_cast<float>(commands.followSmoothing.verticalMs));
+        const bool identityRetarget =
+            followIdentityRetarget.exchange(false, std::memory_order_acq_rel);
+        const bool valid = anchor.valid && pose::IsFinite(anchor.position);
+        // Seed once before deriving orbit offsets. Subsequent filtering happens
+        // after distance/height input, so auto uses this frame's intended offset.
+        if (!anchorSmoothedValid_) UpdateAnchorSmoothing(anchor, dt, 0, 0);
+        if (!valid) followPreviousSample_ = {};
+        else if (anchor.sampleNs != followPreviousSample_.sampleNs) {
+            const auto& previous = followPreviousSample_;
+            if (previous.valid && previous.sampleNs > 0 &&
+                anchor.sampleNs > previous.sampleNs &&
+                anchor.actorToken == previous.actorToken && anchor.actor == previous.actor &&
+                anchor.bone == previous.bone) {
+                const auto delta = Subtract(anchor.position, previous.position);
+                result.followStep = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+                result.followSampleDt = static_cast<float>(anchor.sampleNs - previous.sampleNs) * 1.0e-9F;
+                // Conservative positional discontinuity heuristic, calibrated
+                // against dev.454 capture. No claim to know animation semantics.
+                result.followJumpDetected = result.followSampleDt <= 0.1F &&
+                    result.followStep >= 0.35F &&
+                    result.followStep / result.followSampleDt >= 12.0F;
+            }
+            followPreviousSample_ = anchor;
+        }
         if (!followSeeded_ && anchorSmoothedValid_ && lastPoseValid_) {
             const pose::Vector3 delta =
                 Subtract(lastPose_.position, anchorSmoothedPosition_);
@@ -448,12 +496,14 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
                 leftX * (kFollowOrbitDegreesPerSecond * kPi / 180.0F) * dt;
             const float distanceSpeed = kFollowDistanceSpeed *
                 (commands.sprintHeld ? kFreeSprintMultiplier : 1.0F);
+            const float heightSpeed = kFollowHeightSpeed *
+                (commands.sprintHeld ? kFreeSprintMultiplier : 1.0F);
             followDistance_ = std::clamp(
                 followDistance_ - leftY * distanceSpeed * dt,
                 kFollowDistanceMinimum,
                 kFollowDistanceMaximum);
             followHeight_ = std::clamp(
-                followHeight_ + rightY * kFollowHeightSpeed * dt,
+                followHeight_ + rightY * heightSpeed * dt,
                 kFollowHeightMinimum,
                 kFollowHeightMaximum);
         }
@@ -464,6 +514,33 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
                 followHeight_,
                 std::cos(followYawRadians_) * followDistance_,
             };
+            // Include room-scale head displacement and vertical offset. Use the
+            // intended relative offset, not old world head minus a teleported
+            // target: that would mistake a jump/filter lag for backing away.
+            auto viewOffset = offset;
+            if (headPoseValid && lastPoseValid_ && pose::IsFinite(headPose.position)) {
+                const float yawDelta = followYawRadians_ + kPi -
+                    YawFromOrientation(lastPose_.orientation, followYawRadians_ + kPi);
+                viewOffset = Add(viewOffset, RotateAroundY(
+                    Subtract(headPose.position, lastPose_.position), yawDelta));
+            }
+            result.followDistance = std::sqrt(viewOffset.x * viewOffset.x +
+                viewOffset.y * viewOffset.y + viewOffset.z * viewOffset.z);
+            result.followHorizontalMs = smoothing.preset == 5
+                ? static_cast<float>(smoothing.horizontalMs)
+                : 50.0F * std::clamp(result.followDistance - 1.0F, 0.0F, 1.0F);
+            result.followVerticalMs = static_cast<float>(smoothing.verticalMs);
+            result.followTeleportApplied =
+                (smoothing.preset == 0 && result.followJumpDetected) ||
+                identityRetarget;
+            if (result.followTeleportApplied) {
+                result.followHorizontalMs = 0;
+                result.followVerticalMs = 0;
+            }
+            UpdateAnchorSmoothing(anchor, dt,
+                result.followHorizontalMs * 0.001F, result.followVerticalMs * 0.001F);
+            result.followAnchorValid = valid;
+            result.followSmoothedAnchor = anchorSmoothedPosition_;
             lastPose_ = {
                 Add(anchorSmoothedPosition_, offset),
                 QuaternionFromYaw(followYawRadians_ + kPi),
@@ -478,7 +555,8 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
     }
 
     case VrFreeCameraMode::FirstPerson: {
-        UpdateAnchorSmoothing(anchor, dt, kFirstPersonSmoothingTau);
+        UpdateAnchorSmoothing(anchor, dt,
+            kFirstPersonSmoothingTau, kFirstPersonSmoothingTau);
         const auto directionFollow =
             static_cast<VrFpDirectionFollow>(commands.fpDirectionFollow);
         // Manual snap turns only when the bone does not own the yaw.

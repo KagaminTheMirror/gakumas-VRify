@@ -25,6 +25,7 @@
         static auto* klass = Il2cppUtils::GetClass("campus-submodule.Runtime.dll", "Campus.Common", "CampusActorController");
         static auto* indexMethod = Il2cppUtils::il2cpp_class_get_method_from_name(klass->address, "get_index", 0);
         const int index = indexMethod ? reinterpret_cast<int (*)(void*)>(indexMethod->methodPointer)(actor) : 0;
+        gakumas::vr::NoteFollowCostumeActor(actor, index);
         const bool follow = gakumas::vr::camera::IsVrFreeCameraBoneAnchorWanted();
         const bool toon = Config::vrActorToonSourceAnchor && Config::vrToonFollowRef != Config::kVrToonFollowRefSource && gakumas::vr::camera::IsVrFreeCameraLocomotionActive();
         static bool needRestoreHides = false;
@@ -59,6 +60,10 @@
         vrCameraAnchorPosition = transform->GetPosition();
         vrCameraAnchorForward = transform->GetForward();
         vrCameraAnchorRotation = transform->GetRotation();
+        vrCameraAnchorActor = index;
+        vrCameraAnchorBone = boneId;
+        vrCameraAnchorActorToken = reinterpret_cast<std::uintptr_t>(actor);
+        gakumas::vr::camera::PublishVrFollowActorController(actor);
         vrCameraAnchorTimeNanoseconds = gakumas::vr::pose::MonotonicNowNanoseconds();
         static auto* rootField = klass->Get<UnityResolve::Field>("_rootBody");
         auto* body = Il2cppUtils::ClassGetFieldValue<UnityResolve::UnityType::Transform*>(actor, rootField);

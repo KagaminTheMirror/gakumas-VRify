@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pose/PoseMath.hpp"
+#include "camera/FollowSmoothing.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -110,8 +111,8 @@ struct VrFreeCameraCommands {
     float leftStickY = 0.0F;
     float rightStickX = 0.0F;
     float rightStickY = 0.0F;
-    // Hold-to-sprint. FREE: planar + climb. FOLLOW: distance only (orbit
-    // and height stay at walk rate). The OpenXR worker already gates this
+    // Hold-to-sprint. FREE: planar + climb. FOLLOW: distance and height
+    // (orbit stays at walk rate). The OpenXR worker already gates this
     // on left trigger held and the left pointer not sitting on a visible
     // UI quad (game panel / settings menu / adjust bar).
     bool sprintHeld = false;
@@ -121,6 +122,7 @@ struct VrFreeCameraCommands {
     bool hasModeRequest = false;
     VrFreeCameraMode modeRequest = VrFreeCameraMode::Off;
     int fpDirectionFollow = 0;
+    FollowSmoothingSettings followSmoothing{};
 };
 
 // Character bone sample published by CampusActorController.LateUpdate on the
@@ -128,6 +130,10 @@ struct VrFreeCameraCommands {
 // missing actor index) - the rig then freezes at its last pose instead of
 // snapping to the origin.
 struct VrFreeCameraAnchor {
+    std::int64_t sampleNs = 0;
+    std::uintptr_t actorToken = 0;
+    int actor = -1;
+    int bone = -1;
     bool valid = false;
     pose::Vector3 position{};
     pose::Vector3 forward{};
@@ -165,6 +171,16 @@ struct VrFreeCameraUpdateResult {
     bool resetApplied = false;
     VrFreeCameraMode mode = VrFreeCameraMode::Off;
     pose::Pose rigPose{};
+    // Numeric values only, for the bounded FOLLOW probe; never Unity objects.
+    bool followAnchorValid = false;
+    pose::Vector3 followSmoothedAnchor{};
+    float followDistance = 0;
+    float followHorizontalMs = 0;
+    float followVerticalMs = 0;
+    float followStep = 0;
+    float followSampleDt = 0;
+    bool followJumpDetected = false;
+    bool followTeleportApplied = false;
 };
 
 class VrFreeCameraRig final {
@@ -194,9 +210,7 @@ public:
     static constexpr float kFirstPersonOffsetLimit = 0.5F;   // m per axis
     static constexpr float kFirstPersonOffsetDefaultY = 0.06F;
     static constexpr float kFollowSmoothingTau = 0.25F;      // seconds
-    // FP position smoothing is off (tau 0 = raw tracking): lag detaches
-    // the view from a running character (stereo.216). FOLLOW does not
-    // have that problem and keeps its orbit smoothing.
+    // FP position smoothing stays off; FOLLOW uses auto or custom settings.
     static constexpr float kFirstPersonSmoothingTau = 0.0F;  // seconds
     // Direction follow lags behind the bone on purpose: an instant hard lock
     // to a dancing head is the worst motion-sickness case.
@@ -224,7 +238,8 @@ private:
     void UpdateAnchorSmoothing(
         const VrFreeCameraAnchor& anchor,
         float dtSeconds,
-        float tauSeconds) noexcept;
+        float horizontalTauSeconds,
+        float verticalTauSeconds) noexcept;
     [[nodiscard]] bool ConsumeSnapTurn(
         float rightStickX,
         float rightStickY,
@@ -241,6 +256,7 @@ private:
     float followYawRadians_ = 0.0F;
     float followDistance_ = kFollowDistanceDefault;
     float followHeight_ = 0.0F;
+    VrFreeCameraAnchor followPreviousSample_{};
 
     // First person mode. Offset is local to the rig yaw: x lateral, y up,
     // z forward.
@@ -283,9 +299,17 @@ void RequestVrFreeCameraMode(VrFreeCameraMode mode) noexcept;
 
 // FOLLOW anchor bone (HumanBodyBones value). Owned here as an atomic so the
 // menu (OpenXR worker) and the bone sampler (Unity main thread) never touch
-// GKCamera's CSEnum across threads. Defaults to Head (10).
+// GKCamera's CSEnum across threads. Defaults to Neck (9).
 void SetVrFreeCameraFollowBone(int humanBodyBoneValue) noexcept;
 [[nodiscard]] int ReadVrFreeCameraFollowBone() noexcept;
+// CampusActorController* currently sampled as the FOLLOW/FP bone anchor.
+// Written from LateUpdate; not a retained Unity handle. Null when no
+// FOLLOW/FP sample has been published this session.
+void PublishVrFollowActorController(void* actor) noexcept;
+[[nodiscard]] void* ReadVrFollowActorController() noexcept;
+// One-shot: next FOLLOW update hard-cuts the smoothed anchor so a same-idol
+// costume retarget keeps the current orbit instead of chasing the old model.
+void RequestFollowIdentityRetarget() noexcept;
 // Advances through kVrFreeCameraBoneOptions; returns the new value.
 int CycleVrFreeCameraFollowBone(std::uint32_t presses) noexcept;
 // i18n key of the option matching `value`, or the Head key when unknown.

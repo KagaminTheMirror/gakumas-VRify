@@ -6,7 +6,7 @@
  #include "nlohmann/json.hpp"
  #include "../Log.h"
  #include <thread>
-@@ -59,13 +60,16 @@
+@@ -63,13 +64,16 @@ namespace GakumasLocal::Config {
      bool dmmUnlockSize = false;
  
      void LoadConfig(const std::string& configStr) {
@@ -23,7 +23,7 @@
              GetConfigItem(lazyInit);
              GetConfigItem(replaceFont);
              GetConfigItem(replaceTexture);
-@@ -111,6 +115,7 @@
+@@ -119,6 +123,7 @@ namespace GakumasLocal::Config {
              GetConfigItem(dmmUnlockSize);
          }
          catch (std::exception& e) {
@@ -31,7 +31,7 @@
              Log::ErrorFmt("LoadConfig error: %s", e.what());
          }
          isConfigInit = true;
-@@ -118,7 +123,7 @@
+@@ -126,7 +131,7 @@ namespace GakumasLocal::Config {
  
      void SaveConfig(const std::string& configPath) {
          try {

@@ -2,7 +2,7 @@
 +++ b/src/platformDefine.hpp
 @@ -13,23 +13,34 @@
  
- #define PLUGIN_VERSION "v3.4.1"
+ #define PLUGIN_VERSION "v3.5.0"
  
 -#define ADD_HOOK(name, addr)                                                                       \
 -	name##_Addr = reinterpret_cast<name##_Type>(addr);                                             \

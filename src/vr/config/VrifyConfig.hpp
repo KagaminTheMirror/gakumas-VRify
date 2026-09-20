@@ -201,6 +201,14 @@ namespace GakumasLocal::Config {
     // 3 = disabled (default; hidden from the X cycle and the mode combo).
     extern int vrCameraYButtonBone;
     extern int vrFpDirectionFollow;
+    extern int vrFollowSmoothingPreset;
+    extern bool vrLiveGaze;
+    inline constexpr int kDefaultVrLiveGazePreset = 1;
+    extern int vrLiveGazePreset; // 0 stable, 1 standard, 2 gaze.
+    inline constexpr int kDefaultVrLiveGazeScope = 0;
+    extern int vrLiveGazeScope; // 0 selected idol, 1 all idols.
+    extern float vrFollowHorizontalMs;
+    extern float vrFollowVerticalMs;
 
     // Adjustable game-panel placement (right-A adjust mode). The offset is
     // the head-to-panel-centre vector in VIEW space; `pinned` re-anchors the

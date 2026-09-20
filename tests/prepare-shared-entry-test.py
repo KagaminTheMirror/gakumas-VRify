@@ -28,7 +28,8 @@ def extract(text, marker):
 hook = (stage / 'GakumasLocalify/Hook.cpp').read_text(encoding='utf-8')
 runtime = (stage / 'vr/unity/CameraRuntime.inc.cpp').read_text(encoding='utf-8')
 fragments = ''.join(extract(runtime, 'bool ' + name + '(') for name in (
-    'IsVrUnityRuntimeEnabled', 'AreVrUnityCameraDiagnosticsEnabled', 'IsLocalifyFreeCameraEnabled'))
+    'IsVrUnityRuntimeEnabled', 'AreVrUnityCameraDiagnosticsEnabled',
+    'IsLocalifyFreeCameraEnabled', 'IsLocalifyGyroEmuEnabled'))
 fragments += (stage / 'vr/unity/EndCameraCallback.inc.cpp').read_text(encoding='utf-8')
 fragments += (stage / 'vr/unity/MainCameraCallback.inc.cpp').read_text(encoding='utf-8')
 fragments += extract(hook, 'DEFINE_HOOK(UnityResolve::UnityType::Camera*, Camera_get_main,')
