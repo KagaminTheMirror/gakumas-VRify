@@ -1329,6 +1329,39 @@ bool PaintVrAaMenu(
                 std::to_string(Config::vrCameraYButtonBone));
         }
 
+        const char* turnModeItems[] = {
+            ts("vr_freecam_turn_snap"),
+            ts("vr_freecam_turn_smooth"),
+        };
+        const int turnModeBefore = Config::vrCameraTurnMode;
+        ComboRow(
+            ts("vr_menu_freecam_turn_mode"),
+            &Config::vrCameraTurnMode,
+            turnModeItems,
+            camera::kVrFreeCameraTurnModeCount,
+            true,
+            stick);
+        if (turnModeBefore != Config::vrCameraTurnMode) {
+            PersistMenuConfig(log, "turn-mode");
+            log.Write(
+                "[VR][menu] freecam turn mode=" +
+                std::to_string(Config::vrCameraTurnMode));
+        }
+        HelpLine(ts("vr_menu_freecam_turn_mode_help"));
+
+        if (Config::vrCameraTurnMode ==
+            static_cast<int>(camera::VrFreeCameraTurnMode::Smooth)) {
+            SliderRow(
+                ts("vr_menu_freecam_turn_speed"),
+                &Config::vrCameraTurnSpeed,
+                30.0F,
+                360.0F,
+                "%.0f deg/s",
+                true,
+                input.sticks);
+            HelpLine(ts("vr_menu_freecam_turn_speed_help"));
+        }
+
         const char* smoothingItems[] = {
             ts("vr_follow_smooth_auto"), ts("vr_follow_smooth_custom"),
         };

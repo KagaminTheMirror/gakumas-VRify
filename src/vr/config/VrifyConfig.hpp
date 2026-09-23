@@ -209,6 +209,9 @@ namespace GakumasLocal::Config {
     extern int vrLiveGazeScope; // 0 selected idol, 1 all idols.
     extern float vrFollowHorizontalMs;
     extern float vrFollowVerticalMs;
+    // Turn mode: 0 = Snap, 1 = Smooth. Turn speed in degrees per second.
+    extern int vrCameraTurnMode;
+    extern float vrCameraTurnSpeed;
 
     // Adjustable game-panel placement (right-A adjust mode). The offset is
     // the head-to-panel-centre vector in VIEW space; `pinned` re-anchors the

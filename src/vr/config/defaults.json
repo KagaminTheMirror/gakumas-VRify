@@ -47,6 +47,8 @@
     "vrLiveGazeScope": 0,
     "vrFollowHorizontalMs": 0.0,
     "vrFollowVerticalMs": 100.0,
+    "vrCameraTurnMode": 0,
+    "vrCameraTurnSpeed": 120.0,
     "vrPanelCustomized": false,
     "vrPanelPinned": false,
     "vrPanelOffsetX": 0.0,
