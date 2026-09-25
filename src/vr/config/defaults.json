@@ -39,6 +39,7 @@
     "vrPointerSmoothEnabled": true,
     "vrPointerSmoothMinCutoff": 0.5,
     "vrPointerSmoothBeta": 8.0,
+    "vrPointerSizeScale": 1.0,
     "vrCameraYButtonBone": 0,
     "vrFpDirectionFollow": 3,
     "vrFollowSmoothingPreset": 0,

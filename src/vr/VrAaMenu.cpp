@@ -37,6 +37,24 @@ constexpr float kLabelWidth = 360.0F;
 constexpr float kColumnGap = 10.0F;
 constexpr float kControlHeight = 46.0F;
 
+void DrawPointer(ImDrawList* draw, const ImVec2& point,
+                 const ImVec2& radius) {
+    if (!std::isfinite(radius.x) || !std::isfinite(radius.y) ||
+        radius.x <= 0.0F || radius.y <= 0.0F) return;
+    const auto disc = [&](float scale, ImU32 color) {
+        // UV aspect correction makes this an ellipse in texels but a circle
+        // on the physical panel, including non-square texture densities.
+        for (int i = 0; i < 48; ++i) {
+            const float angle = static_cast<float>(i) * (2.0F * IM_PI / 48.0F);
+            draw->PathLineTo(ImVec2(point.x + std::cos(angle) * radius.x * scale,
+                                   point.y + std::sin(angle) * radius.y * scale));
+        }
+        draw->PathFillConvex(color);
+    };
+    disc(1.0F, IM_COL32(20, 20, 24, 255));
+    disc(pointer::kInnerRadiusRatio, IM_COL32(255, 255, 255, 255));
+}
+
 ImGuiContext* g_context = nullptr;
 ID3D11Device* g_device = nullptr;
 // ImGui records into a deferred context. Issuing its dozens of state changes
@@ -1716,8 +1734,8 @@ bool PaintVrAaMenu(
         }
         const ImVec2 point(
             cursor.u * io.DisplaySize.x, cursor.v * io.DisplaySize.y);
-        overlay->AddCircleFilled(point, 11.0F, IM_COL32(255, 255, 255, 255));
-        overlay->AddCircle(point, 14.0F, IM_COL32(20, 20, 24, 255), 0, 3.0F);
+        DrawPointer(overlay, point, ImVec2(
+            cursor.radius.x * io.DisplaySize.x, cursor.radius.y * io.DisplaySize.y));
     }
     ImGui::End();
     ImGui::Render();
@@ -1878,10 +1896,8 @@ bool PaintVrPanelOverlay(
             ImDrawList* overlayDraw = ImGui::GetForegroundDrawList();
             const ImVec2 point(
                 input.u * io.DisplaySize.x, input.v * barHeight);
-            overlayDraw->AddCircleFilled(
-                point, 11.0F, IM_COL32(255, 255, 255, 255));
-            overlayDraw->AddCircle(
-                point, 14.0F, IM_COL32(20, 20, 24, 255), 0, 3.0F);
+            DrawPointer(overlayDraw, point, ImVec2(
+                input.cursorRadius.x * io.DisplaySize.x, input.cursorRadius.y * barHeight));
         }
         ImGui::PopStyleVar();
         ImGui::End();

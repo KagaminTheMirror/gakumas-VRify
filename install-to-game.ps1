@@ -121,6 +121,8 @@ if (Test-Path -LiteralPath $vrConfigPath) {
 if ($writeVrConfig) {
     # Probe is the only way a packaged install keeps file logging on. A leftover
     # game-side true would otherwise keep writing after a normal install.
+    $mergedVr.Remove('vrPointerAnalyticAa')
+    $mergedVr.Remove('vrPointerFixedProbe')
     $mergedVr['vrDiagnosticsEnabled'] = [bool]$Probe
     $mergedVr | ConvertTo-Json -Depth 20 | Set-Content `
         -LiteralPath $vrConfigPath -Encoding utf8

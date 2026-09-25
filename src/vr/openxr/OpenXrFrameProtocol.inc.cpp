@@ -29,6 +29,28 @@ void OpenXrContext::FreezeGpuSubmitSnapshot(FrameWork& work) noexcept {
     gpu.mirrorWidth = work.frame.mirrorWidth;
     gpu.mirrorHeight = work.frame.mirrorHeight;
     gpu.mirrorLayoutGeneration = work.frame.mirrorLayoutGeneration;
+    // Publish visual geometry with this ticket. Wait(N+1) may already have
+    // moved the live panel when Submit(N) draws these pointers.
+    const float scale = GakumasLocal::Config::vrPointerSizeScale;
+    const float panelHeight = gpu.mirrorWidth == 0 ? 0.0F :
+        gpu.panelQuadWidth * static_cast<float>(gpu.mirrorHeight) /
+        static_cast<float>(gpu.mirrorWidth);
+    for (auto& p : work.frame.pointers) {
+        p.mirrorCursorRadius = pointer::VisibleRadiusUv(gpu.panelPoseView,
+            gpu.panelQuadWidth, panelHeight, p.u, p.v, scale);
+        p.menuCursorRadius = pointer::VisibleRadiusUv(menuPoseView_,
+            kMenuWidthMetres, kMenuHeightMetres, p.menuU, p.menuV, scale);
+        p.barCursorRadius = pointer::VisibleRadiusUv(gpu.barPoseView,
+            gpu.barQuadWidth, gpu.barQuadHeight, p.barU, p.barV, scale);
+    }
+    gpu.pointerPanelPoseBase = gpu.panelPoseBase;
+    if (!gpu.panelPoseUsesBase) {
+        const auto offset = pose::Rotate(headPoseBase_.orientation,gpu.panelPoseView.position);
+        gpu.pointerPanelPoseBase.position = {headPoseBase_.position.x+offset.x,
+            headPoseBase_.position.y+offset.y,headPoseBase_.position.z+offset.z};
+        gpu.pointerPanelPoseBase.orientation = pose::Multiply(headPoseBase_.orientation,gpu.panelPoseView.orientation);
+    }
+
 }
 
 void OpenXrContext::ResetFrameProtocol() noexcept {
@@ -498,7 +520,7 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
             }
             VR_PERF_SCOPE(mirror, "xr.render-mirror", [&](std::string_view line) noexcept { log.Write(line); });
             mirrorReady = RenderMirrorFrame(
-                sourceFrame, frame.pointers, log);
+                sourceFrame, log);
             mirrorResult = lastResult_;
             if (mirrorReady) {
                 frame.sourceFrameGeneration = sourceFrameGeneration;
@@ -659,6 +681,12 @@ OpenXrContext::FrameResult OpenXrContext::SubmitPrepared(
     if (mirrorLayerVisible) {
         layers.layerPtrs[layers.layerCount++] =
             reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layers.mirror);
+        const bool hasPointer = std::any_of(frame.pointers.begin(), frame.pointers.end(),
+            [](const auto& p) { return p.hovering; });
+        if (hasPointer && RenderAnalyticPointers(frame,gpu,layers,log)) {
+            layers.layerPtrs[layers.layerCount++] =
+                reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layers.pointerProjection);
+        }
     }
     if (overlayReady && gpu.panelAdjustMode && mirrorLayerVisible) {
         layers.layerPtrs[layers.layerCount++] =

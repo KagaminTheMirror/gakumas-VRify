@@ -270,6 +270,7 @@ typedef XrFlags64 XrSwapchainCreateFlags;
 typedef XrFlags64 XrSwapchainUsageFlags;
 
 static const XrSwapchainUsageFlags XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT = 0x00000001;
+static const XrSwapchainUsageFlags XR_SWAPCHAIN_USAGE_SAMPLED_BIT = 0x00000020;
 
 // Flag bits for XrCompositionLayerFlags
 // XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT is deprecated and should not be used

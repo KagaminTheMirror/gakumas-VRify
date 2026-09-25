@@ -2543,6 +2543,7 @@ bool OpenXrContext::RenderPanelOverlayFrame(
     input.hovering = pointers[owner].barHovering;
     input.u = pointers[owner].barU;
     input.v = pointers[owner].barV;
+    input.cursorRadius = pointers[owner].barCursorRadius;
     input.triggerHeld =
         pointers[owner].barHovering && pointers[owner].triggerHeld;
     input.triggerPressed =
@@ -3110,7 +3111,6 @@ bool OpenXrContext::EnsureMirrorLayout(
 
 bool OpenXrContext::RenderMirrorFrame(
     ID3D11Texture2D* sourceFrame,
-    const std::array<PointerState, 2>& pointers,
     VrLog& log) {
     if (sourceFrame == nullptr || mirrorSwapchain_ == XR_NULL_HANDLE ||
         sessionContext_ == nullptr ||
@@ -3209,7 +3209,6 @@ bool OpenXrContext::RenderMirrorFrame(
     }
     sessionContext_->CopyResource(mirrorImages_[imageIndex].texture, copySource);
 
-    OverlayPointerCursors(mirrorImages_[imageIndex].texture, pointers);
 
     XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     lastResult_ = dispatch_.ReleaseSwapchainImage()(mirrorSwapchain_, &releaseInfo);
@@ -3691,101 +3690,6 @@ bool OpenXrContext::RenderProjectionFrame(
     return true;
 }
 
-void OpenXrContext::OverlayPointerCursors(
-    ID3D11Texture2D* destination,
-    const std::array<PointerState, 2>& pointers) noexcept {
-    if (destination == nullptr || sessionContext_ == nullptr ||
-        mirrorWidth_ == 0 || mirrorHeight_ == 0) {
-        return;
-    }
-
-    const UINT diameter = std::clamp(
-        std::min(mirrorWidth_, mirrorHeight_) / 80U,
-        8U,
-        18U);
-    const int radius = static_cast<int>(diameter / 2U);
-    const bool bgra = AreCopyCompatibleFormats(
-        static_cast<DXGI_FORMAT>(mirrorSwapchainFormat_),
-        DXGI_FORMAT_B8G8R8A8_UNORM);
-
-    for (std::size_t hand = 0; hand < pointers.size(); ++hand) {
-        const auto& pointer = pointers[hand];
-        if (!pointer.hovering) {
-            continue;
-        }
-
-        auto packedPixel = [&](const std::array<std::uint8_t, 4>& rgba) {
-            const std::uint8_t byte0 = bgra ? rgba[2] : rgba[0];
-            const std::uint8_t byte2 = bgra ? rgba[0] : rgba[2];
-            return static_cast<std::uint32_t>(byte0) |
-                   (static_cast<std::uint32_t>(rgba[1]) << 8U) |
-                   (static_cast<std::uint32_t>(byte2) << 16U) |
-                   (static_cast<std::uint32_t>(rgba[3]) << 24U);
-        };
-        std::array<std::uint32_t, 28U * 28U> outlinePixels{};
-        std::array<std::uint32_t, 28U * 28U> whitePixels{};
-        outlinePixels.fill(packedPixel({24, 24, 24, 255}));
-        whitePixels.fill(packedPixel({255, 255, 255, 255}));
-
-        const int centerX = static_cast<int>(std::lround(
-            pointer.u * static_cast<float>(mirrorWidth_ - 1U)));
-        const int centerY = static_cast<int>(std::lround(
-            pointer.v * static_cast<float>(mirrorHeight_ - 1U)));
-        auto updateBox = [&](int left,
-                             int top,
-                             int right,
-                             int bottom,
-                             const std::array<std::uint32_t, 28U * 28U>& pixels) {
-            left = std::clamp(left, 0, static_cast<int>(mirrorWidth_));
-            right = std::clamp(right, 0, static_cast<int>(mirrorWidth_));
-            top = std::clamp(top, 0, static_cast<int>(mirrorHeight_));
-            bottom = std::clamp(bottom, 0, static_cast<int>(mirrorHeight_));
-            if (left >= right || top >= bottom) {
-                return;
-            }
-            D3D11_BOX box{};
-            box.left = static_cast<UINT>(left);
-            box.top = static_cast<UINT>(top);
-            box.front = 0;
-            box.right = static_cast<UINT>(right);
-            box.bottom = static_cast<UINT>(bottom);
-            box.back = 1;
-            sessionContext_->UpdateSubresource(
-                destination,
-                0,
-                &box,
-                pixels.data(),
-                static_cast<UINT>(right - left) * sizeof(std::uint32_t),
-                0);
-        };
-
-        auto drawDisc = [&](int discRadius,
-                            const std::array<std::uint32_t, 28U * 28U>& pixels) {
-            auto halfWidthAt = [&](int y) {
-                return static_cast<int>(std::floor(std::sqrt(
-                    static_cast<double>(discRadius * discRadius - y * y))));
-            };
-            for (int top = -discRadius; top <= discRadius;) {
-                const int halfWidth = halfWidthAt(top);
-                int bottom = top + 1;
-                while (bottom <= discRadius && halfWidthAt(bottom) == halfWidth) {
-                    ++bottom;
-                }
-                updateBox(
-                    centerX - halfWidth,
-                    centerY + top,
-                    centerX + halfWidth + 1,
-                    centerY + bottom,
-                    pixels);
-                top = bottom;
-            }
-        };
-        drawDisc(radius, outlinePixels);
-        const int innerRadius = std::max(radius - 2, 1);
-        drawDisc(innerRadius, whitePixels);
-    }
-}
-
 OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log, bool quitting) {
     if (instance_ == XR_NULL_HANDLE || dispatch_.PollEvent() == nullptr) {
         lastResult_ = XR_ERROR_HANDLE_INVALID;
@@ -3955,6 +3859,7 @@ OpenXrContext::EventResult OpenXrContext::DrainEvents(VrLog& log, bool quitting)
 }
 
 #include "OpenXrFrameProtocol.inc.cpp"
+#include "OpenXrPointerAa.inc.cpp"
 
 bool OpenXrContext::RequestExit(VrLog& log) {
     if (exitRequested_) {
@@ -4212,6 +4117,7 @@ void OpenXrContext::ResetSessionChildren() noexcept {
     pendingReferenceSpaceChangeTimes_.clear();
     projectionTrackingTimeFloor_ = 0;
     ResetProjectionSwapchain();
+    ResetAnalyticPointers();
     ResetMenuSwapchain();
     ResetPanelOverlaySwapchain();
     ResetMirrorSwapchain();

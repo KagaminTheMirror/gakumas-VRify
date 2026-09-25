@@ -3,8 +3,10 @@
 #include "OpenXrDispatch.hpp"
 #include "../FrameHitchProbe.hpp"
 #include "../PanelPlacement.hpp"
+#include "../PointerVisual.hpp"
 #include "../d3d11/StereoRenderMailbox.hpp"
 #include "../d3d11/VerticalFlipPass.hpp"
+#include "../d3d11/PointerAaPass.hpp"
 #include "../frame/FrameCoordinator.hpp"
 #include "../input/PointerSmoother.hpp"
 #include "../pose/PoseMath.hpp"
@@ -103,6 +105,10 @@ public:
         bool barHovering = false;
         float barU = 0.0F;
         float barV = 0.0F;
+        // Frozen after smoothing with this frame's physical panel geometry.
+        pointer::RadiusUv mirrorCursorRadius{};
+        pointer::RadiusUv menuCursorRadius{};
+        pointer::RadiusUv barCursorRadius{};
         XrPosef aimPose{};
         bool gripPoseValid = false;
         bool usedGripPose = false;
@@ -113,6 +119,7 @@ public:
         bool hovering = false;
         float u = 0.0F;
         float v = 0.0F;
+        pointer::RadiusUv radius{};
     };
 
     struct AaMenuStick {
@@ -176,6 +183,7 @@ public:
         bool triggerPressed = false;
         float u = 0.0F;
         float v = 0.0F;
+        pointer::RadiusUv cursorRadius{};
     };
 
     struct PanelOverlayOutput {
@@ -400,11 +408,7 @@ private:
         VrLog& log);
     bool RenderMirrorFrame(
         ID3D11Texture2D* sourceFrame,
-        const std::array<PointerState, 2>& pointers,
         VrLog& log);
-    void OverlayPointerCursors(
-        ID3D11Texture2D* destination,
-        const std::array<PointerState, 2>& pointers) noexcept;
     void ResetInputSession() noexcept;
     void ResetInputActions() noexcept;
     void ResetMirrorSwapchain() noexcept;
@@ -429,7 +433,9 @@ private:
         XrCompositionLayerQuad bar{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad hint{XR_TYPE_COMPOSITION_LAYER_QUAD};
         XrCompositionLayerQuad menu{XR_TYPE_COMPOSITION_LAYER_QUAD};
-        std::array<const XrCompositionLayerBaseHeader*, 5> layerPtrs{};
+        XrCompositionLayerProjection pointerProjection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        std::array<XrCompositionLayerProjectionView,2> pointerViews{};
+        std::array<const XrCompositionLayerBaseHeader*, 6> layerPtrs{};
         std::uint32_t layerCount = 0;
         bool projectionReady = false;
         bool mirrorReady = false;
@@ -439,6 +445,7 @@ private:
     // Immutable GPU submit parameters frozen at Wait return. Submit/End of
     // ticket N must read this copy so Wait(N+1) can mutate live UI/pose/layout.
     struct GpuSubmitSnapshot {
+        pose::Pose pointerPanelPoseBase{};
         bool aaMenuVisible = false;
         bool stereoUiPanelVisible = false;
         bool panelAdjustMode = false;
@@ -461,6 +468,9 @@ private:
         std::uint32_t mirrorHeight = 0;
         std::uint64_t mirrorLayoutGeneration = 0;
     };
+    bool RenderAnalyticPointers(const StereoFrame& frame, const GpuSubmitSnapshot& gpu,
+        SubmitLayers& layers, VrLog& log);
+    void ResetAnalyticPointers() noexcept;
 
     struct FrameWork {
         frame::FrameIdentity identity{};
@@ -698,6 +708,12 @@ private:
     bool repeatedStereoReuseLogged_ = false;
     d3d11::VerticalFlipPass projectionVerticalFlip_;
     ID3D11DeviceContext* sessionContext_ = nullptr;
+    XrSwapchain pointerEyeSwapchain_ = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageD3D11KHR> pointerEyeImages_;
+    DXGI_FORMAT pointerEyeFormat_ = DXGI_FORMAT_UNKNOWN;
+    std::uint32_t pointerEyeWidth_ = 0, pointerEyeHeight_ = 0;
+    bool pointerEyeFailed_ = false;
+    d3d11::PointerAaPass pointerAaPass_;
     ID3D11Device* sessionDevice_ = nullptr;
     bool hitchReadyLogged_ = false;
     std::atomic<XrResult> lastResult_{XR_SUCCESS};
@@ -715,6 +731,7 @@ inline OpenXrContext::AaMenuInput SelectAaMenuInput(
         input.cursors[hand].hovering = pointers[hand].menuHovering;
         input.cursors[hand].u = pointers[hand].menuU;
         input.cursors[hand].v = pointers[hand].menuV;
+        input.cursors[hand].radius = pointers[hand].menuCursorRadius;
         input.sticks[hand].active = pointers[hand].thumbstickActive;
         input.sticks[hand].x = pointers[hand].thumbstick.x;
     }

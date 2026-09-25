@@ -3,6 +3,7 @@
 #include "host/localify/ConfigIntegration.hpp"
 #include "../camera/FollowSmoothing.hpp"
 #include "../LiveGaze.hpp"
+#include "../PointerVisual.hpp"
 #include "nlohmann/json.hpp"
 #include "GakumasLocalify/Log.h"
 #include <algorithm>
@@ -56,6 +57,7 @@ namespace GakumasLocal::Config {
     bool vrPointerSmoothEnabled = true;
     float vrPointerSmoothMinCutoff = kDefaultVrPointerSmoothMinCutoff;
     float vrPointerSmoothBeta = kDefaultVrPointerSmoothBeta;
+    float vrPointerSizeScale = 1.0F;
     int vrCameraYButtonBone = 0;
     int vrFpDirectionFollow = 3;
     int vrFollowSmoothingPreset = 0;
@@ -205,6 +207,7 @@ namespace GakumasLocal::Config {
             vrGripPanelTransparent = false;
             vrHideUiTextureOverlay = true;
             vrHandGlowSticks = false;
+            vrPointerSizeScale = 1.0F;
             ResetVrPointerSettings();
             vrPanelCustomized = false;
             vrPanelPinned = false;
@@ -260,6 +263,7 @@ namespace GakumasLocal::Config {
             GetVrConfigItem(vrGripPanelTransparent);
             GetVrConfigItem(vrHideUiTextureOverlay);
             GetVrConfigItem(vrHandGlowSticks);
+            GetVrConfigItem(vrPointerSizeScale);
             GetVrConfigItem(vrCameraYButtonBone);
             GetVrConfigItem(vrFpDirectionFollow);
             GetVrConfigItem(vrFollowSmoothingPreset);
@@ -275,6 +279,9 @@ namespace GakumasLocal::Config {
             GetVrConfigItem(vrPanelOffsetZ);
             GetVrConfigItem(vrPanelWidth);
 #undef GetVrConfigItem
+            // File-only: clamp once at load. The menu calls the other clamp
+            // routines every paint; it must not write this VR-worker input.
+            vrPointerSizeScale = gakumas::vr::pointer::ClampSizeScale(vrPointerSizeScale);
             if (vrToonFollowRef < 0 || vrToonFollowRef > 2) {
                 vrToonFollowRef = kDefaultVrToonFollowRef;
             }
@@ -289,6 +296,8 @@ namespace GakumasLocal::Config {
                 : nlohmann::json::object();
             config.erase("vrDebugEnabled");
             config.erase("vrProbeOnly");
+            config.erase("vrPointerAnalyticAa");
+            config.erase("vrPointerFixedProbe");
             config["schemaVersion"] = 1;
 #define SetVrConfigItem(name) config[#name] = name
             SetVrConfigItem(vrDiagnosticsEnabled);
@@ -332,6 +341,7 @@ namespace GakumasLocal::Config {
             SetVrConfigItem(vrPointerSmoothEnabled);
             SetVrConfigItem(vrPointerSmoothMinCutoff);
             SetVrConfigItem(vrPointerSmoothBeta);
+            SetVrConfigItem(vrPointerSizeScale);
             SetVrConfigItem(vrCameraYButtonBone);
             SetVrConfigItem(vrFpDirectionFollow);
             SetVrConfigItem(vrFollowSmoothingPreset);

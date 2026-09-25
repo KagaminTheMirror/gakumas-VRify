@@ -195,6 +195,10 @@ namespace GakumasLocal::Config {
     extern float vrPointerSmoothMinCutoff;
     extern float vrPointerSmoothBeta;
 
+    // File-only visual size multiplier: 1 = VD normal contact footprint.
+    // Restart after editing; does not change hit testing or smoothing.
+    extern float vrPointerSizeScale;
+
     // VR free camera. Y button function: 0 = switch character,
     // 1 = switch FOLLOW anchor bone. First person (`vrFpDirectionFollow`):
     // 0 = none (in cycle, yaw manual), 1 = turn, 2 = turn + tilt,
