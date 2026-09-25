@@ -435,6 +435,9 @@ float g_helpTestDelta = 0;
 std::string g_helpCaptureForTest;
 std::string g_popupCaptureForTest;
 std::string g_comboCaptureForTest;
+std::string g_openComboHelpLabel;
+ImVec2 g_openComboListMin{};
+ImVec2 g_openComboListMax{};
 float g_scrollCaptureForTest = -1;
 float g_bodyScrollForTest = 0;
 float g_panelBarRightForTest = 0;
@@ -515,10 +518,20 @@ void EndRow(const MenuRow& row) {
 }
 void DrawHelpDock() {
     std::string hovered;
-    for (const auto& entry : g_helpRows) {
-        if (ImGui::GetIO().MousePos.y < 678 && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseHoveringRect(entry.row.origin,
-            ImVec2(entry.row.origin.x + entry.row.width, entry.row.origin.y + entry.row.height - 2), false)) {
-            hovered = entry.row.label;
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool overOpenList = !g_openComboHelpLabel.empty() &&
+        mouse.x >= g_openComboListMin.x && mouse.y >= g_openComboListMin.y &&
+        mouse.x < g_openComboListMax.x && mouse.y < g_openComboListMax.y;
+    if (overOpenList) {
+        // The open list covers later rows. Keep the owner's explanation
+        // instead of whichever row sits under the pointer.
+        hovered = g_openComboHelpLabel;
+    } else {
+        for (const auto& entry : g_helpRows) {
+            if (ImGui::GetIO().MousePos.y < 678 && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseHoveringRect(entry.row.origin,
+                ImVec2(entry.row.origin.x + entry.row.width, entry.row.origin.y + entry.row.height - 2), false)) {
+                hovered = entry.row.label;
+            }
         }
     }
     g_helpState.Advance(g_helpTestDelta > 0 ? g_helpTestDelta : ImGui::GetIO().DeltaTime, hovered, g_helpDragging);
@@ -565,7 +578,9 @@ void ComboRow(
         ImGui::OpenPopupEx(ImHashStr("##ComboPopup", 0, ImGui::GetID("##value")), ImGuiPopupFlags_None);
         g_comboCaptureForTest.clear();
     }
+    ImGuiWindow* listWindow = nullptr;
     if (ImGui::BeginCombo("##value", items[*value], ImGuiComboFlags_HeightLarge)) {
+        listWindow = ImGui::GetCurrentWindow();
         for (int index = 0; index < count; ++index) {
             if (ImGui::Selectable(items[index], index == *value, 0,
                                   ImVec2(0.0F, kControlHeight))) {
@@ -573,6 +588,14 @@ void ComboRow(
             }
         }
         ImGui::EndCombo();
+    }
+    if (listWindow != nullptr) {
+        // EndCombo finishes the list size. Reading it earlier only covers the
+        // first row, so lower entries still fall through to the rows behind.
+        const ImRect listRect = listWindow->Rect();
+        g_openComboHelpLabel = label;
+        g_openComboListMin = listRect.Min;
+        g_openComboListMax = listRect.Max;
     }
     // Stick nudging keeps the row usable if the popup is hard to hit in VR.
     if (enabled && stick.active && !stick.consumed &&
@@ -999,6 +1022,9 @@ bool PaintVrAaMenu(
     g_gridY = ImGui::GetCursorScreenPos().y;
     g_gridWidth = ImGui::GetContentRegionAvail().x;
     g_gridRight = false; g_helpDragging = false; g_helpRows.clear();
+    g_openComboHelpLabel.clear();
+    g_openComboListMin = {};
+    g_openComboListMax = {};
     const char* aaModeItems[] = {
         ts("vr_aa_mode_inherit"),
         ts("vr_aa_mode_taa"),
@@ -1665,7 +1691,15 @@ bool PaintVrAaMenu(
             Config::vrToonFollowRef = Config::kDefaultVrToonFollowRef;
             Config::vrVolumeSourceAnchor = true;
             Config::vrDisableSourceCamera = false;
+            Config::vrSourceCameraTiny = false;
             Config::vrGripPanelTransparent = false;
+            Config::vrCameraYButtonBone = 0;
+            Config::vrFpDirectionFollow =
+                static_cast<int>(camera::VrFpDirectionFollow::Disabled);
+            if (camera::ReadVrFreeCameraMode() ==
+                camera::VrFreeCameraMode::FirstPerson) {
+                camera::RequestVrFreeCameraMode(camera::VrFreeCameraMode::Off);
+            }
             Config::vrEyeDeferredStencilOff = false;
             Config::vrEyeShadeBandBias = 0.0F;
             Config::vrHideUiTextureOverlay = true;
