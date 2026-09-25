@@ -66,6 +66,8 @@ namespace GakumasLocal::Config {
     int vrLiveGazeScope = kDefaultVrLiveGazeScope;
     float vrFollowHorizontalMs = 0.0F;
     float vrFollowVerticalMs = 100.0F;
+    int vrCameraTurnMode = 0;
+    float vrCameraTurnSpeed = 120.0F;
     bool vrPanelCustomized = false;
     bool vrPanelPinned = false;
     float vrPanelOffsetX = 0.0F;
@@ -156,6 +158,8 @@ namespace GakumasLocal::Config {
         gakumas::vr::SetLiveGazeScope(vrLiveGazeScope);
         vrFollowHorizontalMs = clampFloat(vrFollowHorizontalMs, 0.0F, 500.0F, 0.0F);
         vrFollowVerticalMs = clampFloat(vrFollowVerticalMs, 0.0F, 500.0F, 100.0F);
+        vrCameraTurnMode = clampInt(vrCameraTurnMode, 0, 1);
+        vrCameraTurnSpeed = clampFloat(vrCameraTurnSpeed, 30.0F, 360.0F, 120.0F);
         gakumas::vr::camera::PublishFollowSmoothing(
             vrFollowSmoothingPreset, vrFollowHorizontalMs, vrFollowVerticalMs);
         vrMenuLanguage = clampInt(
@@ -272,6 +276,8 @@ namespace GakumasLocal::Config {
             GetVrConfigItem(vrLiveGazeScope);
             GetVrConfigItem(vrFollowHorizontalMs);
             GetVrConfigItem(vrFollowVerticalMs);
+            GetVrConfigItem(vrCameraTurnMode);
+            GetVrConfigItem(vrCameraTurnSpeed);
             GetVrConfigItem(vrPanelCustomized);
             GetVrConfigItem(vrPanelPinned);
             GetVrConfigItem(vrPanelOffsetX);
@@ -350,6 +356,8 @@ namespace GakumasLocal::Config {
             SetVrConfigItem(vrLiveGazeScope);
             SetVrConfigItem(vrFollowHorizontalMs);
             SetVrConfigItem(vrFollowVerticalMs);
+            SetVrConfigItem(vrCameraTurnMode);
+            SetVrConfigItem(vrCameraTurnSpeed);
             SetVrConfigItem(vrPanelCustomized);
             SetVrConfigItem(vrPanelPinned);
             SetVrConfigItem(vrPanelOffsetX);

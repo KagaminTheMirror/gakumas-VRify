@@ -381,10 +381,24 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
     const float rightY = verticalDominant
         ? ApplyDeadzone(commands.rightStickY, kStickDeadzone)
         : 0.0F;
-    float snapDegrees = 0.0F;
-    const bool snapTurned = ConsumeSnapTurn(
-        commands.rightStickX, commands.rightStickY, snapDegrees);
-    const float snapRadians = snapDegrees * kPi / 180.0F;
+    float turnDeltaRadians = 0.0F;
+    if (commands.turnMode == static_cast<int>(VrFreeCameraTurnMode::Smooth)) {
+        snapEngaged_ = false;
+        // Turn horizontally only while the stick is not dominated by vertical input.
+        const float rightX = !verticalDominant
+            ? ApplyDeadzone(commands.rightStickX, kStickDeadzone)
+            : 0.0F;
+        if (rightX != 0.0F) {
+            turnDeltaRadians =
+                rightX * (commands.turnSpeed * kPi / 180.0F) * dt;
+        }
+    } else {
+        float snapDegrees = 0.0F;
+        if (ConsumeSnapTurn(
+                commands.rightStickX, commands.rightStickY, snapDegrees)) {
+            turnDeltaRadians = snapDegrees * kPi / 180.0F;
+        }
+    }
 
     switch (mode_) {
     case VrFreeCameraMode::Off:
@@ -393,8 +407,8 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
         break;
 
     case VrFreeCameraMode::Free: {
-        if (snapTurned) {
-            freeYawRadians_ += snapRadians;
+        if (turnDeltaRadians != 0.0F) {
+            freeYawRadians_ += turnDeltaRadians;
             // Pivot around the user's head so the view spins in place. The
             // bridge composes head = rig + R(rigYaw)*delta, so rotating the
             // rig position around the head keeps the head position fixed.
@@ -402,7 +416,7 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
                 headPoseValid ? headPose.position : freePosition_;
             freePosition_ = Add(
                 pivot,
-                RotateAroundY(Subtract(freePosition_, pivot), snapRadians));
+                RotateAroundY(Subtract(freePosition_, pivot), turnDeltaRadians));
         }
         if (leftX != 0.0F || leftY != 0.0F) {
             const pose::Quaternion basis = headPoseValid
@@ -487,8 +501,8 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
         }
 
         if (followSeeded_) {
-            if (snapTurned) {
-                followYawRadians_ += snapRadians;
+            if (turnDeltaRadians != 0.0F) {
+                followYawRadians_ += turnDeltaRadians;
             }
             // Stick right orbits the camera to the character's right side as
             // seen by the user (hardware feedback: += felt inverted).
@@ -559,9 +573,9 @@ VrFreeCameraUpdateResult VrFreeCameraRig::Update(
             kFirstPersonSmoothingTau, kFirstPersonSmoothingTau);
         const auto directionFollow =
             static_cast<VrFpDirectionFollow>(commands.fpDirectionFollow);
-        // Manual snap turns only when the bone does not own the yaw.
-        if (snapTurned && directionFollow == VrFpDirectionFollow::None) {
-            firstPersonYawRadians_ += snapRadians;
+        // Manual turns only when the bone does not own the yaw.
+        if (turnDeltaRadians != 0.0F && directionFollow == VrFpDirectionFollow::None) {
+            firstPersonYawRadians_ += turnDeltaRadians;
         }
         firstPersonOffset_.x = std::clamp(
             firstPersonOffset_.x + leftX * kFirstPersonOffsetSpeed * dt,

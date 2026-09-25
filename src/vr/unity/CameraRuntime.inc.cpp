@@ -1018,6 +1018,8 @@
         commands.dtSeconds = dtSeconds;
         commands.fpDirectionFollow = Config::vrFpDirectionFollow;
         commands.followSmoothing = vrcam::ReadFollowSmoothing();
+        commands.turnMode = Config::vrCameraTurnMode;
+        commands.turnSpeed = Config::vrCameraTurnSpeed;
         const int menuModeRequest = vrcam::ConsumeVrFreeCameraModeRequest();
         if (menuModeRequest >= 0) {
             commands.hasModeRequest = true;

@@ -103,6 +103,12 @@ inline constexpr int kVrFpFollowDisplayCount = 4;
     }
 }
 
+enum class VrFreeCameraTurnMode : int {
+    Snap = 0,
+    Smooth = 1,
+};
+inline constexpr int kVrFreeCameraTurnModeCount = 2;
+
 struct VrFreeCameraCommands {
     float dtSeconds = 0.0F;
     // Sticks are pre-gated by the caller: zero while the VR menu is open or
@@ -123,6 +129,8 @@ struct VrFreeCameraCommands {
     VrFreeCameraMode modeRequest = VrFreeCameraMode::Off;
     int fpDirectionFollow = 0;
     FollowSmoothingSettings followSmoothing{};
+    int turnMode = static_cast<int>(VrFreeCameraTurnMode::Smooth);
+    float turnSpeed = 120.0F; // degrees per second for smooth turn
 };
 
 // Character bone sample published by CampusActorController.LateUpdate on the
